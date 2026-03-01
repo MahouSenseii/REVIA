@@ -139,6 +139,19 @@ void RestServer::setup_routes() {
         res.set_content(json({{"ok", true}}).dump(), "application/json");
     });
 
+    svr_.Post("/api/model/config", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            auto body = json::parse(req.body);
+            std::string server_url = body.value("local_server_url", "");
+            std::string model = body.value("api_model", body.value("local_path", ""));
+            pipeline_.set_llm_config(server_url, model);
+            res.set_content(json({{"ok", true}}).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.set_content(json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
     svr_.Get("/api/training-data", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         json j;

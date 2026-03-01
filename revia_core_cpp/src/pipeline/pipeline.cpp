@@ -5,11 +5,20 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 namespace revia {
 
 Pipeline::Pipeline(TelemetryEngine& t, EmotionNet& e, RouterClassifier& r, PluginManager& p)
     : telemetry_(t), emotion_(e), router_(r), plugins_(p) {}
+
+void Pipeline::set_llm_config(const std::string& server_url, const std::string& model) {
+    std::lock_guard<std::mutex> lk(llm_cfg_mtx_);
+    if (!server_url.empty()) llm_url_ = server_url;
+    if (!model.empty()) llm_model_ = model;
+}
 
 void Pipeline::process(const PipelineRequest& req) {
     if (req.on_status) req.on_status("Processing");
@@ -84,32 +93,92 @@ void Pipeline::stage_llm_generate(const PipelineRequest& req, const std::string&
     telemetry_.set_state("Generating");
     if (req.on_status) req.on_status("Generating");
 
-    std::vector<std::string> tokens = {
-        "I", " understand", " your", " request", ".", " Let", " me",
-        " help", " you", " with", " that", ".", " As", " your",
-        " neural", " assistant", ",", " I'm", " here", " to",
-        " provide", " thoughtful", " and", " helpful", " responses", "."
+    std::string url, model;
+    {
+        std::lock_guard<std::mutex> lk(llm_cfg_mtx_);
+        url = llm_url_;
+        model = llm_model_;
+    }
+
+    // Parse host and port from url (e.g. "http://127.0.0.1:8080")
+    std::string host = "127.0.0.1";
+    int port = 8080;
+    {
+        std::string rest = url;
+        auto scheme_end = rest.find("://");
+        if (scheme_end != std::string::npos) rest = rest.substr(scheme_end + 3);
+        auto colon = rest.rfind(':');
+        if (colon != std::string::npos) {
+            host = rest.substr(0, colon);
+            try { port = std::stoi(rest.substr(colon + 1)); } catch (...) {}
+        } else {
+            host = rest;
+        }
+    }
+
+    nlohmann::json body = {
+        {"model", model},
+        {"messages", nlohmann::json::array({
+            {{"role", "system"}, {"content", "You are REVIA, a helpful AI assistant."}},
+            {{"role", "user"}, {"content", req.user_text}}
+        })},
+        {"temperature", 0.7},
+        {"stream", true}
     };
 
+    std::string full_response;
     LLMMetrics m;
     m.context_length = 2048;
-    std::string full_response;
     auto gen_start = std::chrono::high_resolution_clock::now();
+    int token_count = 0;
 
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(40 + std::rand() % 30));
-        full_response += tokens[i];
-        if (req.on_token) req.on_token(tokens[i]);
+    httplib::Client cli(host, port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(120, 0);
 
-        auto elapsed = std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now() - gen_start).count();
-        m.tokens_generated = static_cast<int>(i + 1);
-        m.tokens_per_second = elapsed > 0 ? m.tokens_generated / elapsed : 0;
-        telemetry_.set_llm_metrics(m);
+    std::string sse_buffer;
+    auto result = cli.Post(
+        "/v1/chat/completions",
+        httplib::Headers{},
+        body.dump(),
+        "application/json",
+        [&](const char* data, size_t len) -> bool {
+            sse_buffer.append(data, len);
+            size_t pos;
+            while ((pos = sse_buffer.find('\n')) != std::string::npos) {
+                std::string line = sse_buffer.substr(0, pos);
+                sse_buffer.erase(0, pos + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string payload = line.substr(6);
+                if (payload == "[DONE]") return true;
+                try {
+                    auto chunk = nlohmann::json::parse(payload);
+                    std::string tok = chunk["choices"][0]["delta"].value("content", "");
+                    if (!tok.empty()) {
+                        full_response += tok;
+                        ++token_count;
+                        if (req.on_token) req.on_token(tok);
+                        auto elapsed = std::chrono::duration<double>(
+                            std::chrono::high_resolution_clock::now() - gen_start).count();
+                        m.tokens_generated = token_count;
+                        m.tokens_per_second = elapsed > 0 ? token_count / elapsed : 0;
+                        telemetry_.set_llm_metrics(m);
+                    }
+                } catch (...) {}
+            }
+            return true;
+        }
+    );
+
+    if (!result || result->status != 200) {
+        std::string err = "[LLM Error] Cannot reach " + host + ":" + std::to_string(port)
+                        + ". Make sure your LLM server is running with a model loaded.";
+        if (req.on_token) req.on_token(err);
+        full_response = err;
     }
 
     if (req.on_complete) req.on_complete(full_response);
-
     stage_tts_synthesize(full_response);
     telemetry_.end_span(span);
 }

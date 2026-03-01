@@ -254,10 +254,9 @@ class LLMBackend:
     def generate_streaming(self, text, broadcast_fn, image_b64=None):
         with self._lock:
             source = self.source
-
-        self.conversation.append({"role": "user", "content": text})
-        if len(self.conversation) > 40:
-            self.conversation = self.conversation[-30:]
+            self.conversation.append({"role": "user", "content": text})
+            if len(self.conversation) > 40:
+                self.conversation = self.conversation[-30:]
 
         if source == "online" and self.api_key:
             return self._generate_online(broadcast_fn, image_b64=image_b64)
@@ -299,7 +298,6 @@ class LLMBackend:
         }
         url = endpoint + "/chat/completions"
         full_text = ""
-        token_count = 0
         t0 = time.perf_counter()
 
         with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
@@ -316,17 +314,22 @@ class LLMBackend:
                     tok = delta.get("content", "")
                     if tok:
                         full_text += tok
-                        token_count += 1
                         broadcast_fn({"type": "chat_token", "token": tok})
                 except (json.JSONDecodeError, IndexError, KeyError):
                     continue
 
         elapsed = time.perf_counter() - t0
+        token_count = len(full_text.split())
         tps = token_count / elapsed if elapsed > 0 else 0
         telemetry.llm["tokens_generated"] = token_count
         telemetry.llm["tokens_per_second"] = round(tps, 1)
-        telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages) + token_count
-        self.conversation.append({"role": "assistant", "content": full_text})
+        def _count_words(content):
+            if isinstance(content, list):
+                return sum(len(p.get("text", "").split()) for p in content if isinstance(p, dict))
+            return len(content.split())
+        telemetry.llm["context_length"] = sum(_count_words(m["content"]) for m in messages) + token_count
+        with self._lock:
+            self.conversation.append({"role": "assistant", "content": full_text})
         return full_text
 
     def _call_anthropic(self, endpoint, messages, broadcast_fn):
@@ -353,7 +356,6 @@ class LLMBackend:
             body["system"] = sys_msg
         url = endpoint + "/messages"
         full_text = ""
-        token_count = 0
         t0 = time.perf_counter()
 
         with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
@@ -367,16 +369,18 @@ class LLMBackend:
                         tok = chunk.get("delta", {}).get("text", "")
                         if tok:
                             full_text += tok
-                            token_count += 1
                             broadcast_fn({"type": "chat_token", "token": tok})
                 except (json.JSONDecodeError, KeyError):
                     continue
 
         elapsed = time.perf_counter() - t0
+        token_count = len(full_text.split())
         tps = token_count / elapsed if elapsed > 0 else 0
         telemetry.llm["tokens_generated"] = token_count
         telemetry.llm["tokens_per_second"] = round(tps, 1)
-        self.conversation.append({"role": "assistant", "content": full_text})
+        telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages if isinstance(m["content"], str)) + token_count
+        with self._lock:
+            self.conversation.append({"role": "assistant", "content": full_text})
         return full_text
 
     def _discover_model_name(self, base_url):
@@ -413,7 +417,6 @@ class LLMBackend:
             }
 
             full_text = ""
-            token_count = 0
             t0 = time.perf_counter()
 
             try:
@@ -447,18 +450,19 @@ class LLMBackend:
                         tok = delta.get("content", "")
                         if tok:
                             full_text += tok
-                            token_count += 1
                             broadcast_fn({"type": "chat_token", "token": tok})
                     except (json.JSONDecodeError, IndexError, KeyError):
                         continue
 
             elapsed = time.perf_counter() - t0
+            token_count = len(full_text.split())
             tps = token_count / elapsed if elapsed > 0 else 0
             telemetry.llm["tokens_generated"] = token_count
             telemetry.llm["tokens_per_second"] = round(tps, 1)
             if model_name:
                 telemetry.system["model"] = model_name
-            self.conversation.append({"role": "assistant", "content": full_text})
+            with self._lock:
+                self.conversation.append({"role": "assistant", "content": full_text})
             return full_text
         except Exception as e:
             short_url = base_url.replace("http://", "")
@@ -468,7 +472,8 @@ class LLMBackend:
                 f"  Make sure {server_name} is running with a model loaded."
             )
             broadcast_fn({"type": "chat_token", "token": err})
-            self.conversation.append({"role": "assistant", "content": err})
+            with self._lock:
+                self.conversation.append({"role": "assistant", "content": err})
             return err
 
     def _generate_stub(self, text, broadcast_fn):
@@ -489,7 +494,8 @@ class LLMBackend:
         tps = len(tokens) / elapsed if elapsed > 0 else 0
         telemetry.llm["tokens_generated"] = len(tokens)
         telemetry.llm["tokens_per_second"] = round(tps, 1)
-        self.conversation.append({"role": "assistant", "content": full.strip()})
+        with self._lock:
+            self.conversation.append({"role": "assistant", "content": full.strip()})
         return full.strip()
 
 
@@ -764,12 +770,14 @@ def process_pipeline(text, image_b64=None):
 
     s = telemetry.begin_span("emotion_analysis")
     emo = emotion_net.infer(text)
-    telemetry.emotion = emo
+    with telemetry._lock:
+        telemetry.emotion = emo
     telemetry.end_span(s)
 
     s = telemetry.begin_span("router_classify")
     route = router_cls.classify(text)
-    telemetry.router = route
+    with telemetry._lock:
+        telemetry.router = route
     telemetry.end_span(s)
 
     s = telemetry.begin_span("context_gather")

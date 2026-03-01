@@ -23,7 +23,7 @@ RouterOutput RouterClassifier::classify(const std::string& text, const std::stri
                || lower.find("open") != std::string::npos) {
         out = {"command", 0.80f, "system_exec", false, 0.1f, 0.0};
     } else if (lower.find("see") != std::string::npos || lower.find("look at") != std::string::npos
-               || lower.find("camera") != std::string::npos) {
+               || lower.find("camera") != std::string::npos || lower.find("image") != std::string::npos) {
         out = {"vision_query", 0.78f, "vision_capture", false, 0.15f, 0.0};
     } else if (lower.find("remember") != std::string::npos || lower.find("recall") != std::string::npos) {
         out = {"memory_query", 0.82f, "memory_recall", true, 0.85f, 0.0};

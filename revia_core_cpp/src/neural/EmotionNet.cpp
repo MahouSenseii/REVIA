@@ -21,7 +21,8 @@ EmotionOutput EmotionNet::infer(const std::string& text) {
     } else if (lower.find("angry") != std::string::npos || lower.find("hate") != std::string::npos
                || lower.find("furious") != std::string::npos) {
         out = {-0.7f, 0.8f, 0.7f, "Angry", 0.78f, 0.0};
-    } else if (lower.find("sad") != std::string::npos || lower.find("depressed") != std::string::npos) {
+    } else if (lower.find("sad") != std::string::npos || lower.find("depressed") != std::string::npos
+               || lower.find("sorry") != std::string::npos) {
         out = {-0.6f, 0.3f, 0.2f, "Sad", 0.75f, 0.0};
     } else if (lower.find("scared") != std::string::npos || lower.find("afraid") != std::string::npos) {
         out = {-0.5f, 0.7f, 0.1f, "Fear", 0.72f, 0.0};
