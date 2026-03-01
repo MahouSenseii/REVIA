@@ -1,0 +1,538 @@
+/* === REVIA Light Theme — Futuristic Bright === */
+
+* {
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #111122;
+}
+
+QMainWindow {
+    background-color: #eef1f5;
+}
+
+/* ---- Sidebar ---- */
+#sidebar {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 rgba(235, 240, 248, 250),
+        stop:1 rgba(225, 230, 242, 245));
+    border-right: 1px solid rgba(0, 100, 180, 0.18);
+}
+
+#sidebarName {
+    color: #0a0a1e;
+    font-size: 16px;
+    font-weight: bold;
+}
+
+#sidebarRole {
+    color: #005599;
+    font-size: 10px;
+}
+
+#sidebarStatus {
+    color: #222233;
+    font-size: 10px;
+}
+
+#sidebarSep {
+    color: rgba(0, 100, 180, 0.25);
+    max-height: 1px;
+}
+
+#sidebarSection {
+    color: #005599;
+    font-size: 9px;
+    font-weight: bold;
+}
+
+/* ---- Top Bar ---- */
+#topBar {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(255, 255, 255, 245),
+        stop:1 rgba(242, 245, 250, 245));
+    border: 1px solid rgba(0, 100, 180, 0.15);
+    border-radius: 10px;
+}
+
+#pill {
+    background: rgba(0, 100, 180, 0.07);
+    border: 1px solid rgba(0, 100, 180, 0.18);
+    border-radius: 14px;
+    padding: 4px 12px;
+    color: #1a2a3a;
+    font-size: 9px;
+}
+
+#titlePill {
+    background: rgba(0, 100, 180, 0.1);
+    border: 1px solid rgba(0, 100, 180, 0.28);
+    border-radius: 14px;
+    padding: 4px 16px;
+    color: #005599;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+#healthPill {
+    background: rgba(200, 30, 60, 0.1);
+    border: 1px solid rgba(200, 30, 60, 0.3);
+    border-radius: 14px;
+    padding: 4px 12px;
+    color: #a02040;
+}
+
+#healthPillOnline {
+    background: rgba(0, 150, 50, 0.1);
+    border: 1px solid rgba(0, 150, 50, 0.3);
+    border-radius: 14px;
+    padding: 4px 12px;
+    color: #007030;
+}
+
+/* ---- Status Panel ---- */
+#statusPanel {
+    background: rgba(255, 255, 255, 230);
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 10px;
+    padding: 8px;
+}
+
+#panelHeader {
+    color: #005599;
+}
+
+/* ---- Chat Panel ---- */
+#chatPanel {
+    background: rgba(255, 255, 255, 240);
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 12px;
+}
+
+#chatDisplay {
+    background: #f6f7fb;
+    border: none;
+    border-radius: 10px;
+    padding: 12px;
+    color: #111122;
+    selection-background-color: rgba(0, 100, 180, 0.2);
+}
+
+#chatInputRow {
+    background: rgba(242, 245, 250, 230);
+    border-top: 1px solid rgba(0, 100, 180, 0.1);
+}
+
+#chatInput {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.18);
+    border-radius: 8px;
+    padding: 6px 12px;
+    color: #111122;
+    font-size: 10px;
+}
+
+#chatInput:focus {
+    border: 1px solid rgba(0, 100, 180, 0.45);
+}
+
+#micBtn, #visionBtn {
+    background: rgba(0, 100, 180, 0.08);
+    border: 1px solid rgba(0, 100, 180, 0.22);
+    border-radius: 18px;
+    font-size: 14px;
+    color: #111122;
+}
+
+#micBtn:hover, #visionBtn:hover {
+    background: rgba(0, 100, 180, 0.16);
+}
+
+#micBtn:checked {
+    background: rgba(220, 50, 80, 0.25);
+    border: 2px solid rgba(220, 50, 80, 0.5);
+}
+
+#sendBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0088cc, stop:1 #006699);
+    border: none;
+    border-radius: 8px;
+    color: #ffffff;
+    font-weight: bold;
+    font-size: 10px;
+}
+
+#sendBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0099dd, stop:1 #0077aa);
+}
+
+/* ---- Inference Panel ---- */
+#inferencePanel {
+    background: rgba(255, 255, 255, 230);
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 10px;
+}
+
+#metricLabel {
+    color: #333344;
+    font-size: 9px;
+}
+
+#metricValue {
+    color: #005599;
+    font-size: 9px;
+}
+
+#webcamFrame {
+    background: #edf0f5;
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 8px;
+}
+
+#webcamLabel {
+    color: #336688;
+}
+
+#webcamPlaceholder {
+    color: #556677;
+    background: #f0f2f6;
+    border: 1px dashed rgba(0, 100, 180, 0.18);
+    border-radius: 6px;
+}
+
+/* ---- Right Tabs ---- */
+#rightTabs {
+    background: rgba(242, 245, 250, 240);
+    border-left: 1px solid rgba(0, 100, 180, 0.12);
+}
+
+QTabWidget::pane {
+    background: rgba(242, 245, 250, 240);
+    border: none;
+}
+
+QTabBar::tab {
+    background: rgba(238, 242, 248, 220);
+    border: 1px solid rgba(0, 100, 180, 0.1);
+    border-bottom: none;
+    padding: 6px 12px;
+    margin-right: 2px;
+    color: #3a3a4a;
+    font-size: 9px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+QTabBar::tab:selected {
+    background: rgba(0, 100, 180, 0.1);
+    color: #004477;
+    border: 1px solid rgba(0, 100, 180, 0.22);
+    border-bottom: none;
+}
+
+QTabBar::tab:hover:!selected {
+    background: rgba(0, 100, 180, 0.05);
+    color: #222233;
+}
+
+/* ---- Tab Headers ---- */
+#tabHeader {
+    color: #0a0a1e;
+    font-size: 12px;
+    font-weight: bold;
+    padding-bottom: 6px;
+}
+
+/* ---- Group Boxes ---- */
+QGroupBox {
+    background: rgba(255, 255, 255, 200);
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 8px;
+    margin-top: 12px;
+    padding-top: 20px;
+    font-weight: bold;
+    color: #004477;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #004477;
+    font-size: 10px;
+}
+
+/* ---- Inputs ---- */
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.15);
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #111122;
+    font-size: 10px;
+}
+
+QLineEdit:focus {
+    border: 1px solid rgba(0, 100, 180, 0.4);
+}
+
+QTextEdit {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.15);
+    border-radius: 6px;
+    padding: 6px;
+    color: #111122;
+    font-size: 10px;
+}
+
+QTextEdit:focus {
+    border: 1px solid rgba(0, 100, 180, 0.4);
+}
+
+QComboBox {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.15);
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #111122;
+    font-size: 10px;
+    min-width: 100px;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 6px solid #336688;
+    margin-right: 8px;
+}
+
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.22);
+    selection-background-color: rgba(0, 100, 180, 0.15);
+    color: #111122;
+}
+
+QSpinBox, QDoubleSpinBox {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.15);
+    border-radius: 6px;
+    padding: 5px 10px;
+    color: #111122;
+    font-size: 10px;
+}
+
+QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid rgba(0, 100, 180, 0.4);
+}
+
+QCheckBox {
+    color: #1a1a2e;
+    spacing: 8px;
+    font-size: 10px;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid rgba(0, 100, 180, 0.28);
+    border-radius: 4px;
+    background: #ffffff;
+}
+
+QCheckBox::indicator:checked {
+    background: rgba(0, 100, 180, 0.4);
+    border: 1px solid rgba(0, 100, 180, 0.55);
+}
+
+/* ---- Buttons ---- */
+#primaryBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0088cc, stop:1 #006699);
+    border: none;
+    border-radius: 8px;
+    padding: 8px 20px;
+    color: #ffffff;
+    font-weight: bold;
+    font-size: 10px;
+}
+
+#primaryBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+        stop:0 #0099dd, stop:1 #0077aa);
+}
+
+#primaryBtn:disabled {
+    background: #aabbcc;
+    color: #667788;
+}
+
+#secondaryBtn {
+    background: rgba(0, 100, 180, 0.07);
+    border: 1px solid rgba(0, 100, 180, 0.18);
+    border-radius: 8px;
+    padding: 8px 16px;
+    color: #1a2a3a;
+    font-size: 10px;
+}
+
+#secondaryBtn:hover {
+    background: rgba(0, 100, 180, 0.14);
+    border: 1px solid rgba(0, 100, 180, 0.28);
+    color: #0a0a1e;
+}
+
+#secondaryBtn:disabled {
+    background: #e8eaee;
+    color: #889098;
+    border: 1px solid #d0d4da;
+}
+
+#browseBtn {
+    background: rgba(0, 100, 180, 0.07);
+    border: 1px solid rgba(0, 100, 180, 0.18);
+    border-radius: 6px;
+    padding: 4px 12px;
+    color: #1a2a3a;
+    font-size: 9px;
+}
+
+/* ---- Scrollbars ---- */
+QScrollBar:vertical {
+    background: rgba(225, 230, 240, 180);
+    width: 8px;
+    margin: 0;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(0, 100, 180, 0.28);
+    min-height: 30px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(0, 100, 180, 0.42);
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background: rgba(225, 230, 240, 180);
+    height: 8px;
+    margin: 0;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(0, 100, 180, 0.28);
+    min-width: 30px;
+    border-radius: 4px;
+}
+
+QScrollArea {
+    border: none;
+    background: #eef1f5;
+}
+
+QScrollArea > QWidget > QWidget {
+    background: #eef1f5;
+}
+
+QStackedWidget {
+    background: transparent;
+}
+
+QStackedWidget > QWidget {
+    background: transparent;
+}
+
+/* ---- Tables ---- */
+QTableWidget {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 6px;
+    gridline-color: rgba(0, 100, 180, 0.08);
+    color: #111122;
+    font-size: 9px;
+}
+
+QHeaderView::section {
+    background: #f0f2f8;
+    border: none;
+    border-bottom: 1px solid rgba(0, 100, 180, 0.12);
+    padding: 4px 8px;
+    color: #004477;
+    font-size: 9px;
+    font-weight: bold;
+}
+
+QTableWidget::item {
+    padding: 3px 6px;
+    color: #111122;
+}
+
+QTableWidget::item:selected {
+    background: rgba(0, 100, 180, 0.14);
+}
+
+/* ---- Lists ---- */
+QListWidget {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.12);
+    border-radius: 6px;
+    color: #111122;
+    font-size: 10px;
+}
+
+QListWidget::item:selected {
+    background: rgba(0, 100, 180, 0.14);
+}
+
+/* ---- Log View ---- */
+#logView {
+    background: #f6f7fb;
+    border: 1px solid rgba(0, 100, 180, 0.1);
+    border-radius: 6px;
+    color: #222233;
+}
+
+/* ---- Misc ---- */
+#profileTab {
+    border: none;
+    background: transparent;
+}
+
+#centerPanel {
+    background: #eef1f5;
+}
+
+QWidget {
+    background: transparent;
+}
+
+QToolTip {
+    background: #ffffff;
+    border: 1px solid rgba(0, 100, 180, 0.22);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #111122;
+    font-size: 9px;
+}
+
+QLabel {
+    background: transparent;
+    color: #111122;
+}
+
+QFormLayout QLabel {
+    color: #1a1a2e;
+}
