@@ -138,58 +138,52 @@ class QwenTTSBackend(QObject):
         threading.Thread(target=_do, daemon=True).start()
 
     def speak_from_profile(self, text, voice_profile, emotion="neutral"):
-        """Speak chat text by cloning the profile's saved WAV via Qwen3-TTS.
-        The saved WAV IS the voice identity -- we clone from it for every response."""
-        def _do():
-            print(f"[TTS] speak_from_profile called")
-            print(f"[TTS]   engine={self._engine_name}")
-            print(f"[TTS]   gradio_client={self._has_gradio_client()}")
-            print(f"[TTS]   profile={voice_profile.name}, has_wav={voice_profile.has_wav()}")
-            print(f"[TTS]   generated_wav={voice_profile.generated_wav}")
+        """Speak chat text asynchronously (returns immediately)."""
+        threading.Thread(
+            target=self._speak_from_profile_impl,
+            args=(text, voice_profile, emotion),
+            daemon=True,
+        ).start()
 
-            if not self._has_gradio_client():
-                print("[TTS]   -> FALLBACK: no gradio_client installed")
-                mods = voice_profile.get_modulated(emotion)
-                self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
-                return
+    def speak_from_profile_sync(self, text, voice_profile, emotion="neutral"):
+        """Speak chat text synchronously — blocks until synthesis AND playback are done."""
+        self._speak_from_profile_impl(text, voice_profile, emotion)
 
-            if self._engine_name == "pyttsx3":
-                print("[TTS]   -> FALLBACK: engine set to pyttsx3")
-                mods = voice_profile.get_modulated(emotion)
-                self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
-                return
+    def _speak_from_profile_impl(self, text, voice_profile, emotion="neutral"):
+        """Synthesize and play text using the voice profile. Always runs synchronously."""
+        if not self._has_gradio_client():
+            mods = voice_profile.get_modulated(emotion)
+            self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
+            return
 
-            if not voice_profile.has_wav():
-                print("[TTS]   -> FALLBACK: profile has no WAV file")
-                mods = voice_profile.get_modulated(emotion)
-                self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
-                return
+        if self._engine_name == "pyttsx3":
+            mods = voice_profile.get_modulated(emotion)
+            self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
+            return
 
-            print(f"[TTS]   -> CLONING from: {voice_profile.generated_wav}")
-            try:
-                wav_result, info = self._qwen_clone(
-                    text,
-                    voice_profile.generated_wav,
-                    voice_profile.clone_ref_text or "",
-                    voice_profile.language or "Auto",
-                    not bool(voice_profile.clone_ref_text),
-                    None,
-                    voice_profile.model_size or "1.7B",
-                )
-                print(f"[TTS]   clone result: wav={wav_result}, info={info}")
-            except Exception as e:
-                print(f"[TTS]   clone exception: {e}")
-                wav_result = None
+        if not voice_profile.has_wav():
+            mods = voice_profile.get_modulated(emotion)
+            self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
+            return
 
-            if wav_result and Path(wav_result).exists():
-                print(f"[TTS]   -> PLAYING cloned WAV: {wav_result}")
-                self._play_wav_blocking(wav_result)
-            else:
-                print("[TTS]   -> FALLBACK: clone failed, using pyttsx3")
-                mods = voice_profile.get_modulated(emotion)
-                self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
+        try:
+            wav_result, info = self._qwen_clone(
+                text,
+                voice_profile.generated_wav,
+                voice_profile.clone_ref_text or "",
+                voice_profile.language or "Auto",
+                not bool(voice_profile.clone_ref_text),
+                None,
+                voice_profile.model_size or "1.7B",
+            )
+        except Exception as e:
+            wav_result = None
 
-        threading.Thread(target=_do, daemon=True).start()
+        if wav_result and Path(wav_result).exists():
+            self._play_wav_blocking(wav_result)
+        else:
+            mods = voice_profile.get_modulated(emotion)
+            self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
 
     def _play_wav_blocking(self, wav_path):
         """Play WAV synchronously (called from background thread)."""

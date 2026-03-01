@@ -2,6 +2,7 @@
 #include <string>
 #include <functional>
 #include <atomic>
+#include <mutex>
 #include "telemetry/telemetry.h"
 
 namespace revia {
@@ -24,6 +25,7 @@ public:
              RouterClassifier& router, PluginManager& plugins);
 
     void process(const PipelineRequest& req);
+    void set_llm_config(const std::string& server_url, const std::string& model);
 
     std::atomic<bool> emotion_enabled{true};
     std::atomic<bool> router_enabled{true};
@@ -33,6 +35,10 @@ private:
     EmotionNet& emotion_;
     RouterClassifier& router_;
     PluginManager& plugins_;
+
+    std::mutex llm_cfg_mtx_;
+    std::string llm_url_{"http://127.0.0.1:8080"};
+    std::string llm_model_{"default"};
 
     void stage_input_capture(const PipelineRequest& req);
     void stage_stt_batch(const PipelineRequest& req);

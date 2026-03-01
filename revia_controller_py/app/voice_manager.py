@@ -41,10 +41,14 @@ class VoiceManager(QObject):
             self.voice_changed.emit(name)
 
     def speak(self, text, emotion=None):
-        """Speak text using the active voice profile.
-        Uses saved WAV as clone reference for consistency, or pyttsx3 fallback."""
+        """Speak text using the active voice profile (async, returns immediately)."""
         emo = emotion or self._current_emotion
         self.backend.speak_from_profile(text, self._active_profile, emo)
+
+    def speak_sync(self, text, emotion=None):
+        """Speak text synchronously — blocks until synthesis and playback are done."""
+        emo = emotion or self._current_emotion
+        self.backend.speak_from_profile_sync(text, self._active_profile, emo)
 
     def apply_emotion_modifiers(self, emotion_state):
         """Called by EmotionNet to update current emotion."""

@@ -1,4 +1,6 @@
 import base64
+import queue
+import threading
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit, QPushButton,
     QComboBox,
@@ -19,6 +21,10 @@ class ChatPanel(QFrame):
         self._current_response = ""
         self._full_response = ""
         self._vision_active = False
+        # Sentence-level streaming TTS
+        self._tts_sentence_buf = ""
+        self._tts_queue = queue.Queue()
+        self._tts_worker_active = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -156,6 +162,13 @@ class ChatPanel(QFrame):
         self.input_field.clear()
         self._current_response = ""
         self._full_response = ""
+        self._tts_sentence_buf = ""
+        # Drain any leftover TTS queue from previous response
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
         self.client.send_chat(text, image_b64=image_b64)
 
     def _on_token(self, token):
@@ -171,8 +184,52 @@ class ChatPanel(QFrame):
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
+        # Sentence-streaming TTS: queue completed sentences immediately
+        tts_mode = self.tts_combo.currentText()
+        if tts_mode != "Off" and self.voice_manager:
+            self._tts_sentence_buf += token
+            self._flush_tts_sentences(end_of_response=False)
+
+    def _flush_tts_sentences(self, end_of_response=False):
+        """Split buffer on sentence boundaries and queue each complete sentence."""
+        buf = self._tts_sentence_buf
+        while buf:
+            # Find earliest sentence terminator followed by whitespace (or end if flushing)
+            best = -1
+            for i, ch in enumerate(buf):
+                if ch in '.!?':
+                    # Skip over closing quotes/parens
+                    j = i + 1
+                    while j < len(buf) and buf[j] in '"\')':
+                        j += 1
+                    at_end = j >= len(buf)
+                    followed_by_space = j < len(buf) and buf[j] in ' \n\t'
+                    if followed_by_space or (end_of_response and at_end):
+                        best = j
+                        break
+            if best == -1:
+                break
+            sentence = buf[:best].strip()
+            buf = buf[best:].lstrip()
+            if len(sentence) > 2 and not sentence.startswith('['):
+                self._tts_queue.put(sentence)
+                if not self._tts_worker_active:
+                    self._tts_worker_active = True
+                    threading.Thread(target=self._tts_worker, daemon=True).start()
+        self._tts_sentence_buf = buf
+
+    def _tts_worker(self):
+        """Background thread: consumes sentence queue and speaks each one in order."""
+        while True:
+            try:
+                sentence = self._tts_queue.get(timeout=3.0)
+                self.voice_manager.speak_sync(sentence)
+                self._tts_queue.task_done()
+            except queue.Empty:
+                break
+        self._tts_worker_active = False
+
     def _on_complete(self, text):
-        response = self._full_response or text
         if not self._current_response:
             self.chat_display.append(
                 f'<span style="color:#a78bfa;font-weight:bold;">Revia:</span> {text}'
@@ -181,17 +238,21 @@ class ChatPanel(QFrame):
         self._full_response = ""
         self.chat_display.append("")
 
-        # TTS: speak via selected engine
         tts_mode = self.tts_combo.currentText()
-        print(f"[CHAT] _on_complete: tts_mode={tts_mode}, has_vm={self.voice_manager is not None}")
-        if response and tts_mode != "Off":
-            clean = response.strip()
-            if clean and not clean.startswith("["):
-                if self.voice_manager:
-                    print(f"[CHAT] -> voice_manager.speak(), engine={self.voice_manager.backend.engine_name}")
-                    self.voice_manager.speak(clean)
-                elif self.audio_service:
-                    print("[CHAT] -> audio_service.speak() (no voice_manager)")
+        if tts_mode != "Off":
+            if self.voice_manager:
+                # Flush any remaining partial sentence from the streaming buffer
+                self._flush_tts_sentences(end_of_response=True)
+                remaining = self._tts_sentence_buf.strip()
+                self._tts_sentence_buf = ""
+                if remaining and not remaining.startswith('['):
+                    self._tts_queue.put(remaining)
+                    if not self._tts_worker_active:
+                        self._tts_worker_active = True
+                        threading.Thread(target=self._tts_worker, daemon=True).start()
+            elif self.audio_service:
+                clean = (text or "").strip()
+                if clean and not clean.startswith("["):
                     self.audio_service.speak(clean)
 
     def _on_vision_toggled(self, active):
