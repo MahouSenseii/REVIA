@@ -217,8 +217,30 @@ class LLMBackend:
             }
 
     def _build_messages(self, image_b64=None):
-        """Build the full message list with system prompt + memory + conversation."""
+        """Build the full message list with system prompt + emotion context + memory + conversation."""
         sys_content = self.system_prompt
+
+        # Inject live emotional context so the LLM can adapt its tone
+        with telemetry._lock:
+            emo = dict(telemetry.emotion)
+        label = emo.get("label", "Neutral")
+        if label not in ("Neutral", "Disabled", "---", ""):
+            v = emo.get("valence", 0.0)
+            conf = emo.get("confidence", 0.0)
+            _hints = {
+                "Happy":      "Match their energy with warmth and enthusiasm.",
+                "Angry":      "Stay calm and understanding. Acknowledge their frustration without being defensive.",
+                "Sad":        "Be gentle, empathetic, and supportive. Offer comfort.",
+                "Curious":    "Be thorough, engaging, and educational in your explanation.",
+                "Frustrated": "Be patient and clear. Acknowledge their concern and offer concrete help.",
+                "Fear":       "Be reassuring, calm, and supportive.",
+                "Excited":    "Share their enthusiasm and be energetic in your response.",
+            }
+            hint = _hints.get(label, "Adjust your tone to match their emotional state.")
+            sys_content += (
+                f"\n\n[Emotional context: The user currently seems {label} "
+                f"(valence {v:+.2f}, confidence {conf:.0%}). {hint}]"
+            )
 
         mem_ctx = memory_store.get_context_for_llm()
         if mem_ctx:
@@ -511,22 +533,73 @@ class EmotionNet:
         self.last_inference_ms = 0.0
         self.last_output = "Neutral"
 
-    def infer(self, text):
+    def infer(self, text, recent_messages=None, prev_emotion=None, profile_name=None):
+        """Infer emotion from current text with contextual corrections.
+
+        Context factors (like a real person's emotional state):
+        - Emotional inertia: previous emotion carries over partially (~20%)
+        - Conversation tone: recent exchanges shift the baseline
+        - Profile familiarity: known users have a slightly warmer baseline
+        """
         if not self.enabled:
             return {"label": "Disabled", "confidence": 0, "valence": 0,
                     "arousal": 0, "dominance": 0, "inference_ms": 0}
         t0 = time.perf_counter()
         low = text.lower()
-        if any(w in low for w in ("happy", "great", "awesome", "love", "thank")):
+
+        # --- 1. Keyword baseline ---
+        if any(w in low for w in ("happy", "great", "awesome", "love", "thank", "wonderful", "amazing")):
             r = {"valence": 0.8, "arousal": 0.6, "dominance": 0.5, "label": "Happy", "confidence": 0.82}
-        elif any(w in low for w in ("angry", "hate", "furious")):
+        elif any(w in low for w in ("angry", "hate", "furious", "ridiculous", "unacceptable")):
             r = {"valence": -0.7, "arousal": 0.8, "dominance": 0.7, "label": "Angry", "confidence": 0.78}
-        elif any(w in low for w in ("sad", "depressed", "sorry")):
+        elif any(w in low for w in ("sad", "depressed", "sorry", "upset", "cry", "miss", "lonely")):
             r = {"valence": -0.6, "arousal": 0.3, "dominance": 0.2, "label": "Sad", "confidence": 0.75}
+        elif any(w in low for w in ("scared", "afraid", "nervous", "anxious", "worried")):
+            r = {"valence": -0.5, "arousal": 0.7, "dominance": 0.1, "label": "Fear", "confidence": 0.72}
+        elif any(w in low for w in ("excited", "can't wait", "omg", "wow", "incredible")):
+            r = {"valence": 0.7, "arousal": 0.8, "dominance": 0.5, "label": "Excited", "confidence": 0.70}
         elif "?" in low:
             r = {"valence": 0.1, "arousal": 0.4, "dominance": 0.3, "label": "Curious", "confidence": 0.68}
         else:
             r = {"valence": 0.0, "arousal": 0.2, "dominance": 0.4, "label": "Neutral", "confidence": 0.90}
+
+        # --- 2. Emotional inertia: blend 20% of previous emotional state ---
+        # Humans don't flip instantly between emotions; the previous state carries over.
+        if prev_emotion and prev_emotion.get("label") not in ("Neutral", "Disabled", "---", ""):
+            alpha = 0.80  # 80% current message, 20% previous state
+            r["valence"]   = alpha * r["valence"]   + (1 - alpha) * prev_emotion.get("valence", 0.0)
+            r["arousal"]   = alpha * r["arousal"]   + (1 - alpha) * prev_emotion.get("arousal", 0.2)
+            r["dominance"] = alpha * r["dominance"] + (1 - alpha) * prev_emotion.get("dominance", 0.4)
+
+        # --- 3. Conversation tone adjustment ---
+        # Recent messages from the user shift the baseline valence.
+        if recent_messages:
+            user_msgs = [m for m in recent_messages[-8:] if m.get("role") == "user"]
+            recent_text = " ".join(m.get("content", "")[:120] for m in user_msgs).lower()
+            positive_words = sum(recent_text.count(w) for w in
+                                 ("thank", "great", "help", "please", "nice", "love", "good"))
+            negative_words = sum(recent_text.count(w) for w in
+                                 ("angry", "hate", "stupid", "wrong", "bad", "terrible", "awful"))
+            # Gentle nudge: +0.05 per positive word cluster, -0.07 per negative
+            valence_shift = min(0.15, positive_words * 0.05) - min(0.20, negative_words * 0.07)
+            r["valence"] = max(-1.0, min(1.0, r["valence"] + valence_shift))
+
+        # --- 4. Profile familiarity ---
+        # A named, known persona creates a slightly warmer social context.
+        if profile_name and profile_name.lower() not in ("default", "revia", ""):
+            r["valence"] = min(1.0, r["valence"] + 0.05)
+            r["confidence"] = min(1.0, r["confidence"] + 0.03)
+
+        # --- 5. Re-derive label if Neutral was the baseline but context shifted it ---
+        if r["label"] == "Neutral":
+            v, a = r["valence"], r["arousal"]
+            if v > 0.35 and a > 0.4:
+                r["label"] = "Happy"
+            elif v < -0.25 and a > 0.55:
+                r["label"] = "Frustrated"
+            elif v < -0.25:
+                r["label"] = "Sad"
+
         time.sleep(random.uniform(0.004, 0.012))
         ms = (time.perf_counter() - t0) * 1000
         r["inference_ms"] = ms
@@ -769,7 +842,14 @@ def process_pipeline(text, image_b64=None):
     telemetry.end_span(s)
 
     s = telemetry.begin_span("emotion_analysis")
-    emo = emotion_net.infer(text)
+    with telemetry._lock:
+        prev_emotion = dict(telemetry.emotion)
+    emo = emotion_net.infer(
+        text,
+        recent_messages=memory_store.get_short_term(limit=8),
+        prev_emotion=prev_emotion,
+        profile_name=memory_store._profile_name,
+    )
     with telemetry._lock:
         telemetry.emotion = emo
     telemetry.end_span(s)
