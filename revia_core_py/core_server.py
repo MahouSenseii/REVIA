@@ -486,12 +486,46 @@ class LLMBackend:
             with self._lock:
                 self.conversation.append({"role": "assistant", "content": full_text})
             return full_text
-        except Exception as e:
+        except req.exceptions.ConnectionError as e:
             short_url = base_url.replace("http://", "")
             err = (
                 f"[Local LLM Error] Cannot reach {server_name} at {short_url}\n"
                 f"  Error: {e}\n"
                 f"  Make sure {server_name} is running with a model loaded."
+            )
+            broadcast_fn({"type": "chat_token", "token": err})
+            with self._lock:
+                self.conversation.append({"role": "assistant", "content": err})
+            return err
+        except req.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else "?"
+            detail = ""
+            if e.response is not None:
+                try:
+                    detail = e.response.text.strip()
+                except Exception:
+                    detail = ""
+            short_url = base_url.replace("http://", "")
+            vision_hint = ""
+            if image_b64:
+                vision_hint = (
+                    "\n  Vision hint: this request included an image. "
+                    "For llama.cpp, load a multimodal model and mmproj "
+                    "(or disable vision for this model)."
+                )
+            err = (
+                f"[Local LLM Error] {server_name} returned HTTP {status} at {short_url}\n"
+                f"  Error: {detail or e}{vision_hint}"
+            )
+            broadcast_fn({"type": "chat_token", "token": err})
+            with self._lock:
+                self.conversation.append({"role": "assistant", "content": err})
+            return err
+        except Exception as e:
+            short_url = base_url.replace("http://", "")
+            err = (
+                f"[Local LLM Error] Request failed for {server_name} at {short_url}\n"
+                f"  Error: {e}"
             )
             broadcast_fn({"type": "chat_token", "token": err})
             with self._lock:

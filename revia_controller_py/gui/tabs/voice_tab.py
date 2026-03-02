@@ -2,6 +2,7 @@
 import sys
 import shutil
 import threading
+import importlib.util
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
@@ -856,7 +857,17 @@ class VoiceTab(QScrollArea):
         env.insert("PATH", sox_dir + ";" + env.value("PATH", ""))
         self._tts_process.setProcessEnvironment(env)
 
-        args = ["-m", "qwen_tts.cli.demo",
+        qwen_module = self._resolve_qwen_module()
+        if not qwen_module:
+            self.tts_server_status.setStyleSheet("color: #cc3333;")
+            self.tts_server_status.setText(
+                "Qwen3-TTS module not found. Install package, then retry."
+            )
+            self.start_tts_btn.setEnabled(True)
+            self.stop_tts_btn.setEnabled(False)
+            return
+
+        args = ["-m", qwen_module,
                 model_id, "--port", port, "--ip", "0.0.0.0",
                 "--no-flash-attn"]
         self.tts_server_status.setText(f"Loading {model_key}...")
@@ -876,6 +887,17 @@ class VoiceTab(QScrollArea):
         self._tts_ready_timer = QTimer(self)
         self._tts_ready_timer.timeout.connect(self._poll_tts_ready)
         self._tts_ready_timer.start(5000)
+
+    def _resolve_qwen_module(self):
+        """Resolve the Qwen TTS demo module across known package layouts."""
+        candidates = [
+            "qwen_tts.cli.demo",
+            "qwen_tts_cli.demo",
+        ]
+        for mod in candidates:
+            if importlib.util.find_spec(mod) is not None:
+                return mod
+        return ""
 
     def _poll_tts_ready(self):
         """Check if Gradio server is actually accepting connections."""
