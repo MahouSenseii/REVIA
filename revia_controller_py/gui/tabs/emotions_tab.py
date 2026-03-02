@@ -6,9 +6,17 @@ from PySide6.QtWidgets import (
     QTextEdit, QCheckBox, QSpinBox,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QPainter, QColor, QPen
 
-# Valence → hex colour
+try:
+    from PySide6.QtCharts import (
+        QChart, QChartView, QLineSeries, QValueAxis,
+    )
+    _CHARTS_AVAILABLE = True
+except ImportError:
+    _CHARTS_AVAILABLE = False
+
+# Emotion → hex colour
 _EMOTION_COLORS = {
     "Happy":      "#4ade80",
     "Excited":    "#34d399",
@@ -30,16 +38,20 @@ _INJECT_HINTS = {
     "Excited":    "Share their enthusiasm and be energetic in your response.",
 }
 
+_CHART_MAX_POINTS = 50
+
 
 class EmotionsTab(QScrollArea):
-    """Live emotion monitor — shows detected user emotion, VAD values,
-    the exact text injected into the AI's system prompt, and emotion history."""
+    """Live emotion monitor — current state, VAD values, line chart history,
+    and the emotion text injected into the AI's system prompt."""
 
     def __init__(self, event_bus, client, parent=None):
         super().__init__(parent)
         self.event_bus = event_bus
         self.client = client
         self.setWidgetResizable(True)
+
+        self._chart_tick = 0  # increments on each data point
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -95,6 +107,72 @@ class EmotionsTab(QScrollArea):
 
         layout.addWidget(emo_group)
 
+        # ── Emotion line chart ──────────────────────────────────────────
+        chart_group = QGroupBox("Emotion Timeline")
+        chart_group.setObjectName("settingsGroup")
+        cgl = QVBoxLayout(chart_group)
+
+        if _CHARTS_AVAILABLE:
+            self._chart_view, self._emotion_series, self._x_axis = \
+                self._build_chart()
+            self._chart_view.setMinimumHeight(220)
+            cgl.addWidget(self._chart_view)
+        else:
+            # Fallback: plain text history (QtCharts not installed)
+            self._chart_view = None
+            self._emotion_series = {}
+            self._x_axis = None
+            self._fallback_hist = QTextEdit()
+            self._fallback_hist.setReadOnly(True)
+            self._fallback_hist.setMaximumHeight(200)
+            self._fallback_hist.setFont(QFont("Consolas", 8))
+            self._fallback_hist.setPlaceholderText(
+                "PySide6.QtCharts not available — showing text history…"
+            )
+            cgl.addWidget(self._fallback_hist)
+
+        # Chart controls row
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("Show last"))
+        self.hist_limit = QSpinBox()
+        self.hist_limit.setRange(5, 100)
+        self.hist_limit.setValue(25)
+        ctrl_row.addWidget(self.hist_limit)
+        ctrl_row.addWidget(QLabel("entries"))
+        ctrl_row.addStretch()
+
+        clear_chart_btn = QPushButton("Clear Chart")
+        clear_chart_btn.setObjectName("secondaryBtn")
+        clear_chart_btn.clicked.connect(self._clear_chart)
+        ctrl_row.addWidget(clear_chart_btn)
+
+        refresh_btn = QPushButton("Refresh from API")
+        refresh_btn.setObjectName("secondaryBtn")
+        refresh_btn.clicked.connect(self._refresh_history)
+        ctrl_row.addWidget(refresh_btn)
+        cgl.addLayout(ctrl_row)
+
+        # Compact legend below the chart
+        if _CHARTS_AVAILABLE:
+            legend_row = QHBoxLayout()
+            legend_row.setSpacing(14)
+            for emo, color in _EMOTION_COLORS.items():
+                dot = QLabel("●")
+                dot.setStyleSheet(f"color: {color};")
+                dot.setFont(QFont("Segoe UI", 10))
+                lbl = QLabel(emo)
+                lbl.setFont(QFont("Segoe UI", 8))
+                lbl.setStyleSheet("color: #94a3b8;")
+                pair = QHBoxLayout()
+                pair.setSpacing(3)
+                pair.addWidget(dot)
+                pair.addWidget(lbl)
+                legend_row.addLayout(pair)
+            legend_row.addStretch()
+            cgl.addLayout(legend_row)
+
+        layout.addWidget(chart_group)
+
         # ── Emotion → AI injection ──────────────────────────────────────
         inject_group = QGroupBox("Emotion Injection to AI")
         inject_group.setObjectName("settingsGroup")
@@ -121,41 +199,70 @@ class EmotionsTab(QScrollArea):
         ig.addWidget(self.inject_preview)
 
         layout.addWidget(inject_group)
-
-        # ── Emotion history ─────────────────────────────────────────────
-        hist_group = QGroupBox("Emotion History")
-        hist_group.setObjectName("settingsGroup")
-        hl = QVBoxLayout(hist_group)
-
-        ctrl_row = QHBoxLayout()
-        ctrl_row.addWidget(QLabel("Show last"))
-        self.hist_limit = QSpinBox()
-        self.hist_limit.setRange(5, 100)
-        self.hist_limit.setValue(25)
-        ctrl_row.addWidget(self.hist_limit)
-        ctrl_row.addWidget(QLabel("entries"))
-        ctrl_row.addStretch()
-
-        refresh_btn = QPushButton("Refresh History")
-        refresh_btn.setObjectName("secondaryBtn")
-        refresh_btn.clicked.connect(self._refresh_history)
-        ctrl_row.addWidget(refresh_btn)
-        hl.addLayout(ctrl_row)
-
-        self.hist_display = QTextEdit()
-        self.hist_display.setReadOnly(True)
-        self.hist_display.setMaximumHeight(200)
-        self.hist_display.setFont(QFont("Consolas", 8))
-        self.hist_display.setPlaceholderText("No emotion history yet…")
-        hl.addWidget(self.hist_display)
-
-        layout.addWidget(hist_group)
         layout.addStretch()
         self.setWidget(container)
 
         # Wire live telemetry updates
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
         self.event_bus.chat_complete.connect(lambda _: self._refresh_history())
+
+    # ── Chart builder ────────────────────────────────────────────────────
+
+    def _build_chart(self):
+        """Build and return the QChart, series dict, and x-axis."""
+        chart = QChart()
+        chart.setTitle("")
+        chart.setAnimationOptions(QChart.NoAnimation)
+        chart.legend().setVisible(False)  # we draw our own legend below
+
+        # Dark background to match the app theme
+        chart.setBackgroundVisible(False)
+        chart.setPlotAreaBackgroundVisible(True)
+        chart.setPlotAreaBackgroundBrush(QColor("#1a1a2e"))
+
+        # One series per emotion
+        series_map = {}
+        for emotion, hex_color in _EMOTION_COLORS.items():
+            series = QLineSeries()
+            series.setName(emotion)
+            pen = QPen(QColor(hex_color))
+            pen.setWidth(2)
+            series.setPen(pen)
+            # Start hidden; only the active emotion gets data
+            chart.addSeries(series)
+            series_map[emotion] = series
+
+        # X axis — turn index
+        x_axis = QValueAxis()
+        x_axis.setRange(0, _CHART_MAX_POINTS)
+        x_axis.setLabelFormat("%d")
+        x_axis.setLabelsColor(QColor("#64748b"))
+        x_axis.setGridLineColor(QColor("#1e293b"))
+        x_axis.setTitleText("Turn")
+        x_axis.setTitleBrush(QColor("#64748b"))
+        x_axis.setTickCount(6)
+        chart.addAxis(x_axis, Qt.AlignBottom)
+
+        # Y axis — confidence 0→1
+        y_axis = QValueAxis()
+        y_axis.setRange(0.0, 1.0)
+        y_axis.setLabelFormat("%.1f")
+        y_axis.setLabelsColor(QColor("#64748b"))
+        y_axis.setGridLineColor(QColor("#1e293b"))
+        y_axis.setTitleText("Confidence")
+        y_axis.setTitleBrush(QColor("#64748b"))
+        y_axis.setTickCount(6)
+        chart.addAxis(y_axis, Qt.AlignLeft)
+
+        for series in series_map.values():
+            series.attachAxis(x_axis)
+            series.attachAxis(y_axis)
+
+        chart_view = QChartView(chart)
+        chart_view.setRenderHint(QPainter.Antialiasing)
+        chart_view.setStyleSheet("background: transparent; border: none;")
+
+        return chart_view, series_map, x_axis
 
     # ── Slots ────────────────────────────────────────────────────────────
 
@@ -181,7 +288,11 @@ class EmotionsTab(QScrollArea):
         self.arousal_bar.setValue(int(a * 100))
         self.dominance_bar.setValue(int(d * 100))
 
-        # Preview the actual text that will be injected
+        # Add to live chart
+        if _CHARTS_AVAILABLE and self._emotion_series:
+            self._add_chart_point(label, conf)
+
+        # Preview injection text
         if self.inject_enabled.isChecked() and label not in ("Neutral", "Disabled", "---", ""):
             hint = _INJECT_HINTS.get(label, "Adjust your tone to match their emotional state.")
             preview = (
@@ -191,6 +302,33 @@ class EmotionsTab(QScrollArea):
         else:
             preview = "(No emotion text injected — emotion is Neutral or injection is disabled)"
         self.inject_preview.setPlainText(preview)
+
+    def _add_chart_point(self, label: str, confidence: float):
+        """Append a new reading to the chart, sliding window of _CHART_MAX_POINTS."""
+        self._chart_tick += 1
+        tick = float(self._chart_tick)
+
+        for emo, series in self._emotion_series.items():
+            val = confidence if emo == label else 0.0
+            series.append(tick, val)
+            # Trim to window size
+            if series.count() > _CHART_MAX_POINTS:
+                series.remove(0)
+
+        # Slide x-axis window
+        x_min = max(0.0, tick - _CHART_MAX_POINTS)
+        x_max = x_min + _CHART_MAX_POINTS
+        self._x_axis.setRange(x_min, x_max)
+
+    def _clear_chart(self):
+        """Reset all series and tick counter."""
+        self._chart_tick = 0
+        if _CHARTS_AVAILABLE and self._emotion_series:
+            for series in self._emotion_series.values():
+                series.clear()
+            self._x_axis.setRange(0, _CHART_MAX_POINTS)
+        elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
+            self._fallback_hist.clear()
 
     def _toggle_injection(self, enabled: bool):
         """Enable / disable EmotionNet via the server API."""
@@ -204,6 +342,7 @@ class EmotionsTab(QScrollArea):
             pass
 
     def _refresh_history(self):
+        """Load history from the API and replay it into the chart."""
         limit = self.hist_limit.value()
         try:
             r = _req.get(
@@ -211,23 +350,29 @@ class EmotionsTab(QScrollArea):
                 params={"limit": limit},
                 timeout=3,
             )
-            if r.ok:
-                history = r.json()
-                if not history:
-                    self.hist_display.setPlainText("No emotion history recorded yet.")
-                    return
+            if not r.ok:
+                return
+            history = r.json()
+            if not history:
+                return
+
+            if _CHARTS_AVAILABLE and self._emotion_series:
+                # Clear and replay from API history
+                for series in self._emotion_series.values():
+                    series.clear()
+                self._chart_tick = 0
+                for entry in history:
+                    lbl  = entry.get("label", "Neutral")
+                    conf = entry.get("confidence", 0.0)
+                    self._add_chart_point(lbl, conf)
+            elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
                 lines = []
                 for entry in reversed(history):
-                    ts    = entry.get("timestamp", "")[:19]
-                    lbl   = entry.get("label", "?")
-                    val   = entry.get("valence",   0.0)
-                    conf  = entry.get("confidence", 0.0)
-                    color = _EMOTION_COLORS.get(lbl, "#94a3b8")
-                    lines.append(
-                        f"[{ts}]  {lbl:<12}  V:{val:+.2f}  conf:{conf:.0%}"
-                    )
-                self.hist_display.setPlainText("\n".join(lines))
-            else:
-                self.hist_display.setPlainText(f"HTTP {r.status_code}")
-        except Exception as ex:
-            self.hist_display.setPlainText(f"Error: {ex}")
+                    ts   = entry.get("timestamp", "")[:19]
+                    lbl  = entry.get("label", "?")
+                    val  = entry.get("valence",   0.0)
+                    conf = entry.get("confidence", 0.0)
+                    lines.append(f"[{ts}]  {lbl:<12}  V:{val:+.2f}  conf:{conf:.0%}")
+                self._fallback_hist.setPlainText("\n".join(lines))
+        except Exception:
+            pass

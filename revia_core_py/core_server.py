@@ -750,12 +750,18 @@ class MemoryStore:
 
     @property
     def redis_available(self):
+        global _redis_client
+        # If not connected yet, try to connect now (handles Docker starting after server)
+        if _redis_client is None:
+            _init_redis()
         if _redis_client is None:
             return False
         try:
             _redis_client.ping()
             return True
         except Exception:
+            # Connection dropped — reset so next check retries
+            _redis_client = None
             return False
 
     def _redis_key(self):
