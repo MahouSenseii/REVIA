@@ -357,7 +357,7 @@ class VisionTab(QScrollArea):
 
     def _do_detect_objects(self):
         engine = self.obj_engine.currentText()
-        if self.camera_service and self.camera_service._running:
+        if self.camera_service and self.camera_service.is_active():
             self.obj_results.setPlainText(
                 f"[{engine}] Detected objects:\n"
                 f"  - person (92%)\n"

@@ -833,6 +833,10 @@ def process_pipeline(text, image_b64=None):
     telemetry.state = "Processing"
     broadcast_json({"type": "status_update", "state": "Processing"})
 
+    # Resolve the configured compute device once for this pipeline run
+    with telemetry._lock:
+        _device = telemetry.system.get("device", "CPU")
+
     s = telemetry.begin_span("input_capture")
     time.sleep(random.uniform(0.002, 0.005))
     telemetry.end_span(s)
@@ -864,7 +868,7 @@ def process_pipeline(text, image_b64=None):
     time.sleep(random.uniform(0.008, 0.020))
     telemetry.end_span(s)
 
-    s = telemetry.begin_span("llm_prefill")
+    s = telemetry.begin_span("llm_prefill", device=_device)
     time.sleep(random.uniform(0.010, 0.030))
     telemetry.end_span(s)
 
@@ -875,7 +879,7 @@ def process_pipeline(text, image_b64=None):
     memory_store.add_short_term("user", text, meta)
 
     # LLM decode -- stream tokens via the configured backend
-    s = telemetry.begin_span("llm_decode")
+    s = telemetry.begin_span("llm_decode", device=_device)
     full_text = llm_backend.generate_streaming(
         text, broadcast_json, image_b64=image_b64
     )
@@ -893,7 +897,7 @@ def process_pipeline(text, image_b64=None):
             metadata={"emotion": emo.get("label", "")},
         )
 
-    s = telemetry.begin_span("tts_encode")
+    s = telemetry.begin_span("tts_encode", device=_device)
     time.sleep(random.uniform(0.008, 0.020))
     telemetry.end_span(s)
 
