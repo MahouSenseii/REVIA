@@ -1,5 +1,6 @@
 """Voice Management tab for REVIA -- Qwen3-TTS integration with 3 generation modes."""
 import sys
+import re
 import shutil
 import threading
 import importlib.util
@@ -24,6 +25,8 @@ QWEN_MODELS = {
     "CustomVoice 1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     "VoiceDesign 1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 }
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class VoiceTab(QScrollArea):
@@ -867,10 +870,8 @@ class VoiceTab(QScrollArea):
             self.stop_tts_btn.setEnabled(False)
             return
 
-        args = ["-m", qwen_module,
-                model_id, "--port", port, "--ip", "0.0.0.0",
-                "--no-flash-attn"]
-        self.tts_server_status.setText(f"Loading {model_key}...")
+        args, device_label = self._build_tts_server_args(qwen_module, model_id, port)
+        self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
         self.tts_server_status.setStyleSheet("color: #ccaa00;")
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
@@ -898,6 +899,42 @@ class VoiceTab(QScrollArea):
             if importlib.util.find_spec(mod) is not None:
                 return mod
         return ""
+
+    def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str):
+        """Build launch args and prefer CUDA when available."""
+        device = self._detect_tts_device()
+        args = [
+            "-m", qwen_module,
+            model_id, "--port", port, "--ip", "0.0.0.0",
+            "--no-flash-attn",
+        ]
+        if self._qwen_cli_supports_flag(qwen_module, "--device"):
+            args.extend(["--device", device])
+        return args, device.upper()
+
+    def _detect_tts_device(self) -> str:
+        """Auto-select CUDA when available, otherwise force CPU."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    def _qwen_cli_supports_flag(self, qwen_module: str, flag: str) -> bool:
+        """Check whether qwen_tts demo CLI accepts a given option."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", qwen_module, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            return flag in ((result.stdout or "") + (result.stderr or ""))
+        except Exception:
+            return False
 
     def _poll_tts_ready(self):
         """Check if Gradio server is actually accepting connections."""
@@ -937,13 +974,11 @@ class VoiceTab(QScrollArea):
             "utf-8", errors="replace"
         )
         for line in data.strip().split("\n"):
-            line = line.strip()
+            line = self._clean_tts_log_line(line)
             if not line:
                 continue
             print(f"[TTS-SRV] {line}")
-            self._tts_last_lines.append(line)
-            if len(self._tts_last_lines) > 20:
-                self._tts_last_lines.pop(0)
+            self._append_tts_log_line(line)
             if "Running on" in line:
                 self.tts_server_status.setText("Running on :8000")
                 self.tts_server_status.setStyleSheet("color: #00aa40;")
@@ -957,12 +992,10 @@ class VoiceTab(QScrollArea):
                 "utf-8", errors="replace"
             )
             for line in remaining.strip().split("\n"):
-                line = line.strip()
+                line = self._clean_tts_log_line(line)
                 if line:
                     print(f"[TTS-SRV] {line}")
-                    self._tts_last_lines.append(line)
-                    if len(self._tts_last_lines) > 20:
-                        self._tts_last_lines.pop(0)
+                    self._append_tts_log_line(line)
 
         print(f"[TTS-SRV] Exited: code={exit_code}")
         if self._tts_ready_timer:
@@ -990,6 +1023,16 @@ class VoiceTab(QScrollArea):
                 self.tts_server_status.setText(
                     f"Exited ({exit_code}) — check console for details"
                 )
+
+    def _clean_tts_log_line(self, line: str) -> str:
+        """Normalize process output for UI display by removing ANSI escapes."""
+        return ANSI_ESCAPE_RE.sub("", line).strip()
+
+    def _append_tts_log_line(self, line: str):
+        """Store meaningful process output lines for crash hints."""
+        self._tts_last_lines.append(line)
+        if len(self._tts_last_lines) > 20:
+            self._tts_last_lines.pop(0)
 
     def _kill_port(self, port):
         try:
