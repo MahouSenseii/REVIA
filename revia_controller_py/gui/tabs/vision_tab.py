@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QGroupBox, QSpinBox, QCheckBox,
-    QPushButton, QMessageBox, QTextEdit,
+    QPushButton, QMessageBox, QTextEdit, QSizePolicy,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -226,8 +226,11 @@ class VisionTab(QScrollArea):
         self.preview = QLabel("[Camera Inactive]")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumHeight(200)
+        self.preview.setMinimumWidth(0)
+        self.preview.setMaximumWidth(720)
+        self.preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.preview.setObjectName("webcamPlaceholder")
-        p.addWidget(self.preview)
+        p.addWidget(self.preview, alignment=Qt.AlignCenter)
 
         snap_row = QHBoxLayout()
         self.snapshot_btn = QPushButton("Take Snapshot")
