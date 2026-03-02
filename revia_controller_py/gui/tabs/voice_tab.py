@@ -870,10 +870,8 @@ class VoiceTab(QScrollArea):
             self.stop_tts_btn.setEnabled(False)
             return
 
-        args = ["-m", qwen_module,
-                model_id, "--port", port, "--ip", "0.0.0.0",
-                "--no-flash-attn"]
-        self.tts_server_status.setText(f"Loading {model_key}...")
+        args, device_label = self._build_tts_server_args(qwen_module, model_id, port)
+        self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
         self.tts_server_status.setStyleSheet("color: #ccaa00;")
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
@@ -901,6 +899,42 @@ class VoiceTab(QScrollArea):
             if importlib.util.find_spec(mod) is not None:
                 return mod
         return ""
+
+    def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str):
+        """Build launch args and prefer CUDA when available."""
+        device = self._detect_tts_device()
+        args = [
+            "-m", qwen_module,
+            model_id, "--port", port, "--ip", "0.0.0.0",
+            "--no-flash-attn",
+        ]
+        if self._qwen_cli_supports_flag(qwen_module, "--device"):
+            args.extend(["--device", device])
+        return args, device.upper()
+
+    def _detect_tts_device(self) -> str:
+        """Auto-select CUDA when available, otherwise force CPU."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    def _qwen_cli_supports_flag(self, qwen_module: str, flag: str) -> bool:
+        """Check whether qwen_tts demo CLI accepts a given option."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", qwen_module, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            return flag in ((result.stdout or "") + (result.stderr or ""))
+        except Exception:
+            return False
 
     def _poll_tts_ready(self):
         """Check if Gradio server is actually accepting connections."""
