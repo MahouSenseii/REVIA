@@ -18,6 +18,54 @@ from flask_cors import CORS
 import websockets
 import websockets.server
 
+# ---------------------------------------------------------------------------
+# Optional Redis client for Docker-backed long-term memory
+# ---------------------------------------------------------------------------
+
+_redis_client = None
+
+def _init_redis():
+    global _redis_client
+    try:
+        import redis as _redis_mod
+        host = os.environ.get("REDIS_HOST", "127.0.0.1")
+        port = int(os.environ.get("REDIS_PORT", "6379"))
+        c = _redis_mod.Redis(
+            host=host, port=port,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        c.ping()
+        _redis_client = c
+        print(f"[REVIA Core] Redis connected at {host}:{port} — long-term memory backed by Docker.")
+    except Exception as e:
+        print(f"[REVIA Core] Redis unavailable ({e}). Using local .jsonl files for long-term memory.")
+        _redis_client = None
+
+_init_redis()
+
+# ---------------------------------------------------------------------------
+# Emotion history (in-memory ring buffer)
+# ---------------------------------------------------------------------------
+
+_emotion_history = []
+_EMOTION_HISTORY_MAX = 100
+
+def _record_emotion(emo):
+    """Append emotion reading to the ring buffer."""
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "label":     emo.get("label", "Neutral"),
+        "valence":   round(emo.get("valence", 0.0), 4),
+        "arousal":   round(emo.get("arousal", 0.0), 4),
+        "dominance": round(emo.get("dominance", 0.0), 4),
+        "confidence": round(emo.get("confidence", 0.0), 4),
+    }
+    _emotion_history.append(entry)
+    if len(_emotion_history) > _EMOTION_HISTORY_MAX:
+        del _emotion_history[:-_EMOTION_HISTORY_MAX]
+
 
 def _get_gpu_stats():
     try:
@@ -242,7 +290,14 @@ class LLMBackend:
                 f"(valence {v:+.2f}, confidence {conf:.0%}). {hint}]"
             )
 
-        mem_ctx = memory_store.get_context_for_llm()
+        # Pass current user query for relevance-aware memory retrieval
+        query = None
+        if self.conversation:
+            last = self.conversation[-1]
+            if last.get("role") == "user" and isinstance(last.get("content"), str):
+                query = last["content"]
+
+        mem_ctx = memory_store.get_context_for_llm(query=query)
         if mem_ctx:
             sys_content += "\n\n--- Memory Context ---\n" + mem_ctx
 
@@ -689,6 +744,45 @@ class MemoryStore:
         self._lt_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_long_term()
 
+    # ------------------------------------------------------------------
+    # Redis helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def redis_available(self):
+        if _redis_client is None:
+            return False
+        try:
+            _redis_client.ping()
+            return True
+        except Exception:
+            return False
+
+    def _redis_key(self):
+        return f"revia:lt:{self._profile_name}"
+
+    def _redis_push(self, entry):
+        """Push a single long-term entry to Redis (best-effort)."""
+        if _redis_client is None:
+            return
+        try:
+            _redis_client.rpush(self._redis_key(), json.dumps(entry))
+        except Exception:
+            pass
+
+    def _redis_clear(self):
+        """Delete the Redis list for the current profile."""
+        if _redis_client is None:
+            return
+        try:
+            _redis_client.delete(self._redis_key())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Profile switching
+    # ------------------------------------------------------------------
+
     def switch_profile(self, profile_name):
         """Switch to a different profile's memory."""
         with self._lock:
@@ -699,7 +793,28 @@ class MemoryStore:
             self._lt_file.parent.mkdir(parents=True, exist_ok=True)
             self._load_long_term()
 
+    # ------------------------------------------------------------------
+    # Load from Redis → fallback to local file
+    # ------------------------------------------------------------------
+
     def _load_long_term(self):
+        # Try Redis first
+        if _redis_client is not None:
+            try:
+                raw_entries = _redis_client.lrange(self._redis_key(), 0, -1)
+                for raw in raw_entries:
+                    try:
+                        self.long_term.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        pass
+                if self.long_term:
+                    print(f"[Memory] Loaded {len(self.long_term)} long-term entries from Redis "
+                          f"(profile: {self._profile_name})")
+                    return
+            except Exception as e:
+                print(f"[Memory] Redis load failed ({e}), falling back to local file.")
+
+        # Fallback: local .jsonl file
         if self._lt_file.exists():
             for line in self._lt_file.read_text(encoding="utf-8").splitlines():
                 try:
@@ -707,10 +822,20 @@ class MemoryStore:
                 except json.JSONDecodeError:
                     pass
 
-    def get_context_for_llm(self, max_short=10, max_long=5):
-        """Build a memory context string to inject into the LLM prompt."""
+    # ------------------------------------------------------------------
+    # Context building for LLM (query-aware)
+    # ------------------------------------------------------------------
+
+    def get_context_for_llm(self, query=None, max_short=10, max_long=5):
+        """Build a memory context string injected into the LLM system prompt.
+
+        If *query* is provided, relevant long-term entries are retrieved via
+        keyword scoring instead of just the chronologically last N entries.
+        """
         with self._lock:
             parts = []
+
+            # Recent conversation window
             recent = self.short_term[-max_short:] if self.short_term else []
             if recent:
                 lines = []
@@ -720,17 +845,50 @@ class MemoryStore:
                     lines.append(f"  [{role}]: {content}")
                 parts.append("Recent conversation memory:\n" + "\n".join(lines))
 
+            # Query-aware long-term retrieval
             if self.long_term:
-                notes = self.long_term[-max_long:]
+                if query:
+                    relevant = self._score_long_term(query, max_long)
+                else:
+                    relevant = self.long_term[-max_long:]
                 lines = []
-                for e in notes:
+                for e in relevant:
                     content = e.get("content", "")[:200]
                     cat = e.get("category", "")
                     ts = e.get("timestamp", "")[:10]
                     lines.append(f"  [{cat} {ts}]: {content}")
-                parts.append("Long-term memories:\n" + "\n".join(lines))
+                parts.append("Relevant long-term memories:\n" + "\n".join(lines))
 
             return "\n\n".join(parts) if parts else ""
+
+    def _score_long_term(self, query, max_results):
+        """Return up to *max_results* long-term entries most relevant to *query*."""
+        query_lower = query.lower()
+        words = set(w for w in query_lower.split() if len(w) > 2)
+        scored = []
+        for entry in self.long_term:
+            content_lower = entry.get("content", "").lower()
+            score = sum(1 for w in words if w in content_lower)
+            if query_lower in content_lower:
+                score += 3
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = [e for _, e in scored[:max_results]]
+        # Pad with recents if needed
+        if len(results) < max_results:
+            seen = set(id(e) for e in results)
+            for e in reversed(self.long_term):
+                if id(e) not in seen:
+                    results.append(e)
+                    seen.add(id(e))
+                    if len(results) >= max_results:
+                        break
+        return results
+
+    # ------------------------------------------------------------------
+    # Write helpers
+    # ------------------------------------------------------------------
 
     def add_short_term(self, role, content, metadata=None):
         with self._lock:
@@ -749,8 +907,10 @@ class MemoryStore:
     def _promote_to_long_term(self, entry):
         entry["promoted"] = True
         self.long_term.append(entry)
+        raw = json.dumps(entry)
+        self._redis_push(entry)
         with open(self._lt_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+            f.write(raw + "\n")
 
     def save_to_long_term(self, content, category="user_note", metadata=None):
         with self._lock:
@@ -760,10 +920,16 @@ class MemoryStore:
                 "metadata": metadata or {},
             }
             self.long_term.append(entry)
+            self._redis_push(entry)
             with open(self._lt_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
 
+    # ------------------------------------------------------------------
+    # Search (for API / Memory tab)
+    # ------------------------------------------------------------------
+
     def search(self, query, max_results=5):
+        """Keyword search across long-term entries (also used by REST API)."""
         query_lower = query.lower()
         results = []
         for entry in reversed(self.long_term):
@@ -772,6 +938,10 @@ class MemoryStore:
                 if len(results) >= max_results:
                     break
         return results
+
+    # ------------------------------------------------------------------
+    # Read helpers
+    # ------------------------------------------------------------------
 
     def get_short_term(self, limit=50):
         with self._lock:
@@ -783,6 +953,10 @@ class MemoryStore:
             "long_term_count": len(self.long_term),
         }
 
+    # ------------------------------------------------------------------
+    # Clear helpers
+    # ------------------------------------------------------------------
+
     def clear_short_term(self):
         with self._lock:
             self.short_term.clear()
@@ -790,6 +964,7 @@ class MemoryStore:
     def clear_long_term(self):
         with self._lock:
             self.long_term.clear()
+            self._redis_clear()
             if self._lt_file.exists():
                 self._lt_file.write_text("", encoding="utf-8")
 
@@ -890,6 +1065,7 @@ def process_pipeline(text, image_b64=None):
     )
     with telemetry._lock:
         telemetry.emotion = emo
+    _record_emotion(emo)
     telemetry.end_span(s)
 
     s = telemetry.begin_span("router_classify")
@@ -1097,9 +1273,15 @@ def _build_system_prompt(prof):
         )
 
     parts.append(
-        "Use your memory context (provided below the conversation) to "
-        "recall past interactions and user preferences. Reference them "
-        "naturally when relevant."
+        "MEMORY & EMOTION INSTRUCTIONS: "
+        "A '--- Memory Context ---' section will be appended to your system prompt "
+        "before each response, containing recent conversation history and long-term "
+        "facts/preferences about the user. "
+        "You MUST actively read this context and reference relevant memories in your "
+        "replies — e.g., if the user's name or a preference is stored, use it. "
+        "An '[Emotional context]' hint may also appear — adapt your tone and empathy "
+        "level accordingly. These hints are part of your character: respond naturally "
+        "and with emotional intelligence at all times."
     )
 
     return "\n".join(parts)
@@ -1140,6 +1322,32 @@ def api_memory_short_clear():
 def api_memory_long_clear():
     memory_store.clear_long_term()
     return jsonify({"ok": True})
+
+@app.route("/api/memory/docker/status", methods=["GET"])
+def api_memory_docker_status():
+    """Return Redis/Docker connection status for the memory backend."""
+    redis_ok = memory_store.redis_available
+    return jsonify({
+        "redis_available": redis_ok,
+        "redis_host": os.environ.get("REDIS_HOST", "127.0.0.1"),
+        "redis_port": int(os.environ.get("REDIS_PORT", "6379")),
+        "long_term_backend": "redis" if redis_ok else "local_file",
+        "profile": memory_store._profile_name,
+        "long_term_count": len(memory_store.long_term),
+    })
+
+@app.route("/api/emotions/history", methods=["GET"])
+def api_emotions_history():
+    """Return the recent emotion history ring buffer."""
+    limit = request.args.get("limit", 50, type=int)
+    return jsonify(_emotion_history[-limit:])
+
+@app.route("/api/emotions/current", methods=["GET"])
+def api_emotions_current():
+    """Return the current emotion state from telemetry."""
+    with telemetry._lock:
+        emo = dict(telemetry.emotion)
+    return jsonify(emo)
 
 # ---------------------------------------------------------------------------
 # Startup

@@ -1,0 +1,26 @@
+version: "3.9"
+
+# REVIA Docker services
+# Run: docker compose up -d
+# This starts Redis for persistent long-term memory storage.
+# The core server will automatically connect to Redis when it's available.
+
+services:
+  revia-redis:
+    image: redis:7-alpine
+    container_name: revia-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - revia_redis_data:/data
+    command: redis-server --appendonly yes --save 60 1 --save 300 10
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  revia_redis_data:
+    name: revia_redis_data

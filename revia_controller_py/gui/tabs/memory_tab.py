@@ -23,6 +23,23 @@ class MemoryTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
+        # --- Docker / Redis Status ---
+        docker_group = QGroupBox("Docker Memory Backend (Long-Term)")
+        docker_group.setObjectName("settingsGroup")
+        dg = QHBoxLayout(docker_group)
+
+        self.docker_status = QLabel("Status: not checked")
+        self.docker_status.setFont(QFont("Consolas", 9))
+        self.docker_status.setObjectName("metricLabel")
+        dg.addWidget(self.docker_status, stretch=1)
+
+        docker_check_btn = QPushButton("Check")
+        docker_check_btn.setObjectName("secondaryBtn")
+        docker_check_btn.clicked.connect(self._check_docker_status)
+        dg.addWidget(docker_check_btn)
+
+        layout.addWidget(docker_group)
+
         # --- Memory Backend ---
         backend_group = QGroupBox("Memory Store")
         backend_group.setObjectName("settingsGroup")
@@ -158,11 +175,17 @@ class MemoryTab(QScrollArea):
 
         # Auto-refresh both views whenever a chat round-trip completes
         self.event_bus.chat_complete.connect(self._on_chat_complete)
+        # Check Docker status once on first connection
+        self.event_bus.connection_changed.connect(self._on_connected)
 
     def _on_chat_complete(self, _text):
         """Triggered after each assistant reply — refresh memory displays."""
         self._refresh_short_term()
         self._refresh_stats()
+
+    def _on_connected(self, connected):
+        if connected:
+            self._check_docker_status()
 
     # --- Actions ---
 
@@ -273,3 +296,30 @@ class MemoryTab(QScrollArea):
             self.lt_count.setText("Entries: 0")
         except Exception:
             pass
+
+    def _check_docker_status(self):
+        try:
+            import requests
+            r = requests.get(
+                f"{self.client.BASE_URL}/api/memory/docker/status", timeout=3
+            )
+            if r.ok:
+                d = r.json()
+                if d.get("redis_available"):
+                    host = d.get("redis_host", "127.0.0.1")
+                    port = d.get("redis_port", 6379)
+                    count = d.get("long_term_count", 0)
+                    self.docker_status.setText(
+                        f"Redis (Docker): Connected  {host}:{port} — "
+                        f"{count} entries  [backend: redis]"
+                    )
+                    self.docker_status.setStyleSheet("color: #4ade80;")
+                else:
+                    self.docker_status.setText(
+                        "Redis (Docker): Offline — using local .jsonl files  "
+                        "(run: docker compose up -d)"
+                    )
+                    self.docker_status.setStyleSheet("color: #f59e0b;")
+        except Exception as ex:
+            self.docker_status.setText(f"Docker check error: {ex}")
+            self.docker_status.setStyleSheet("color: #f87171;")
