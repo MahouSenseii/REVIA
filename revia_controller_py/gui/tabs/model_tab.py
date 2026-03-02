@@ -1,4 +1,5 @@
 import sys
+import json
 import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -9,6 +10,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QProcess, QTimer
 
+# Persisted model settings live alongside the top-level config.json
+_SETTINGS_FILE = Path(__file__).resolve().parents[3] / "model_settings.json"
+
 
 class ModelTab(QScrollArea):
     def __init__(self, event_bus, client, parent=None):
@@ -16,6 +20,7 @@ class ModelTab(QScrollArea):
         self.event_bus = event_bus
         self.client = client
         self._llm_process = None
+        self._loading = False  # guard: prevents saving while loading
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -309,12 +314,14 @@ class ModelTab(QScrollArea):
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self._on_source_changed(0)
         self._on_provider_changed(self.api_provider.currentText())
+        self._load_settings()  # restore previous session settings
 
     # --- Slots ---
 
     def _on_source_changed(self, index):
         self.source_stack.setCurrentIndex(index)
         self.gpu_group.setVisible(index == 0)
+        self._save_settings()
 
     def _on_local_server_changed(self, server):
         urls = {
@@ -334,6 +341,7 @@ class ModelTab(QScrollArea):
         }
         if server in ports:
             self.srv_port.setValue(ports[server])
+        self._save_settings()
 
     def _browse_server_exe(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -342,6 +350,7 @@ class ModelTab(QScrollArea):
         )
         if path:
             self.llm_exe_path.setText(path)
+            self._save_settings()
 
     def _start_llm_server(self):
         if self._llm_process and self._llm_process.state() == QProcess.Running:
@@ -547,6 +556,7 @@ class ModelTab(QScrollArea):
         self.api_model.clear()
         for m in models.get(provider, []):
             self.api_model.addItem(m)
+        self._save_settings()
 
     def _toggle_key_visibility(self, show):
         if show:
@@ -566,6 +576,162 @@ class ModelTab(QScrollArea):
         )
         if path:
             self.local_path.setText(path)
+            self._save_settings()
+
+    # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+
+    def _save_settings(self):
+        """Write current UI state to model_settings.json."""
+        if self._loading:
+            return
+        data = {
+            "source_index": self.source_type.currentIndex(),
+            # Local model
+            "local_path": self.local_path.text(),
+            "local_server": self.local_server.currentText(),
+            "local_server_url": self.local_server_url.text(),
+            "local_format": self.local_format.currentText(),
+            "local_backend": self.local_backend.currentText(),
+            "local_loader": self.local_loader.currentText(),
+            "llm_exe_path": self.llm_exe_path.text(),
+            "srv_gpu_layers": self.srv_gpu_layers.value(),
+            "srv_ctx": self.srv_ctx.value(),
+            "srv_port": self.srv_port.value(),
+            # Online API
+            "api_provider": self.api_provider.currentText(),
+            "api_endpoint": self.api_endpoint.text(),
+            "api_key": self.api_key.text(),
+            "api_model": self.api_model.currentText(),
+            "api_org": self.api_org.text(),
+            # Generation params
+            "ctx_length": self.ctx_length.value(),
+            "temperature": self.temperature.value(),
+            "top_p": self.top_p.value(),
+            "max_tokens": self.max_tokens.value(),
+            "repeat_penalty": self.repeat_penalty.value(),
+            # GPU / quant
+            "gpu_layers": self.gpu_layers.value(),
+            "batch_size": self.batch_size.value(),
+            "threads": self.threads.value(),
+            "quant": self.quant.currentText(),
+        }
+        try:
+            _SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.event_bus.log_entry.emit(f"[Model] Could not save settings: {e}")
+
+    def _load_settings(self):
+        """Restore UI state from model_settings.json (if it exists)."""
+        if not _SETTINGS_FILE.exists():
+            return
+        try:
+            data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        self._loading = True
+        try:
+            # --- Source type ---
+            src = int(data.get("source_index", 0))
+            self.source_type.blockSignals(True)
+            self.source_type.setCurrentIndex(src)
+            self.source_type.blockSignals(False)
+
+            # --- Local model ---
+            self.local_path.setText(data.get("local_path", ""))
+
+            srv = data.get("local_server", "")
+            if srv:
+                self.local_server.blockSignals(True)
+                idx = self.local_server.findText(srv)
+                if idx >= 0:
+                    self.local_server.setCurrentIndex(idx)
+                self.local_server.blockSignals(False)
+
+            # Restore URL after combo (avoids the auto-preset overwriting it)
+            url = data.get("local_server_url", "")
+            if url:
+                self.local_server_url.setText(url)
+
+            fmt = data.get("local_format", "")
+            if fmt:
+                idx = self.local_format.findText(fmt)
+                if idx >= 0:
+                    self.local_format.setCurrentIndex(idx)
+
+            backend = data.get("local_backend", "")
+            if backend:
+                idx = self.local_backend.findText(backend)
+                if idx >= 0:
+                    self.local_backend.setCurrentIndex(idx)
+
+            loader = data.get("local_loader", "")
+            if loader:
+                idx = self.local_loader.findText(loader)
+                if idx >= 0:
+                    self.local_loader.setCurrentIndex(idx)
+
+            self.llm_exe_path.setText(data.get("llm_exe_path", ""))
+            self.srv_gpu_layers.setValue(int(data.get("srv_gpu_layers", -1)))
+            self.srv_ctx.setValue(int(data.get("srv_ctx", 4096)))
+            self.srv_port.setValue(int(data.get("srv_port", 8080)))
+
+            # --- Online API ---
+            provider = data.get("api_provider", "")
+            if provider:
+                self.api_provider.blockSignals(True)
+                idx = self.api_provider.findText(provider)
+                if idx >= 0:
+                    self.api_provider.setCurrentIndex(idx)
+                self.api_provider.blockSignals(False)
+                # Repopulate model list for the saved provider
+                self._on_provider_changed(self.api_provider.currentText())
+
+            ep = data.get("api_endpoint", "")
+            if ep:
+                self.api_endpoint.setText(ep)
+
+            self.api_key.setText(data.get("api_key", ""))
+
+            model = data.get("api_model", "")
+            if model:
+                idx = self.api_model.findText(model)
+                if idx >= 0:
+                    self.api_model.setCurrentIndex(idx)
+                else:
+                    self.api_model.setEditText(model)
+
+            self.api_org.setText(data.get("api_org", ""))
+
+            # --- Generation params ---
+            self.ctx_length.setValue(int(data.get("ctx_length", 4096)))
+            self.temperature.setValue(float(data.get("temperature", 0.7)))
+            self.top_p.setValue(float(data.get("top_p", 0.9)))
+            self.max_tokens.setValue(int(data.get("max_tokens", 512)))
+            self.repeat_penalty.setValue(float(data.get("repeat_penalty", 1.1)))
+
+            # --- GPU / quant ---
+            self.gpu_layers.setValue(int(data.get("gpu_layers", 0)))
+            self.batch_size.setValue(int(data.get("batch_size", 512)))
+            self.threads.setValue(int(data.get("threads", 4)))
+            quant = data.get("quant", "")
+            if quant:
+                idx = self.quant.findText(quant)
+                if idx >= 0:
+                    self.quant.setCurrentIndex(idx)
+
+            # Apply source-page visibility
+            self._on_source_changed(src)
+
+        except Exception as e:
+            self.event_bus.log_entry.emit(f"[Model] Could not restore settings: {e}")
+        finally:
+            self._loading = False
+
+        if data.get("local_path") or data.get("api_key"):
+            self.event_bus.log_entry.emit("[Model] Previous session settings restored.")
 
     def _test_connection(self):
         self.conn_status.setText("Status: Connecting...")
@@ -585,6 +751,7 @@ class ModelTab(QScrollArea):
         self.connect_btn.setEnabled(True)
 
     def _push_config_to_core(self, source):
+        self._save_settings()
         import threading
         cfg = {
             "source": source,

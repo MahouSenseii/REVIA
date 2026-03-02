@@ -3,6 +3,7 @@ import threading
 import requests
 from PySide6.QtCore import QObject, QTimer, QUrl
 from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtNetwork import QAbstractSocket
 
 
 class ControllerClient(QObject):
@@ -38,7 +39,8 @@ class ControllerClient(QObject):
         self.ws.close()
 
     def _try_connect(self):
-        if not self.connected:
+        # Only open when socket is fully unconnected (prevents double-open during reconnect)
+        if not self.connected and self.ws.state() == QAbstractSocket.UnconnectedState:
             self.ws.open(QUrl(self.WS_URL))
 
     def _on_ws_connected(self):
@@ -71,18 +73,22 @@ class ControllerClient(QObject):
             try:
                 r = requests.get(f"{self.BASE_URL}/api/status", timeout=1)
                 if r.ok:
-                    data = r.json()
-                    self._last_poll = data
-                    if not self.connected:
-                        self._try_connect()
+                    self._last_poll = r.json()
+                else:
+                    self._last_poll = None
             except Exception:
                 self._last_poll = None
         threading.Thread(target=_do, daemon=True).start()
+        # Emit result on main thread after the request has time to complete.
+        # Also trigger a WS reconnect attempt here (safe: runs on main thread).
         QTimer.singleShot(1200, self._emit_poll_result)
 
     def _emit_poll_result(self):
         data = getattr(self, "_last_poll", None)
         if data:
+            # Core is reachable — attempt WS reconnect if still disconnected (main thread, safe)
+            if not self.connected:
+                self._try_connect()
             self.event_bus.telemetry_updated.emit({
                 "system": data.get("system", {}),
                 "llm": data.get("llm", {}),
