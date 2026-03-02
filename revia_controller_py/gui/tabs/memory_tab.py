@@ -156,6 +156,14 @@ class MemoryTab(QScrollArea):
         layout.addStretch()
         self.setWidget(container)
 
+        # Auto-refresh both views whenever a chat round-trip completes
+        self.event_bus.chat_complete.connect(self._on_chat_complete)
+
+    def _on_chat_complete(self, _text):
+        """Triggered after each assistant reply — refresh memory displays."""
+        self._refresh_short_term()
+        self._refresh_stats()
+
     # --- Actions ---
 
     def _refresh_short_term(self):

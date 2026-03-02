@@ -88,6 +88,7 @@ class VoiceTab(QScrollArea):
         self.voice_mgr.backend.set_qwen_server("http://localhost:8000")
         self._tts_process = None
         self._tts_ready_timer = None
+        self._tts_last_lines: list[str] = []
         layout.addWidget(srv_group)
 
         # ── 3 Mode Tabs (matching Qwen3-TTS demo) ──
@@ -918,6 +919,9 @@ class VoiceTab(QScrollArea):
             if not line:
                 continue
             print(f"[TTS-SRV] {line}")
+            self._tts_last_lines.append(line)
+            if len(self._tts_last_lines) > 20:
+                self._tts_last_lines.pop(0)
             if "Running on" in line:
                 self.tts_server_status.setText("Running on :8000")
                 self.tts_server_status.setStyleSheet("color: #00aa40;")
@@ -925,13 +929,45 @@ class VoiceTab(QScrollArea):
                     self._tts_ready_timer.stop()
 
     def _on_tts_finished(self, exit_code, exit_status):
+        # Drain any remaining buffered output before updating the UI
+        if self._tts_process:
+            remaining = self._tts_process.readAllStandardOutput().data().decode(
+                "utf-8", errors="replace"
+            )
+            for line in remaining.strip().split("\n"):
+                line = line.strip()
+                if line:
+                    print(f"[TTS-SRV] {line}")
+                    self._tts_last_lines.append(line)
+                    if len(self._tts_last_lines) > 20:
+                        self._tts_last_lines.pop(0)
+
         print(f"[TTS-SRV] Exited: code={exit_code}")
         if self._tts_ready_timer:
             self._tts_ready_timer.stop()
-        self.tts_server_status.setText(f"Exited ({exit_code})")
-        self.tts_server_status.setStyleSheet("")
         self.start_tts_btn.setEnabled(True)
         self.stop_tts_btn.setEnabled(False)
+
+        if exit_code == 0:
+            self.tts_server_status.setText("Stopped")
+            self.tts_server_status.setStyleSheet("")
+        else:
+            # Show the last error line in the status label so the user can
+            # diagnose the crash without opening the console.
+            error_hint = ""
+            for line in reversed(self._tts_last_lines):
+                if line:
+                    error_hint = line[:120]
+                    break
+            self.tts_server_status.setStyleSheet("color: #cc3333;")
+            if error_hint:
+                self.tts_server_status.setText(
+                    f"Exited ({exit_code}): {error_hint}"
+                )
+            else:
+                self.tts_server_status.setText(
+                    f"Exited ({exit_code}) — check console for details"
+                )
 
     def _kill_port(self, port):
         try:
