@@ -1,5 +1,6 @@
 """Voice Management tab for REVIA -- Qwen3-TTS integration with 3 generation modes."""
 import sys
+import re
 import shutil
 import threading
 import importlib.util
@@ -24,6 +25,8 @@ QWEN_MODELS = {
     "CustomVoice 1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     "VoiceDesign 1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 }
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class VoiceTab(QScrollArea):
@@ -937,13 +940,11 @@ class VoiceTab(QScrollArea):
             "utf-8", errors="replace"
         )
         for line in data.strip().split("\n"):
-            line = line.strip()
+            line = self._clean_tts_log_line(line)
             if not line:
                 continue
             print(f"[TTS-SRV] {line}")
-            self._tts_last_lines.append(line)
-            if len(self._tts_last_lines) > 20:
-                self._tts_last_lines.pop(0)
+            self._append_tts_log_line(line)
             if "Running on" in line:
                 self.tts_server_status.setText("Running on :8000")
                 self.tts_server_status.setStyleSheet("color: #00aa40;")
@@ -957,12 +958,10 @@ class VoiceTab(QScrollArea):
                 "utf-8", errors="replace"
             )
             for line in remaining.strip().split("\n"):
-                line = line.strip()
+                line = self._clean_tts_log_line(line)
                 if line:
                     print(f"[TTS-SRV] {line}")
-                    self._tts_last_lines.append(line)
-                    if len(self._tts_last_lines) > 20:
-                        self._tts_last_lines.pop(0)
+                    self._append_tts_log_line(line)
 
         print(f"[TTS-SRV] Exited: code={exit_code}")
         if self._tts_ready_timer:
@@ -990,6 +989,16 @@ class VoiceTab(QScrollArea):
                 self.tts_server_status.setText(
                     f"Exited ({exit_code}) — check console for details"
                 )
+
+    def _clean_tts_log_line(self, line: str) -> str:
+        """Normalize process output for UI display by removing ANSI escapes."""
+        return ANSI_ESCAPE_RE.sub("", line).strip()
+
+    def _append_tts_log_line(self, line: str):
+        """Store meaningful process output lines for crash hints."""
+        self._tts_last_lines.append(line)
+        if len(self._tts_last_lines) > 20:
+            self._tts_last_lines.pop(0)
 
     def _kill_port(self, port):
         try:
