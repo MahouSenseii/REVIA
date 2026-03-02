@@ -153,3 +153,30 @@ class ControllerClient(QObject):
             )
         except Exception:
             pass
+
+    def get_emotion_history(self, limit=50):
+        try:
+            r = requests.get(
+                f"{self.BASE_URL}/api/emotions/history",
+                params={"limit": limit},
+                timeout=2,
+            )
+            return r.json() if r.ok else []
+        except Exception:
+            return []
+
+    def get_current_emotion(self):
+        try:
+            r = requests.get(f"{self.BASE_URL}/api/emotions/current", timeout=2)
+            return r.json() if r.ok else {}
+        except Exception:
+            return {}
+
+    def get_docker_memory_status(self):
+        try:
+            r = requests.get(
+                f"{self.BASE_URL}/api/memory/docker/status", timeout=2
+            )
+            return r.json() if r.ok else {}
+        except Exception:
+            return {}

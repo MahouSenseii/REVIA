@@ -18,6 +18,7 @@ from gui.tabs.vision_tab import VisionTab
 from gui.tabs.filters_tab import FiltersTab
 from gui.tabs.logs_tab import LogsTab
 from gui.tabs.system_tab import SystemTab
+from gui.tabs.emotions_tab import EmotionsTab
 
 
 class MainWindow(QMainWindow):
@@ -95,6 +96,9 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.vision_tab, "Vision")
 
+        self.tabs.addTab(
+            EmotionsTab(self.event_bus, self.client), "Emotions"
+        )
         self.tabs.addTab(
             FiltersTab(self.event_bus, self.client), "Filters"
         )
