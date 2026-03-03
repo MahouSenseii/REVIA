@@ -14,6 +14,7 @@ class ControllerClient(QObject):
         super().__init__(parent)
         self.event_bus = event_bus
         self.connected = False
+        self._poll_lock = threading.Lock()
 
         self.ws = QWebSocket()
         self.ws.connected.connect(self._on_ws_connected)
@@ -74,19 +75,19 @@ class ControllerClient(QObject):
         def _do():
             try:
                 r = requests.get(f"{self.BASE_URL}/api/status", timeout=1)
-                if r.ok:
-                    self._last_poll = r.json()
-                else:
-                    self._last_poll = None
+                result = r.json() if r.ok else None
             except Exception:
-                self._last_poll = None
+                result = None
+            with self._poll_lock:
+                self._last_poll = result
         threading.Thread(target=_do, daemon=True).start()
         # Emit result on main thread after the request has time to complete.
         # Also trigger a WS reconnect attempt here (safe: runs on main thread).
         QTimer.singleShot(1200, self._emit_poll_result)
 
     def _emit_poll_result(self):
-        data = getattr(self, "_last_poll", None)
+        with self._poll_lock:
+            data = getattr(self, "_last_poll", None)
         if data:
             # Core is reachable — attempt WS reconnect if still disconnected (main thread, safe)
             if not self.connected:

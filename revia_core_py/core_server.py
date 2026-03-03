@@ -11,7 +11,12 @@ import json, time, random, threading, asyncio, os, subprocess
 from datetime import datetime
 from pathlib import Path
 
-import psutil
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -85,13 +90,21 @@ def _get_gpu_stats():
 
 
 def _get_system_stats():
-    mem = psutil.virtual_memory()
     gpu = _get_gpu_stats()
+    if _psutil:
+        mem = _psutil.virtual_memory()
+        cpu = _psutil.cpu_percent(interval=None)
+        ram_used = round(mem.used / (1024 * 1024))
+        ram_total = round(mem.total / (1024 * 1024))
+    else:
+        cpu = 0.0
+        ram_used = 0
+        ram_total = 0
     return {
-        "cpu_percent": psutil.cpu_percent(interval=None),
+        "cpu_percent": cpu,
         "gpu_percent": gpu["gpu_percent"],
-        "ram_used_mb": round(mem.used / (1024 * 1024)),
-        "ram_total_mb": round(mem.total / (1024 * 1024)),
+        "ram_used_mb": ram_used,
+        "ram_total_mb": ram_total,
         "vram_used_mb": round(gpu["vram_used_mb"]),
         "vram_total_mb": round(gpu["vram_total_mb"]),
     }
@@ -145,7 +158,8 @@ class TelemetryEngine:
             self.system["vram_total_mb"] = stats["vram_total_mb"]
 
     def _stats_loop(self):
-        psutil.cpu_percent(interval=None)
+        if _psutil:
+            _psutil.cpu_percent(interval=None)
         while True:
             time.sleep(2)
             self._refresh_system_stats()
@@ -343,7 +357,7 @@ class LLMBackend:
             return self._generate_stub(text, broadcast_fn)
 
     def _generate_online(self, broadcast_fn, image_b64=None):
-        import requests as req
+        req = requests
         provider = self.api_provider.lower()
         endpoint = self.api_endpoint.rstrip("/")
         messages = self._build_messages(image_b64=image_b64)
@@ -360,7 +374,7 @@ class LLMBackend:
             return err
 
     def _call_openai_compat(self, endpoint, messages, broadcast_fn):
-        import requests as req
+        req = requests
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -410,7 +424,7 @@ class LLMBackend:
         return full_text
 
     def _call_anthropic(self, endpoint, messages, broadcast_fn):
-        import requests as req
+        req = requests
         sys_msg = ""
         conv = []
         for m in messages:
@@ -462,7 +476,7 @@ class LLMBackend:
 
     def _discover_model_name(self, base_url):
         """Ask the local server for its loaded model name."""
-        import requests as req
+        req = requests
         try:
             r = req.get(base_url.rstrip("/") + "/models", timeout=3)
             if r.ok:
@@ -474,7 +488,7 @@ class LLMBackend:
         return ""
 
     def _generate_local(self, text, broadcast_fn, image_b64=None):
-        import requests as req
+        req = requests
         base_url = self.local_server_url.rstrip("/")
         url = base_url + "/chat/completions"
         server_name = self.local_server
@@ -1053,11 +1067,9 @@ def process_pipeline(text, image_b64=None):
         _device = telemetry.system.get("device", "CPU")
 
     s = telemetry.begin_span("input_capture")
-    time.sleep(random.uniform(0.002, 0.005))
     telemetry.end_span(s)
 
     s = telemetry.begin_span("stt_decode")
-    time.sleep(random.uniform(0.005, 0.010))
     telemetry.end_span(s)
 
     s = telemetry.begin_span("emotion_analysis")
@@ -1081,11 +1093,9 @@ def process_pipeline(text, image_b64=None):
     telemetry.end_span(s)
 
     s = telemetry.begin_span("context_gather")
-    time.sleep(random.uniform(0.008, 0.020))
     telemetry.end_span(s)
 
     s = telemetry.begin_span("llm_prefill", device=_device)
-    time.sleep(random.uniform(0.010, 0.030))
     telemetry.end_span(s)
 
     # Store user message in short-term memory
@@ -1118,11 +1128,9 @@ def process_pipeline(text, image_b64=None):
         )
 
     s = telemetry.begin_span("tts_encode", device=_device)
-    time.sleep(random.uniform(0.008, 0.020))
     telemetry.end_span(s)
 
     s = telemetry.begin_span("memory_write")
-    time.sleep(random.uniform(0.003, 0.010))
     telemetry.end_span(s)
 
     s = telemetry.begin_span("output_deliver")
