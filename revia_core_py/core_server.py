@@ -1096,9 +1096,13 @@ def process_pipeline(text, image_b64=None):
 
     # LLM decode -- stream tokens via the configured backend
     s = telemetry.begin_span("llm_decode", device=_device)
-    full_text = llm_backend.generate_streaming(
-        text, broadcast_json, image_b64=image_b64
-    )
+    try:
+        full_text = llm_backend.generate_streaming(
+            text, broadcast_json, image_b64=image_b64
+        )
+    except Exception as e:
+        full_text = f"[Error: {e}]"
+        broadcast_json({"type": "chat_token", "token": full_text})
     telemetry.end_span(s)
 
     # Store assistant response in short-term memory
