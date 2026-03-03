@@ -29,6 +29,7 @@ class ConversationStarter(QObject):
         self._interval_ms = interval_ms
         self._enabled = False
         self._last_activity = time.monotonic()
+        self._greeted = False  # Prevent repeated startup greetings on reconnect
 
         # Repeating inactivity timer
         self._timer = QTimer(self)
@@ -59,7 +60,12 @@ class ConversationStarter(QObject):
         self._last_activity = time.monotonic()
 
     def greet_on_startup(self, delay_ms=4_000):
-        """Send an opening greeting *delay_ms* milliseconds after startup."""
+        """Send an opening greeting *delay_ms* milliseconds after startup.
+        Only fires once per session regardless of reconnects.
+        """
+        if self._greeted:
+            return
+        self._greeted = True
         QTimer.singleShot(delay_ms, self._trigger)
 
     # ------------------------------------------------------------------
