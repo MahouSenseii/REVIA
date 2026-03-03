@@ -1355,6 +1355,71 @@ def api_emotions_current():
         emo = dict(telemetry.emotion)
     return jsonify(emo)
 
+
+# ---------------------------------------------------------------------------
+# Proactive conversation starter
+# ---------------------------------------------------------------------------
+
+_PROACTIVE_PROMPTS = [
+    "Start a natural conversation without waiting for user input. "
+    "You can share a curious fact, ask an engaging question, make a warm observation, "
+    "or simply check in. Keep it brief (1-2 sentences) and fully in character.",
+
+    "Initiate a conversation naturally. Think of something genuinely interesting to say — "
+    "a question, a thought, or just a friendly hello. Be brief and spontaneous.",
+
+    "Begin a conversation. Say something warm, curious, or playful — whatever feels "
+    "right in the moment. One or two sentences maximum.",
+]
+
+def _run_proactive_pipeline():
+    """Generate a proactive Revia message without a user-side message in the UI."""
+    import random as _random
+    telemetry.state = "Processing"
+    broadcast_json({"type": "status_update", "state": "Processing"})
+
+    # Signal the UI that this is a proactive message (shows 'Revia:' prefix cleanly)
+    broadcast_json({"type": "proactive_start"})
+
+    prompt = _random.choice(_PROACTIVE_PROMPTS)
+
+    # Run through LLM without storing the internal prompt in user memory
+    with llm_backend._lock:
+        source = llm_backend.source
+        saved_conversation = list(llm_backend.conversation)
+        llm_backend.conversation.append({"role": "user", "content": prompt})
+
+    try:
+        if source == "online" and llm_backend.api_key:
+            full_text = llm_backend._generate_online(broadcast_json)
+        elif source == "local" and (llm_backend.local_path or llm_backend.local_server_url):
+            full_text = llm_backend._generate_local(prompt, broadcast_json)
+        else:
+            full_text = llm_backend._generate_stub(prompt, broadcast_json)
+    except Exception as e:
+        full_text = f"[Proactive error: {e}]"
+        broadcast_json({"type": "chat_token", "token": full_text})
+    finally:
+        # Restore conversation: keep only the assistant response, drop the internal prompt
+        with llm_backend._lock:
+            llm_backend.conversation = saved_conversation
+            if full_text and not full_text.startswith("[Proactive error"):
+                llm_backend.conversation.append({"role": "assistant", "content": full_text})
+
+    memory_store.add_short_term("assistant", full_text)
+    broadcast_json({"type": "chat_complete", "text": full_text})
+    snap = telemetry.snapshot()
+    broadcast_json({"type": "telemetry_update", "data": snap})
+    telemetry.state = "Idle"
+    broadcast_json({"type": "status_update", "state": "Idle"})
+
+
+@app.route("/api/proactive", methods=["POST"])
+def api_proactive():
+    """Trigger Revia to start a conversation without user input."""
+    threading.Thread(target=_run_proactive_pipeline, daemon=True).start()
+    return jsonify({"status": "proactive triggered"})
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------

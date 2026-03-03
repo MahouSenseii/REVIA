@@ -83,6 +83,7 @@ class ChatPanel(QFrame):
         self.input_field.returnPressed.connect(self._send)
         self.event_bus.chat_token.connect(self._on_token)
         self.event_bus.chat_complete.connect(self._on_complete)
+        self.event_bus.proactive_start.connect(self._on_proactive_start)
 
         # Wire up audio service
         if self.audio_service:
@@ -90,8 +91,13 @@ class ChatPanel(QFrame):
                 self._on_speech_recognized
             )
 
+        self._conversation_starter = None
+
     def set_camera_service(self, cam):
         self.camera_service = cam
+
+    def set_conversation_starter(self, cs):
+        self._conversation_starter = cs
 
     def set_voice_manager(self, vm):
         self.voice_manager = vm
@@ -133,10 +139,19 @@ class ChatPanel(QFrame):
         if self.audio_service and not self.audio_service._always_listening:
             self.mic_btn.setChecked(False)
 
+    def _on_proactive_start(self):
+        """Revia is about to speak unprompted — show a subtle indicator."""
+        self.chat_display.append(
+            '<span style="color:#a78bfa;font-size:9px;">'
+            '[Revia initiates...]</span>'
+        )
+
     def _send(self):
         text = self.input_field.text().strip()
         if not text:
             return
+        if self._conversation_starter:
+            self._conversation_starter.record_user_activity()
 
         image_b64 = None
         if self._vision_active:

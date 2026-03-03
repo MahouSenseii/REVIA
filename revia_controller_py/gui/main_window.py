@@ -5,6 +5,7 @@ from PySide6.QtCore import Qt
 
 from app.camera_service import CameraService
 from app.audio_service import AudioService
+from app.conversation_starter import ConversationStarter
 from gui.widgets.sidebar import SidebarWidget
 from gui.widgets.topbar import TopBar
 from gui.widgets.chat_panel import ChatPanel
@@ -29,6 +30,9 @@ class MainWindow(QMainWindow):
         self.theme_mgr = theme_mgr
         self.camera_service = CameraService(self)
         self.audio_service = AudioService(self)
+        self.conversation_starter = ConversationStarter(
+            client, event_bus, interval_ms=300_000, parent=self
+        )
         self.setWindowTitle("REVIA \u2014 Neural Assistant Controller")
         self.setMinimumSize(1400, 900)
         self._build_ui()
@@ -90,6 +94,8 @@ class MainWindow(QMainWindow):
 
         # Give chat panel access to the voice manager for TTS
         self.chat_panel.set_voice_manager(self.voice_tab.voice_mgr)
+        # Give chat panel access to the conversation starter for activity tracking
+        self.chat_panel.set_conversation_starter(self.conversation_starter)
 
         self.vision_tab = VisionTab(
             self.event_bus, self.client, self.camera_service
@@ -118,6 +124,12 @@ class MainWindow(QMainWindow):
 
     def _on_connection(self, connected):
         self.topbar.set_health("Online" if connected else "Offline")
+        if connected:
+            if not self.conversation_starter.is_enabled:
+                self.conversation_starter.enable()
+                self.conversation_starter.greet_on_startup(delay_ms=4_000)
+        else:
+            self.conversation_starter.disable()
 
     def closeEvent(self, event):
         self.camera_service.disconnect_camera()

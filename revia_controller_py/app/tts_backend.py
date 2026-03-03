@@ -167,9 +167,11 @@ class QwenTTSBackend(QObject):
             return
 
         try:
+            from .voice_profile import _resolve_wav_path
+            _wav_src = _resolve_wav_path(voice_profile.generated_wav)
             wav_result, info = self._qwen_clone(
                 text,
-                voice_profile.generated_wav,
+                _wav_src,
                 voice_profile.clone_ref_text or "",
                 voice_profile.language or "Auto",
                 not bool(voice_profile.clone_ref_text),
