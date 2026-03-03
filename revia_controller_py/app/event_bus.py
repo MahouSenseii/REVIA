@@ -13,3 +13,4 @@ class EventBus(QObject):
     plugins_updated = Signal(list)
     neural_updated = Signal(dict)
     camera_frame = Signal(QPixmap)
+    proactive_start = Signal()  # Revia is about to initiate a conversation

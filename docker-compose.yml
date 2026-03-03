@@ -2,8 +2,8 @@ version: "3.9"
 
 # REVIA Docker services
 # Run: docker compose up -d
-# This starts Redis for persistent long-term memory storage.
-# The core server will automatically connect to Redis when it's available.
+# Starts Redis (long-term memory) + the Python core server (REST :8123, WS :8124).
+# The GUI controller connects to the core server at 127.0.0.1:8123 / :8124.
 
 services:
   revia-redis:
@@ -21,6 +21,31 @@ services:
       timeout: 3s
       retries: 5
 
+  revia-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: revia-core
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "8124:8124"
+    environment:
+      - REDIS_HOST=revia-redis
+      - REDIS_PORT=6379
+      - REVIA_REST_PORT=8123
+      - REVIA_WS_PORT=8124
+    depends_on:
+      revia-redis:
+        condition: service_healthy
+    volumes:
+      - revia_core_data:/app/data
+      - revia_core_logs:/app/logs
+
 volumes:
   revia_redis_data:
     name: revia_redis_data
+  revia_core_data:
+    name: revia_core_data
+  revia_core_logs:
+    name: revia_core_logs

@@ -1,8 +1,43 @@
 """Voice profile data model and persistence."""
 import json
 import enum
+import sys
 from pathlib import Path
 from datetime import datetime
+
+# Voices root: <repo>/voices/  (two parents above this file's package dir)
+_VOICES_ROOT = Path(__file__).resolve().parents[2] / "voices"
+
+
+def _resolve_wav_path(stored_path: str) -> str:
+    """Return a valid local path for *stored_path*, handling cross-platform cases.
+
+    If the stored path exists as-is, it is returned unchanged.
+    Otherwise the filename is extracted and searched inside _VOICES_ROOT so that
+    Windows paths (e.g. C:/Users/USER/REVIA/voices/audio.wav) resolve correctly
+    when running on Linux/macOS.
+    """
+    if not stored_path:
+        return ""
+    p = Path(stored_path)
+    if p.exists():
+        return stored_path
+    # Extract filename, normalising backslashes first
+    filename = Path(stored_path.replace("\\", "/")).name
+    if not filename:
+        return stored_path
+    # Search voices root directly
+    if _VOICES_ROOT.exists():
+        candidate = _VOICES_ROOT / filename
+        if candidate.exists():
+            return str(candidate)
+        # Search one level deep (profile subdirectories)
+        for subdir in _VOICES_ROOT.iterdir():
+            if subdir.is_dir():
+                candidate = subdir / filename
+                if candidate.exists():
+                    return str(candidate)
+    return stored_path
 
 
 class VoiceMode(enum.Enum):
@@ -94,7 +129,7 @@ class VoiceProfile:
             data.get("styleInstruction", "")
             or data.get("stylePrompt", "")
         )
-        p.generated_wav = data.get("generatedWav", "")
+        p.generated_wav = _resolve_wav_path(data.get("generatedWav", ""))
         p.base_speed = data.get("baseSpeed", 1.0)
         p.base_pitch = data.get("basePitch", 1.0)
         p.created = data.get("created", datetime.now().isoformat())
@@ -124,4 +159,5 @@ class VoiceProfile:
         }
 
     def has_wav(self):
-        return bool(self.generated_wav) and Path(self.generated_wav).exists()
+        resolved = _resolve_wav_path(self.generated_wav)
+        return bool(resolved) and Path(resolved).exists()

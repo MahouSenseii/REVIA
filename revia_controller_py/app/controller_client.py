@@ -65,6 +65,8 @@ class ControllerClient(QObject):
                 self.event_bus.chat_complete.emit(data.get("text", ""))
             elif msg_type == "log_entry":
                 self.event_bus.log_entry.emit(data.get("text", ""))
+            elif msg_type == "proactive_start":
+                self.event_bus.proactive_start.emit()
         except Exception:
             pass
 
@@ -180,3 +182,18 @@ class ControllerClient(QObject):
             return r.json() if r.ok else {}
         except Exception:
             return {}
+
+    def send_proactive(self):
+        """Ask the core server to generate a proactive message from Revia."""
+        def _do():
+            try:
+                requests.post(
+                    f"{self.BASE_URL}/api/proactive",
+                    json={},
+                    timeout=120,
+                )
+            except Exception:
+                self.event_bus.log_entry.emit(
+                    "[ERROR] Failed to trigger proactive message"
+                )
+        threading.Thread(target=_do, daemon=True).start()
