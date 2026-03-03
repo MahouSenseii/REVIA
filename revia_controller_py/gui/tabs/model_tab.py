@@ -21,6 +21,7 @@ class ModelTab(QScrollArea):
         self.client = client
         self._llm_process = None
         self._loading = False  # guard: prevents saving while loading
+        self._pending_source = None  # source to push once core connects
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -732,6 +733,7 @@ class ModelTab(QScrollArea):
 
         if data.get("local_path") or data.get("api_key"):
             self.event_bus.log_entry.emit("[Model] Previous session settings restored.")
+            self._pending_source = "online" if int(data.get("source_index", 0)) == 1 else "local"
 
     def _test_connection(self):
         self.conn_status.setText("Status: Connecting...")
@@ -947,6 +949,9 @@ class ModelTab(QScrollArea):
                 )
                 self.conn_status.setStyleSheet("color: #00aa40;")
                 self.disconnect_btn.setEnabled(True)
+            if self._pending_source:
+                self._push_config_to_core(self._pending_source)
+                self._pending_source = None
         else:
             self.conn_status.setText("Status: Core offline")
             self.conn_status.setStyleSheet("color: #cc3040;")
