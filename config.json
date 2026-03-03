@@ -5,7 +5,7 @@
         "host": "127.0.0.1"
     },
     "pipeline": {
-        "batch_window_ms": 200,
+        "batch_window_ms": 50,
         "stt_model": "small",
         "tts_engine": "Qwen3-TTS",
         "llm_backend": "CPU",
@@ -22,6 +22,25 @@
         "collection": "revia_memories",
         "max_results": 5,
         "auto_store": true
+    },
+    "integrations": {
+        "discord": {
+            "enabled": false,
+            "bot_token": "",
+            "channel_ids": [],
+            "guild_ids": [],
+            "prefix": "!",
+            "mention_only": false
+        },
+        "twitch": {
+            "enabled": false,
+            "oauth_token": "",
+            "channels": [],
+            "prefix": "!",
+            "command": "revia",
+            "respond_to_all": false,
+            "max_response_len": 450
+        }
     },
     "theme": "dark"
 }

@@ -7,9 +7,12 @@ Usage:
     (REST on :8123, WebSocket on :8124)
 """
 
-import json, time, random, threading, asyncio, os, subprocess
+import json, time, random, threading, asyncio, os, subprocess, sys
 from datetime import datetime
 from pathlib import Path
+
+# Make the integrations package importable when running from any CWD
+sys.path.insert(0, str(Path(__file__).parent))
 
 try:
     import psutil as _psutil
@@ -213,6 +216,13 @@ LOCAL_SERVERS = {
 class LLMBackend:
     def __init__(self):
         self._lock = threading.Lock()
+        # Persistent HTTP session — reuses TCP connections for lower latency
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=0
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         self.source = "none"
         self.local_path = ""
         self.local_backend = "CPU"
@@ -357,7 +367,7 @@ class LLMBackend:
             return self._generate_stub(text, broadcast_fn)
 
     def _generate_online(self, broadcast_fn, image_b64=None):
-        req = requests
+        req = self._session  # noqa: F841 (kept for exception messages below)
         provider = self.api_provider.lower()
         endpoint = self.api_endpoint.rstrip("/")
         messages = self._build_messages(image_b64=image_b64)
@@ -374,7 +384,7 @@ class LLMBackend:
             return err
 
     def _call_openai_compat(self, endpoint, messages, broadcast_fn):
-        req = requests
+        req = self._session
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -424,7 +434,7 @@ class LLMBackend:
         return full_text
 
     def _call_anthropic(self, endpoint, messages, broadcast_fn):
-        req = requests
+        req = self._session
         sys_msg = ""
         conv = []
         for m in messages:
@@ -476,7 +486,7 @@ class LLMBackend:
 
     def _discover_model_name(self, base_url):
         """Ask the local server for its loaded model name."""
-        req = requests
+        req = self._session
         try:
             r = req.get(base_url.rstrip("/") + "/models", timeout=3)
             if r.ok:
@@ -488,7 +498,7 @@ class LLMBackend:
         return ""
 
     def _generate_local(self, text, broadcast_fn, image_b64=None):
-        req = requests
+        req = self._session
         base_url = self.local_server_url.rstrip("/")
         url = base_url + "/chat/completions"
         server_name = self.local_server
@@ -611,7 +621,7 @@ class LLMBackend:
         full = ""
         t0 = time.perf_counter()
         for tok in tokens:
-            time.sleep(random.uniform(0.02, 0.05))
+            time.sleep(0.01)  # Reduced stub token delay for lower latency
             word = tok + " "
             full += word
             broadcast_fn({"type": "chat_token", "token": word})
@@ -703,7 +713,8 @@ class EmotionNet:
             elif v < -0.25:
                 r["label"] = "Sad"
 
-        time.sleep(random.uniform(0.004, 0.012))
+        # Latency optimisation: minimal stub delay (real model would replace this)
+        time.sleep(0.002)
         ms = (time.perf_counter() - t0) * 1000
         r["inference_ms"] = ms
         self.last_inference_ms = ms
@@ -733,7 +744,8 @@ class RouterClassifier:
             r = {"mode": "memory_query", "confidence": 0.82, "suggested_tool": "memory_recall", "rag_enable": True}
         else:
             r = {"mode": "chat", "confidence": 0.92, "suggested_tool": "", "rag_enable": False}
-        time.sleep(random.uniform(0.003, 0.008))
+        # Latency optimisation: minimal stub delay
+        time.sleep(0.001)
         ms = (time.perf_counter() - t0) * 1000
         r["inference_ms"] = ms
         self.last_inference_ms = ms
@@ -1144,6 +1156,50 @@ def process_pipeline(text, image_b64=None):
     broadcast_json({"type": "status_update", "state": "Idle"})
     return full_text
 
+
+def process_pipeline_integration(text: str) -> str:
+    """Lightweight pipeline for Discord/Twitch — no WebSocket broadcasts.
+
+    Skips EmotionNet (saves ~5–50 ms) and broadcasts nothing to the GUI so
+    platform chat traffic does not flood the controller UI.  Still stores the
+    exchange in memory and updates conversation history.
+    """
+    def _noop(_data):  # silent broadcast replacement
+        pass
+
+    meta = {}
+    memory_store.add_short_term("user", text, meta)
+
+    try:
+        full_text = llm_backend.generate_streaming(text, _noop)
+    except Exception as exc:
+        full_text = f"[Error: {exc}]"
+
+    memory_store.add_short_term("assistant", full_text)
+
+    # Auto-save summary every 20 messages (same policy as main pipeline)
+    if len(memory_store.short_term) % 20 == 0 and len(memory_store.short_term) > 0:
+        summary = (
+            f"Platform exchange: User said '{text[:100]}', "
+            f"Assistant replied '{full_text[:100]}'"
+        )
+        memory_store.save_to_long_term(summary, category="auto_conversation")
+
+    return full_text
+
+
+# ---------------------------------------------------------------------------
+# Integration Manager (Discord + Twitch)
+# ---------------------------------------------------------------------------
+
+try:
+    from integrations.integration_manager import IntegrationManager
+    integration_manager = IntegrationManager(process_pipeline_integration)
+    print("[REVIA Core] Integration manager ready (Discord + Twitch).")
+except Exception as _int_err:
+    integration_manager = None
+    print(f"[REVIA Core] Integration manager unavailable: {_int_err}")
+
 # ---------------------------------------------------------------------------
 # Flask REST API
 # ---------------------------------------------------------------------------
@@ -1433,6 +1489,64 @@ def api_proactive():
     return jsonify({"status": "proactive triggered"})
 
 # ---------------------------------------------------------------------------
+# Integration API (Discord + Twitch)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/integrations/status", methods=["GET"])
+def api_integrations_status():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    return jsonify(integration_manager.get_status())
+
+
+@app.route("/api/integrations/config", methods=["GET"])
+def api_integrations_config_get():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    return jsonify(integration_manager.get_config())
+
+
+@app.route("/api/integrations/config", methods=["POST"])
+def api_integrations_config_set():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    integration_manager.update_config(data)
+    return jsonify({"ok": True, "config": integration_manager.get_config()})
+
+
+@app.route("/api/integrations/discord/start", methods=["POST"])
+def api_discord_start():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.start_discord()
+    return jsonify({"ok": True, "status": integration_manager.get_status()["discord"]})
+
+
+@app.route("/api/integrations/discord/stop", methods=["POST"])
+def api_discord_stop():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.stop_discord()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/integrations/twitch/start", methods=["POST"])
+def api_twitch_start():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.start_twitch()
+    return jsonify({"ok": True, "status": integration_manager.get_status()["twitch"]})
+
+
+@app.route("/api/integrations/twitch/stop", methods=["POST"])
+def api_twitch_stop():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.stop_twitch()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -1451,11 +1565,16 @@ def run_ws():
 
 def main():
     print("=" * 50)
-    print("  REVIA Core (Python)  v1.1.0")
+    print("  REVIA Core (Python)  v1.2.0")
     print("=" * 50)
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
     time.sleep(0.3)
+
+    # Start any enabled platform integrations (Discord / Twitch)
+    if integration_manager is not None:
+        integration_manager.start_enabled()
+
     print(f"[REVIA Core] REST server on http://0.0.0.0:{REST_PORT}")
     print(f"[REVIA Core] Ready. Open the controller and click 'Connect'.")
     print()

@@ -16,6 +16,10 @@ pyttsx3>=2.90
 sounddevice>=0.4.6
 numpy>=1.24.0
 
+# === Platform Integrations ===
+discord.py>=2.3.0      # Discord bot — pip install "discord.py"
+twitchio>=2.8.0        # Twitch IRC bot — pip install twitchio
+
 # === Optional dependencies ===
 psutil>=5.9.0
 gradio_client>=0.14.0
