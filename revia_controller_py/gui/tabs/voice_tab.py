@@ -896,8 +896,11 @@ class VoiceTab(QScrollArea):
             "qwen_tts_cli.demo",
         ]
         for mod in candidates:
-            if importlib.util.find_spec(mod) is not None:
-                return mod
+            try:
+                if importlib.util.find_spec(mod) is not None:
+                    return mod
+            except (ModuleNotFoundError, ValueError):
+                continue
         return ""
 
     def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str):
