@@ -130,18 +130,19 @@ class AudioService(QObject):
     def _tts_speak(self, text):
         with self._tts_lock:
             try:
-                import pyttsx3
-                engine = pyttsx3.init()
-                voices = engine.getProperty("voices")
-                if voices:
-                    engine.setProperty("voice", voices[0].id)
-                engine.setProperty("rate", 180)
+                if self._tts_engine is None:
+                    import pyttsx3
+                    self._tts_engine = pyttsx3.init()
+                    voices = self._tts_engine.getProperty("voices")
+                    if voices:
+                        self._tts_engine.setProperty("voice", voices[0].id)
+                    self._tts_engine.setProperty("rate", 180)
                 self.tts_started.emit()
-                engine.say(text)
-                engine.runAndWait()
-                engine.stop()
+                self._tts_engine.say(text)
+                self._tts_engine.runAndWait()
                 self.tts_finished.emit()
             except Exception as e:
+                self._tts_engine = None  # reset so next call retries init
                 self.status_changed.emit(f"TTS error: {e}")
 
     # ---- Volume meter ----
