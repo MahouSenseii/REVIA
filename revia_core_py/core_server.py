@@ -8,6 +8,7 @@ Usage:
 """
 
 import json, time, random, threading, asyncio, os, subprocess, sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -122,7 +123,8 @@ class TelemetryEngine:
         self._lock = threading.Lock()
         self._epoch = time.perf_counter()
         self.state = "Idle"
-        self.spans = []
+        self.spans = deque(maxlen=500)
+        self._flush_counter = 0
         self.llm = {"tokens_generated": 0, "tokens_per_second": 0.0, "context_length": 0}
         self.emotion = {
             "valence": 0.0, "arousal": 0.0, "dominance": 0.0,
@@ -178,15 +180,16 @@ class TelemetryEngine:
         span["end_ms"] = now_ms
         span["duration_ms"] = now_ms - span["start_ms"]
         with self._lock:
-            self.spans.append(span)
-            if len(self.spans) > 500:
-                self.spans = self.spans[-400:]
+            self.spans.append(span)  # deque auto-evicts oldest when full
             self._log.write(json.dumps(span) + "\n")
-            self._log.flush()
+            self._flush_counter += 1
+            if self._flush_counter >= 10:
+                self._log.flush()
+                self._flush_counter = 0
 
     def snapshot(self):
         with self._lock:
-            recent = self.spans[-20:] if self.spans else []
+            recent = list(self.spans)[-20:] if self.spans else []
             return {
                 "state": self.state,
                 "llm": dict(self.llm),
@@ -920,12 +923,28 @@ web_search_engine = WebSearchEngine()
 # Situational awareness context (Nero-style live system status)
 # ---------------------------------------------------------------------------
 
+_situational_ctx_cache: tuple[str, float] = ("", 0.0)
+_SITUATIONAL_CTX_TTL = 3.0  # seconds before the cached string is refreshed
+
+
 def _build_situational_context() -> str:
     """Return a concise system-status block injected into every LLM prompt.
 
-    This gives Revia Nero-like awareness of what's on/off so she can naturally
-    reference her own capabilities without being asked.
+    Result is cached for _SITUATIONAL_CTX_TTL seconds so that rapid successive
+    LLM calls (streaming tokens, platform bots) don't repeatedly re-read locks
+    and integration state on every generation.
     """
+    global _situational_ctx_cache
+    now = time.monotonic()
+    cached_text, cached_ts = _situational_ctx_cache
+    if cached_text and (now - cached_ts) < _SITUATIONAL_CTX_TTL:
+        return cached_text
+    result = _compute_situational_context()
+    _situational_ctx_cache = (result, now)
+    return result
+
+
+def _compute_situational_context() -> str:
     lines = [
         "[Revia's Live System Status — you are actively aware of these:]"
     ]
@@ -1002,6 +1021,7 @@ class MemoryStore:
         self._profile_name = profile_name
         self._lt_file = Path(f"data/memory_{profile_name}.jsonl")
         self._lt_file.parent.mkdir(parents=True, exist_ok=True)
+        self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
         self._load_long_term()
 
     # ------------------------------------------------------------------
@@ -1057,6 +1077,8 @@ class MemoryStore:
             self.long_term.clear()
             self._lt_file = Path(f"data/memory_{profile_name}.jsonl")
             self._lt_file.parent.mkdir(parents=True, exist_ok=True)
+            self._lt_handle.close()
+            self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
             self._load_long_term()
 
     # ------------------------------------------------------------------
@@ -1173,10 +1195,9 @@ class MemoryStore:
     def _promote_to_long_term(self, entry):
         entry["promoted"] = True
         self.long_term.append(entry)
-        raw = json.dumps(entry)
         self._redis_push(entry)
-        with open(self._lt_file, "a", encoding="utf-8") as f:
-            f.write(raw + "\n")
+        self._lt_handle.write(json.dumps(entry) + "\n")
+        self._lt_handle.flush()
 
     def save_to_long_term(self, content, category="user_note", metadata=None):
         with self._lock:
@@ -1187,8 +1208,8 @@ class MemoryStore:
             }
             self.long_term.append(entry)
             self._redis_push(entry)
-            with open(self._lt_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
+            self._lt_handle.write(json.dumps(entry) + "\n")
+            self._lt_handle.flush()
 
     # ------------------------------------------------------------------
     # Search (for API / Memory tab)
@@ -1231,8 +1252,9 @@ class MemoryStore:
         with self._lock:
             self.long_term.clear()
             self._redis_clear()
-            if self._lt_file.exists():
-                self._lt_file.write_text("", encoding="utf-8")
+            self._lt_handle.close()
+            self._lt_file.write_text("", encoding="utf-8")
+            self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
 
 
 memory_store = MemoryStore()
@@ -1312,12 +1334,6 @@ def process_pipeline(text, image_b64=None):
     with telemetry._lock:
         _device = telemetry.system.get("device", "CPU")
 
-    s = telemetry.begin_span("input_capture")
-    telemetry.end_span(s)
-
-    s = telemetry.begin_span("stt_decode")
-    telemetry.end_span(s)
-
     s = telemetry.begin_span("emotion_analysis")
     with telemetry._lock:
         prev_emotion = dict(telemetry.emotion)
@@ -1336,12 +1352,6 @@ def process_pipeline(text, image_b64=None):
     route = router_cls.classify(text)
     with telemetry._lock:
         telemetry.router = route
-    telemetry.end_span(s)
-
-    s = telemetry.begin_span("context_gather")
-    telemetry.end_span(s)
-
-    s = telemetry.begin_span("llm_prefill", device=_device)
     telemetry.end_span(s)
 
     # Store user message in short-term memory
@@ -1389,12 +1399,6 @@ def process_pipeline(text, image_b64=None):
             summary, category="auto_conversation",
             metadata={"emotion": emo.get("label", "")},
         )
-
-    s = telemetry.begin_span("tts_encode", device=_device)
-    telemetry.end_span(s)
-
-    s = telemetry.begin_span("memory_write")
-    telemetry.end_span(s)
 
     s = telemetry.begin_span("output_deliver")
     broadcast_json({"type": "chat_complete", "text": full_text})
