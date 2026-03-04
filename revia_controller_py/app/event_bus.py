@@ -13,4 +13,7 @@ class EventBus(QObject):
     plugins_updated = Signal(list)
     neural_updated = Signal(dict)
     camera_frame = Signal(QPixmap)
-    proactive_start = Signal()  # Revia is about to initiate a conversation
+    proactive_start = Signal()        # Revia is about to initiate a conversation
+    expression_update = Signal(dict)  # Avatar expression/emotion change from pipeline
+    tts_start = Signal(str)           # TTS/lip-sync started — payload is the text
+    tts_stop = Signal()               # TTS/lip-sync ended

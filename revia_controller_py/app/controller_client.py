@@ -68,6 +68,17 @@ class ControllerClient(QObject):
                 self.event_bus.log_entry.emit(data.get("text", ""))
             elif msg_type == "proactive_start":
                 self.event_bus.proactive_start.emit()
+            elif msg_type == "expression_update":
+                self.event_bus.expression_update.emit({
+                    "emotion": data.get("emotion", "Neutral"),
+                    "valence": data.get("valence", 0.0),
+                    "arousal": data.get("arousal", 0.2),
+                    "confidence": data.get("confidence", 0.9),
+                })
+            elif msg_type == "tts_start":
+                self.event_bus.tts_start.emit(data.get("text", ""))
+            elif msg_type == "tts_stop":
+                self.event_bus.tts_stop.emit()
         except Exception:
             pass
 
@@ -210,6 +221,16 @@ class ControllerClient(QObject):
     def toggle_websearch(self, enable: bool):
         action = "enable" if enable else "disable"
         self.post(f"/api/websearch/{action}")
+
+    def get_moderation_config(self) -> dict:
+        return self.get("/api/moderation/config") or {}
+
+    def update_moderation_config(self, cfg: dict):
+        self.post("/api/moderation/config", json=cfg)
+
+    def toggle_moderation(self, enable: bool):
+        action = "enable" if enable else "disable"
+        self.post(f"/api/moderation/{action}")
 
     def send_proactive(self):
         """Ask the core server to generate a proactive message from Revia."""

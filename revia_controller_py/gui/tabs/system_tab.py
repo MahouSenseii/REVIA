@@ -155,6 +155,24 @@ class SystemTab(QScrollArea):
         rc_row.addWidget(self.router_info, stretch=1)
         ng.addLayout(rc_row)
 
+        # --- Moderation / Safety Filter toggle ---
+        mod_row = QHBoxLayout()
+        self.moderation_toggle = QCheckBox("Safety Filter (Moderation)")
+        self.moderation_toggle.setChecked(True)
+        self.moderation_toggle.setToolTip(
+            "Content safety layer between LLM output and TTS/avatar.\n"
+            "Enforces personality rules and blocks flagged responses.\n"
+            "Configure blocked phrases and rules via the REST API."
+        )
+        self.moderation_toggle.toggled.connect(self._on_moderation_toggled)
+        mod_row.addWidget(self.moderation_toggle)
+        self.moderation_info = QLabel("Status: ON")
+        self.moderation_info.setFont(QFont("Consolas", 8))
+        self.moderation_info.setObjectName("metricLabel")
+        self.moderation_info.setStyleSheet("color: #00aa40;")
+        mod_row.addWidget(self.moderation_info, stretch=1)
+        ng.addLayout(mod_row)
+
         # --- Web Search (Internet Access) toggle ---
         ws_row = QHBoxLayout()
         self.websearch_toggle = QCheckBox("Internet Search (Web Access)")
@@ -642,6 +660,13 @@ class SystemTab(QScrollArea):
                 i, 4, QTableWidgetItem(p.get("last_error", ""))
             )
 
+    def _on_moderation_toggled(self, enabled: bool):
+        self.client.toggle_moderation(enabled)
+        self.moderation_info.setText("Status: ON" if enabled else "Status: OFF (unsafe)")
+        self.moderation_info.setStyleSheet(
+            "color: #00aa40;" if enabled else "color: #cc3040;"
+        )
+
     def _on_websearch_toggled(self, enabled: bool):
         self.client.toggle_websearch(enabled)
         self.websearch_info.setText("Status: ON" if enabled else "Status: OFF")
@@ -662,6 +687,21 @@ class SystemTab(QScrollArea):
                 f"Inference: {rc.get('last_inference_ms', 0):.1f} ms "
                 f"| Output: {rc.get('last_output', '---')}"
             )
+        # Sync moderation toggle with actual server state
+        mod_data = self.client.get_moderation_config()
+        if mod_data:
+            mod_enabled = mod_data.get("enabled", True)
+            self.moderation_toggle.blockSignals(True)
+            self.moderation_toggle.setChecked(mod_enabled)
+            self.moderation_toggle.blockSignals(False)
+            rule_count = len(mod_data.get("personality_rules", []))
+            if mod_enabled:
+                self.moderation_info.setText(f"Status: ON | {rule_count} rules")
+                self.moderation_info.setStyleSheet("color: #00aa40;")
+            else:
+                self.moderation_info.setText("Status: OFF (unsafe)")
+                self.moderation_info.setStyleSheet("color: #cc3040;")
+
         # Sync web search toggle with actual server state
         ws_data = self.client.get_websearch_status()
         if ws_data:
