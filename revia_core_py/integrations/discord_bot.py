@@ -5,6 +5,8 @@ Routes Discord messages through the REVIA AI pipeline and replies in-channel.
 import asyncio
 import threading
 import logging
+import random
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 logger = logging.getLogger("revia.discord")
@@ -26,6 +28,9 @@ class REVIADiscordBot:
         self._client = None
         self._thread = None
         self._loop = None
+        # Dedicated thread pool — keeps Discord I/O and LLM work off the default
+        # executor so other asyncio tasks are never starved.
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="revia-discord-llm")
         self.running = False
         self.status = "stopped"
         self.last_error = None
@@ -94,11 +99,21 @@ class REVIADiscordBot:
             username = message.author.display_name
             platform_context = f"[Discord user {username}]: {content}"
 
+            # Natural typing delay — makes responses feel less instant/robotic
+            delay_range = cfg.get("typing_delay_ms", [600, 1800])
+            if isinstance(delay_range, list) and len(delay_range) == 2:
+                delay_s = random.uniform(delay_range[0], delay_range[1]) / 1000
+            else:
+                delay_s = 0.0
+
             async with message.channel.typing():
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
+
                 loop = asyncio.get_event_loop()
                 try:
                     response = await loop.run_in_executor(
-                        None, bot_ref.pipeline_fn, platform_context
+                        bot_ref._executor, bot_ref.pipeline_fn, platform_context
                     )
                     bot_ref.messages_processed += 1
                     if response:

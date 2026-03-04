@@ -239,6 +239,22 @@ class LLMBackend:
         self.ctx_length = 4096
         self.system_prompt = "You are REVIA, a smart and friendly AI assistant."
         self.conversation = []
+        # Per-platform conversation isolation — Discord and Twitch get their own
+        # history so their chat context never bleeds into each other or the GUI.
+        self._platform_conversations = {"discord": [], "twitch": []}
+        # Platform-aware hints injected into the system prompt for each platform
+        self._platform_hints = {
+            "discord": (
+                "\n\n[Platform: Discord. You are chatting in a Discord server. "
+                "Be conversational, friendly, and helpful. Responses can be a "
+                "few sentences. Markdown is supported.]"
+            ),
+            "twitch": (
+                "\n\n[Platform: Twitch live chat. You are part of a live stream. "
+                "Keep replies SHORT — ideally one sentence, two at most. "
+                "Be upbeat, engaging, and entertaining. No markdown.]"
+            ),
+        }
 
     def configure(self, cfg):
         with self._lock:
@@ -632,6 +648,42 @@ class LLMBackend:
         with self._lock:
             self.conversation.append({"role": "assistant", "content": full.strip()})
         return full.strip()
+
+
+    def generate_for_platform(self, text, broadcast_fn, platform):
+        """Generate a response using an isolated per-platform conversation buffer.
+
+        Discord and Twitch each maintain their own conversation history so that
+        chat on one platform never contaminates the context seen on another.
+        A short platform hint is also appended to the system prompt so Revia
+        adapts her response length and style to the platform automatically.
+        """
+        with self._lock:
+            source = self.source
+            p_conv = self._platform_conversations.get(platform, [])
+            hint = self._platform_hints.get(platform, "")
+            # Temporarily swap in the platform conversation and inject platform hint
+            _saved_conv = self.conversation
+            _saved_prompt = self.system_prompt
+            self.conversation = p_conv
+            if hint and hint not in self.system_prompt:
+                self.system_prompt = self.system_prompt + hint
+
+        try:
+            if source == "online" and self.api_key:
+                result = self._generate_online(broadcast_fn)
+            elif source == "local" and (self.local_path or self.local_server_url):
+                result = self._generate_local(text, broadcast_fn)
+            else:
+                result = self._generate_stub(text, broadcast_fn)
+        finally:
+            with self._lock:
+                # Persist the updated platform conversation, restore main state
+                self._platform_conversations[platform] = self.conversation
+                self.conversation = _saved_conv
+                self.system_prompt = _saved_prompt
+
+        return result
 
 
 llm_backend = LLMBackend()
@@ -1161,29 +1213,42 @@ def process_pipeline_integration(text: str) -> str:
     """Lightweight pipeline for Discord/Twitch — no WebSocket broadcasts.
 
     Skips EmotionNet (saves ~5–50 ms) and broadcasts nothing to the GUI so
-    platform chat traffic does not flood the controller UI.  Still stores the
-    exchange in memory and updates conversation history.
+    platform chat traffic does not flood the controller UI.  Uses per-platform
+    conversation isolation so Discord and Twitch never share context.
     """
     def _noop(_data):  # silent broadcast replacement
         pass
 
-    meta = {}
-    memory_store.add_short_term("user", text, meta)
+    # Detect platform from the context prefix injected by each bot
+    if text.startswith("[Discord"):
+        platform = "discord"
+    elif text.startswith("[Twitch"):
+        platform = "twitch"
+    else:
+        platform = None
+
+    memory_store.add_short_term("user", text, {"platform": platform or "unknown"})
 
     try:
-        full_text = llm_backend.generate_streaming(text, _noop)
+        if platform:
+            full_text = llm_backend.generate_for_platform(text, _noop, platform)
+        else:
+            full_text = llm_backend.generate_streaming(text, _noop)
     except Exception as exc:
         full_text = f"[Error: {exc}]"
 
-    memory_store.add_short_term("assistant", full_text)
+    memory_store.add_short_term("assistant", full_text, {"platform": platform or "unknown"})
 
     # Auto-save summary every 20 messages (same policy as main pipeline)
     if len(memory_store.short_term) % 20 == 0 and len(memory_store.short_term) > 0:
         summary = (
-            f"Platform exchange: User said '{text[:100]}', "
-            f"Assistant replied '{full_text[:100]}'"
+            f"Platform exchange ({platform or 'unknown'}): "
+            f"User said '{text[:100]}', Assistant replied '{full_text[:100]}'"
         )
-        memory_store.save_to_long_term(summary, category="auto_conversation")
+        memory_store.save_to_long_term(
+            summary, category="auto_conversation",
+            metadata={"platform": platform or "unknown"},
+        )
 
     return full_text
 

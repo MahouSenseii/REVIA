@@ -21,6 +21,9 @@ _DEFAULT_CONFIG: dict = {
         "guild_ids": [],
         "prefix": "!",
         "mention_only": False,
+        # [min_ms, max_ms] random delay before replying — makes responses feel
+        # less instant and more human-like.  Set to [0, 0] to disable.
+        "typing_delay_ms": [600, 1800],
     },
     "twitch": {
         "enabled": False,
@@ -30,6 +33,10 @@ _DEFAULT_CONFIG: dict = {
         "command": "revia",
         "respond_to_all": False,
         "max_response_len": 450,
+        # Seconds a user must wait between responses (prevents spam)
+        "user_cooldown_s": 8,
+        # Seconds identical questions stay cached (0 = disabled)
+        "cache_ttl_s": 300,
     },
 }
 

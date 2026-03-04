@@ -4,7 +4,9 @@ Reads Twitch chat and responds via the REVIA AI pipeline.
 """
 import asyncio
 import threading
+import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 logger = logging.getLogger("revia.twitch")
@@ -27,10 +29,60 @@ class REVIATwitchBot:
         self._bot = None
         self._thread = None
         self._loop = None
+        # Dedicated thread pool — keeps Twitch I/O off the default asyncio executor
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="revia-twitch-llm")
         self.running = False
         self.status = "stopped"
         self.last_error = None
         self.messages_processed = 0
+
+        # Per-user cooldown: {username: last_response_timestamp}
+        self._cooldowns: dict[str, float] = {}
+        self._cooldown_lock = threading.Lock()
+
+        # Simple response cache: {message_text: (response, timestamp)}
+        # Avoids re-calling the LLM for identical questions (common in Twitch chat)
+        self._cache: dict[str, tuple[str, float]] = {}
+        self._cache_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Cooldown helpers
+    # ------------------------------------------------------------------
+
+    def _is_on_cooldown(self, username: str) -> bool:
+        cooldown_s = self.config.get("user_cooldown_s", 8)
+        if cooldown_s <= 0:
+            return False
+        with self._cooldown_lock:
+            last = self._cooldowns.get(username, 0.0)
+            return (time.monotonic() - last) < cooldown_s
+
+    def _record_response(self, username: str):
+        with self._cooldown_lock:
+            self._cooldowns[username] = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_get(self, key: str):
+        ttl = self.config.get("cache_ttl_s", 300)
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry:
+                response, ts = entry
+                if time.monotonic() - ts < ttl:
+                    return response
+                del self._cache[key]
+        return None
+
+    def _cache_set(self, key: str, value: str):
+        with self._cache_lock:
+            # Evict oldest entry if cache exceeds 100 items
+            if len(self._cache) >= 100:
+                oldest = min(self._cache, key=lambda k: self._cache[k][1])
+                del self._cache[oldest]
+            self._cache[key] = (value, time.monotonic())
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -73,14 +125,30 @@ class REVIATwitchBot:
 
                 # Optionally respond to ALL chat messages
                 if respond_to_all and not content.startswith(prefix):
+                    if parent._is_on_cooldown(author):
+                        return
+
                     platform_context = f"[Twitch chatter {author}]: {content}"
+
+                    # Check cache for identical messages (common repeat questions)
+                    cached = parent._cache_get(content.lower())
+                    if cached:
+                        parent.messages_processed += 1
+                        await message.channel.send(
+                            f"@{author} {_truncate(cached, max_len)}"
+                        )
+                        parent._record_response(author)
+                        return
+
                     loop = asyncio.get_event_loop()
                     try:
                         response = await loop.run_in_executor(
-                            None, parent.pipeline_fn, platform_context
+                            parent._executor, parent.pipeline_fn, platform_context
                         )
                         parent.messages_processed += 1
+                        parent._record_response(author)
                         if response:
+                            parent._cache_set(content.lower(), response)
                             await message.channel.send(
                                 f"@{author} {_truncate(response, max_len)}"
                             )
@@ -89,6 +157,7 @@ class REVIATwitchBot:
                         parent.last_error = str(exc)
 
             # Dynamic command registered below
+
         # Attach the AI command dynamically to avoid closure issues
         @_Bot.command(name=command_name)
         async def _cmd_revia(ctx: twitchio_commands.Context):
@@ -101,14 +170,30 @@ class REVIATwitchBot:
                 await ctx.send(f"@{author} Ask me something after the command!")
                 return
 
+            if parent._is_on_cooldown(author):
+                remaining = parent.config.get("user_cooldown_s", 8)
+                await ctx.send(f"@{author} Hold on, I'm still thinking! Try again in a moment.")
+                return
+
             platform_context = f"[Twitch chatter {author}]: {text}"
+
+            # Check cache
+            cached = parent._cache_get(text.lower())
+            if cached:
+                parent.messages_processed += 1
+                parent._record_response(author)
+                await ctx.send(f"@{author} {_truncate(cached, max_len)}")
+                return
+
             loop = asyncio.get_event_loop()
             try:
                 response = await loop.run_in_executor(
-                    None, parent.pipeline_fn, platform_context
+                    parent._executor, parent.pipeline_fn, platform_context
                 )
                 parent.messages_processed += 1
+                parent._record_response(author)
                 if response:
+                    parent._cache_set(text.lower(), response)
                     await ctx.send(f"@{author} {_truncate(response, max_len)}")
             except Exception as exc:
                 logger.error(f"[Twitch] Command pipeline error: {exc}")
