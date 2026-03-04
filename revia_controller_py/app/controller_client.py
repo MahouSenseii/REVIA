@@ -204,6 +204,20 @@ class ControllerClient(QObject):
         except Exception:
             return None
 
+    def get_websearch_status(self) -> dict:
+        try:
+            r = requests.get(f"{self.BASE_URL}/api/websearch/status", timeout=2)
+            return r.json() if r.ok else {}
+        except Exception:
+            return {}
+
+    def toggle_websearch(self, enable: bool):
+        action = "enable" if enable else "disable"
+        try:
+            requests.post(f"{self.BASE_URL}/api/websearch/{action}", timeout=2)
+        except Exception:
+            pass
+
     def send_proactive(self):
         """Ask the core server to generate a proactive message from Revia."""
         def _do():

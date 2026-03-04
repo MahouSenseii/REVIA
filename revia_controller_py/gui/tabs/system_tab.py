@@ -155,6 +155,23 @@ class SystemTab(QScrollArea):
         rc_row.addWidget(self.router_info, stretch=1)
         ng.addLayout(rc_row)
 
+        # --- Web Search (Internet Access) toggle ---
+        ws_row = QHBoxLayout()
+        self.websearch_toggle = QCheckBox("Internet Search (Web Access)")
+        self.websearch_toggle.setChecked(False)
+        self.websearch_toggle.setToolTip(
+            "Allow Revia to look up real-time information via DuckDuckGo.\n"
+            "When ON, Revia will search the web when you ask about current events.\n"
+            "Requires: pip install duckduckgo-search"
+        )
+        self.websearch_toggle.toggled.connect(self._on_websearch_toggled)
+        ws_row.addWidget(self.websearch_toggle)
+        self.websearch_info = QLabel("Status: OFF")
+        self.websearch_info.setFont(QFont("Consolas", 8))
+        self.websearch_info.setObjectName("metricLabel")
+        ws_row.addWidget(self.websearch_info, stretch=1)
+        ng.addLayout(ws_row)
+
         layout.addWidget(neural_group)
 
         # Plugins
@@ -625,6 +642,13 @@ class SystemTab(QScrollArea):
                 i, 4, QTableWidgetItem(p.get("last_error", ""))
             )
 
+    def _on_websearch_toggled(self, enabled: bool):
+        self.client.toggle_websearch(enabled)
+        self.websearch_info.setText("Status: ON" if enabled else "Status: OFF")
+        self.websearch_info.setStyleSheet(
+            "color: #00aa40;" if enabled else "color: #888888;"
+        )
+
     def _refresh_neural(self):
         data = self.client.get_neural()
         if data:
@@ -638,6 +662,26 @@ class SystemTab(QScrollArea):
                 f"Inference: {rc.get('last_inference_ms', 0):.1f} ms "
                 f"| Output: {rc.get('last_output', '---')}"
             )
+        # Sync web search toggle with actual server state
+        ws_data = self.client.get_websearch_status()
+        if ws_data:
+            enabled = ws_data.get("enabled", False)
+            self.websearch_toggle.blockSignals(True)
+            self.websearch_toggle.setChecked(enabled)
+            self.websearch_toggle.blockSignals(False)
+            backend = ws_data.get("backend", "")
+            ddg_ok = ws_data.get("ddg_available", False)
+            if enabled:
+                self.websearch_info.setText(
+                    f"Status: ON | Backend: {backend}"
+                )
+                self.websearch_info.setStyleSheet("color: #00aa40;")
+            else:
+                self.websearch_info.setText(
+                    "Status: OFF"
+                    + ("" if ddg_ok else " (install duckduckgo-search for full results)")
+                )
+                self.websearch_info.setStyleSheet("color: #888888;")
 
     def _on_telemetry(self, data):
         emotion = data.get("emotion", {})

@@ -330,6 +330,9 @@ class LLMBackend:
                 f"(valence {v:+.2f}, confidence {conf:.0%}). {hint}]"
             )
 
+        # Inject live situational awareness so Revia knows what's enabled/disabled
+        sys_content += "\n\n" + _build_situational_context()
+
         # Pass current user query for relevance-aware memory retrieval
         query = None
         if self.conversation:
@@ -786,7 +789,16 @@ class RouterClassifier:
                     "rag_enable": False, "inference_ms": 0}
         t0 = time.perf_counter()
         low = text.lower()
-        if any(w in low for w in ("search", "find", "look up")):
+        # Web-search keywords take priority over local memory search
+        if any(w in low for w in (
+            "search online", "google", "look it up", "look up online",
+            "search the web", "search the internet", "find online",
+            "latest news", "current news", "what's happening", "right now",
+            "real-time", "real time", "today's", "as of today",
+            "what is the current", "what are the latest",
+        )):
+            r = {"mode": "web_search", "confidence": 0.90, "suggested_tool": "web_search", "rag_enable": False}
+        elif any(w in low for w in ("search", "find", "look up")):
             r = {"mode": "memory_query", "confidence": 0.85, "suggested_tool": "rag_search", "rag_enable": True}
         elif any(w in low for w in ("run", "execute", "open")):
             r = {"mode": "command", "confidence": 0.80, "suggested_tool": "system_exec", "rag_enable": False}
@@ -807,6 +819,171 @@ class RouterClassifier:
 
 emotion_net = EmotionNet()
 router_cls = RouterClassifier()
+
+
+# ---------------------------------------------------------------------------
+# Web Search Engine (optional — DuckDuckGo, free, no API key)
+# ---------------------------------------------------------------------------
+
+class WebSearchEngine:
+    """Optional real-time internet search using DuckDuckGo (no API key required).
+
+    Automatically uses the `duckduckgo_search` library if installed for full
+    web results, with a lightweight fallback to DDG's Instant Answer API.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self._ddg_available = False
+        try:
+            from duckduckgo_search import DDGS  # noqa: F401
+            self._ddg_available = True
+            print("[REVIA Core] Web search: duckduckgo_search ready (full results).")
+        except ImportError:
+            print(
+                "[REVIA Core] Web search: duckduckgo_search not installed — "
+                "falling back to DDG Instant API. "
+                "For richer results: pip install duckduckgo-search"
+            )
+
+    @property
+    def backend(self) -> str:
+        return "duckduckgo_search" if self._ddg_available else "ddg_instant"
+
+    def search(self, query: str, max_results: int = 4) -> str:
+        """Return formatted web search results or empty string if disabled."""
+        if not self.enabled:
+            return ""
+        query = query.strip()
+        if not query:
+            return ""
+        if self._ddg_available:
+            return self._search_ddg(query, max_results)
+        return self._search_ddg_instant(query)
+
+    def _search_ddg(self, query: str, max_results: int) -> str:
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            if not results:
+                return f"No web results found for: {query}"
+            lines = []
+            for r in results:
+                title = r.get("title", "")
+                body = r.get("body", "")[:300].strip()
+                href = r.get("href", "")
+                lines.append(f"• {title}: {body}  [{href}]")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"[Web search error: {exc}]"
+
+    def _search_ddg_instant(self, query: str) -> str:
+        """Fallback: DuckDuckGo Instant Answers API — no library needed."""
+        import urllib.request, urllib.parse
+        try:
+            params = urllib.parse.urlencode({
+                "q": query, "format": "json",
+                "no_html": "1", "skip_disambig": "1",
+            })
+            url = f"https://api.duckduckgo.com/?{params}"
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+            parts = []
+            abstract = data.get("AbstractText", "").strip()
+            if abstract:
+                source = data.get("AbstractSource", "")
+                parts.append(f"• {abstract}" + (f" (via {source})" if source else ""))
+            for topic in data.get("RelatedTopics", [])[:3]:
+                text = topic.get("Text", "").strip()
+                if text and text not in "\n".join(parts):
+                    parts.append(f"• {text}")
+            if parts:
+                return "\n".join(parts)
+            return (
+                f"No instant results found for: {query}. "
+                "Tip: install duckduckgo-search for full results."
+            )
+        except Exception as exc:
+            return f"[Web search error: {exc}]"
+
+
+web_search_engine = WebSearchEngine()
+
+
+# ---------------------------------------------------------------------------
+# Situational awareness context (Nero-style live system status)
+# ---------------------------------------------------------------------------
+
+def _build_situational_context() -> str:
+    """Return a concise system-status block injected into every LLM prompt.
+
+    This gives Revia Nero-like awareness of what's on/off so she can naturally
+    reference her own capabilities without being asked.
+    """
+    lines = [
+        "[Revia's Live System Status — you are actively aware of these:]"
+    ]
+
+    # Web search
+    if web_search_engine.enabled:
+        lines.append(
+            "• Internet Search: ONLINE — you can look up real-time information"
+        )
+    else:
+        lines.append(
+            "• Internet Search: OFFLINE — user has web access disabled"
+        )
+
+    # Neural modules
+    emo_label = ""
+    with telemetry._lock:
+        emo_label = telemetry.emotion.get("label", "Neutral")
+    if emotion_net.enabled:
+        lines.append(f"• EmotionNet: ON — current emotional read: {emo_label}")
+    else:
+        lines.append("• EmotionNet: OFF")
+
+    if router_cls.enabled:
+        lines.append("• Intent Router: ON")
+    else:
+        lines.append("• Intent Router: OFF")
+
+    # Platform integrations
+    if integration_manager is not None:
+        try:
+            status = integration_manager.get_status()
+            d = status.get("discord", {})
+            t = status.get("twitch", {})
+            if d.get("running"):
+                lines.append(
+                    f"• Discord: CONNECTED ({d.get('messages_processed', 0)} msgs)"
+                )
+            else:
+                lines.append("• Discord: OFFLINE")
+            if t.get("running"):
+                lines.append(
+                    f"• Twitch: CONNECTED ({t.get('messages_processed', 0)} msgs)"
+                )
+            else:
+                lines.append("• Twitch: OFFLINE")
+        except Exception:
+            pass
+    else:
+        lines.append("• Discord / Twitch: unavailable")
+
+    # Memory
+    st = len(memory_store.short_term)
+    lt = len(memory_store.long_term)
+    lines.append(f"• Memory: {st} recent exchanges | {lt} long-term facts stored")
+
+    lines.append(
+        "Embody this awareness naturally — proactively offer to search the web "
+        "when internet is ON and the user might benefit, acknowledge what's "
+        "offline without dwelling on it, and reference memories when relevant. "
+        "Never pretend a disabled module is working."
+    )
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Memory system -- short-term (conversation) + long-term (persistent)
@@ -1168,11 +1345,28 @@ def process_pipeline(text, image_b64=None):
         meta["has_image"] = True
     memory_store.add_short_term("user", text, meta)
 
+    # Web search injection — if the router detected web-search intent AND the
+    # engine is enabled, fetch results and prepend them to the LLM prompt so
+    # Revia can cite real information in her answer.
+    llm_input = text
+    if web_search_engine.enabled and route.get("suggested_tool") == "web_search":
+        s_ws = telemetry.begin_span("web_search")
+        search_results = web_search_engine.search(text)
+        telemetry.end_span(s_ws)
+        if search_results and not search_results.startswith("[Web search error"):
+            broadcast_json({"type": "status_update", "state": "Searching..."})
+            llm_input = (
+                f"[Live web search results for '{text}':\n{search_results}]\n\n"
+                f"Using the above search results where relevant, answer: {text}"
+            )
+        else:
+            broadcast_json({"type": "log_entry", "text": f"[Search] {search_results}"})
+
     # LLM decode -- stream tokens via the configured backend
     s = telemetry.begin_span("llm_decode", device=_device)
     try:
         full_text = llm_backend.generate_streaming(
-            text, broadcast_json, image_b64=image_b64
+            llm_input, broadcast_json, image_b64=image_b64
         )
     except Exception as e:
         full_text = f"[Error: {e}]"
@@ -1552,6 +1746,46 @@ def api_proactive():
     """Trigger Revia to start a conversation without user input."""
     threading.Thread(target=_run_proactive_pipeline, daemon=True).start()
     return jsonify({"status": "proactive triggered"})
+
+# ---------------------------------------------------------------------------
+# Web Search API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/websearch/status", methods=["GET"])
+def api_websearch_status():
+    return jsonify({
+        "enabled": web_search_engine.enabled,
+        "backend": web_search_engine.backend,
+        "ddg_available": web_search_engine._ddg_available,
+    })
+
+
+@app.route("/api/websearch/enable", methods=["POST"])
+def api_websearch_enable():
+    web_search_engine.enabled = True
+    print("[WebSearch] Internet access ENABLED")
+    return jsonify({"ok": True, "enabled": True})
+
+
+@app.route("/api/websearch/disable", methods=["POST"])
+def api_websearch_disable():
+    web_search_engine.enabled = False
+    print("[WebSearch] Internet access DISABLED")
+    return jsonify({"ok": True, "enabled": False})
+
+
+@app.route("/api/websearch/query", methods=["POST"])
+def api_websearch_query():
+    """Direct web search endpoint for testing or external callers."""
+    if not web_search_engine.enabled:
+        return jsonify({"error": "Web search is disabled"}), 403
+    data = request.get_json(silent=True) or {}
+    q = data.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "missing q"}), 400
+    results = web_search_engine.search(q, max_results=data.get("max_results", 4))
+    return jsonify({"query": q, "results": results})
+
 
 # ---------------------------------------------------------------------------
 # Integration API (Discord + Twitch)
