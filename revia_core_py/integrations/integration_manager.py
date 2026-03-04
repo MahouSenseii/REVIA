@@ -13,6 +13,11 @@ logger = logging.getLogger("revia.integrations")
 
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "integrations_config.json"
 
+_DEFAULT_BOT_STATUS: dict = {
+    "running": False, "status": "stopped",
+    "messages_processed": 0, "last_error": None, "available": True,
+}
+
 _DEFAULT_CONFIG: dict = {
     "discord": {
         "enabled": False,
@@ -117,18 +122,8 @@ class IntegrationManager:
 
     def get_status(self) -> dict:
         return {
-            "discord": (
-                self.discord_bot.get_status()
-                if self.discord_bot
-                else {"running": False, "status": "stopped", "messages_processed": 0,
-                      "last_error": None, "available": True}
-            ),
-            "twitch": (
-                self.twitch_bot.get_status()
-                if self.twitch_bot
-                else {"running": False, "status": "stopped", "messages_processed": 0,
-                      "last_error": None, "available": True}
-            ),
+            "discord": self.discord_bot.get_status() if self.discord_bot else dict(_DEFAULT_BOT_STATUS),
+            "twitch": self.twitch_bot.get_status() if self.twitch_bot else dict(_DEFAULT_BOT_STATUS),
         }
 
 

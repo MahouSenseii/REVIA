@@ -36,6 +36,10 @@ class REVIATwitchBot:
         self.last_error = None
         self.messages_processed = 0
 
+        # Cache frequently-read config values at init time
+        self._cooldown_s: float = config.get("user_cooldown_s", 8)
+        self._cache_ttl_s: float = config.get("cache_ttl_s", 300)
+
         # Per-user cooldown: {username: last_response_timestamp}
         self._cooldowns: dict[str, float] = {}
         self._cooldown_lock = threading.Lock()
@@ -50,28 +54,33 @@ class REVIATwitchBot:
     # ------------------------------------------------------------------
 
     def _is_on_cooldown(self, username: str) -> bool:
-        cooldown_s = self.config.get("user_cooldown_s", 8)
-        if cooldown_s <= 0:
+        if self._cooldown_s <= 0:
             return False
         with self._cooldown_lock:
             last = self._cooldowns.get(username, 0.0)
-            return (time.monotonic() - last) < cooldown_s
+            return (time.monotonic() - last) < self._cooldown_s
 
     def _record_response(self, username: str):
+        now = time.monotonic()
         with self._cooldown_lock:
-            self._cooldowns[username] = time.monotonic()
+            self._cooldowns[username] = now
+            # Evict expired cooldown entries to prevent unbounded growth
+            if len(self._cooldowns) > 500:
+                cutoff = now - max(self._cooldown_s * 10, 300)
+                expired = [u for u, ts in self._cooldowns.items() if ts < cutoff]
+                for u in expired:
+                    del self._cooldowns[u]
 
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
 
     def _cache_get(self, key: str):
-        ttl = self.config.get("cache_ttl_s", 300)
         with self._cache_lock:
             entry = self._cache.get(key)
             if entry:
                 response, ts = entry
-                if time.monotonic() - ts < ttl:
+                if time.monotonic() - ts < self._cache_ttl_s:
                     return response
                 del self._cache[key]
         return None
@@ -88,6 +97,29 @@ class REVIATwitchBot:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _run_pipeline(self, loop, author: str, text: str, send_fn) -> None:
+        """Shared pipeline execution for both command and respond_to_all modes."""
+        max_len = self.config.get("max_response_len", 450)
+        cached = self._cache_get(text.lower())
+        if cached:
+            self.messages_processed += 1
+            self._record_response(author)
+            await send_fn(_truncate(cached, max_len))
+            return
+        try:
+            platform_context = f"[Twitch chatter {author}]: {text}"
+            response = await loop.run_in_executor(
+                self._executor, self.pipeline_fn, platform_context
+            )
+            self.messages_processed += 1
+            self._record_response(author)
+            if response:
+                self._cache_set(text.lower(), response)
+                await send_fn(_truncate(response, max_len))
+        except Exception as exc:
+            logger.error(f"[Twitch] Pipeline error: {exc}")
+            self.last_error = str(exc)
+
     def _build_bot(self):
         if not TWITCHIO_AVAILABLE:
             raise RuntimeError("twitchio is not installed")
@@ -98,7 +130,6 @@ class REVIATwitchBot:
         prefix = cfg.get("prefix", "!")
         command_name = cfg.get("command", "revia")
         respond_to_all = cfg.get("respond_to_all", False)
-        max_len = cfg.get("max_response_len", 450)
         parent = self
 
         class _Bot(twitchio_commands.Bot):
@@ -127,34 +158,11 @@ class REVIATwitchBot:
                 if respond_to_all and not content.startswith(prefix):
                     if parent._is_on_cooldown(author):
                         return
-
-                    platform_context = f"[Twitch chatter {author}]: {content}"
-
-                    # Check cache for identical messages (common repeat questions)
-                    cached = parent._cache_get(content.lower())
-                    if cached:
-                        parent.messages_processed += 1
-                        await message.channel.send(
-                            f"@{author} {_truncate(cached, max_len)}"
-                        )
-                        parent._record_response(author)
-                        return
-
                     loop = asyncio.get_event_loop()
-                    try:
-                        response = await loop.run_in_executor(
-                            parent._executor, parent.pipeline_fn, platform_context
-                        )
-                        parent.messages_processed += 1
-                        parent._record_response(author)
-                        if response:
-                            parent._cache_set(content.lower(), response)
-                            await message.channel.send(
-                                f"@{author} {_truncate(response, max_len)}"
-                            )
-                    except Exception as exc:
-                        logger.error(f"[Twitch] Pipeline error: {exc}")
-                        parent.last_error = str(exc)
+                    await parent._run_pipeline(
+                        loop, author, content,
+                        lambda r: message.channel.send(f"@{author} {r}"),
+                    )
 
             # Dynamic command registered below
 
@@ -171,34 +179,14 @@ class REVIATwitchBot:
                 return
 
             if parent._is_on_cooldown(author):
-                remaining = parent.config.get("user_cooldown_s", 8)
                 await ctx.send(f"@{author} Hold on, I'm still thinking! Try again in a moment.")
                 return
 
-            platform_context = f"[Twitch chatter {author}]: {text}"
-
-            # Check cache
-            cached = parent._cache_get(text.lower())
-            if cached:
-                parent.messages_processed += 1
-                parent._record_response(author)
-                await ctx.send(f"@{author} {_truncate(cached, max_len)}")
-                return
-
             loop = asyncio.get_event_loop()
-            try:
-                response = await loop.run_in_executor(
-                    parent._executor, parent.pipeline_fn, platform_context
-                )
-                parent.messages_processed += 1
-                parent._record_response(author)
-                if response:
-                    parent._cache_set(text.lower(), response)
-                    await ctx.send(f"@{author} {_truncate(response, max_len)}")
-            except Exception as exc:
-                logger.error(f"[Twitch] Command pipeline error: {exc}")
-                parent.last_error = str(exc)
-                await ctx.send(f"@{author} Sorry, something went wrong!")
+            await parent._run_pipeline(
+                loop, author, text,
+                lambda r: ctx.send(f"@{author} {r}"),
+            )
 
         return _Bot()
 
@@ -256,6 +244,7 @@ class REVIATwitchBot:
         if self._loop and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
 
+        self._executor.shutdown(wait=False)
         self.running = False
         self.status = "stopped"
 

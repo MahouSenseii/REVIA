@@ -163,27 +163,25 @@ class IntegrationsTab(QScrollArea):
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_comma_list(text: str) -> list:
+        return [item.strip() for item in text.split(",") if item.strip()]
+
     def _build_discord_config(self) -> dict:
-        raw_channels = self.discord_channels.text().strip()
-        channel_ids = [c.strip() for c in raw_channels.split(",") if c.strip()]
-        raw_guilds = self.discord_guilds.text().strip()
-        guild_ids = [g.strip() for g in raw_guilds.split(",") if g.strip()]
         return {
             "enabled": self.discord_enabled.isChecked(),
             "bot_token": self.discord_token.text().strip(),
-            "channel_ids": channel_ids,
-            "guild_ids": guild_ids,
+            "channel_ids": self._parse_comma_list(self.discord_channels.text()),
+            "guild_ids": self._parse_comma_list(self.discord_guilds.text()),
             "prefix": self.discord_prefix.text().strip() or "!",
             "mention_only": self.discord_mention_only.isChecked(),
         }
 
     def _build_twitch_config(self) -> dict:
-        raw_channels = self.twitch_channels.text().strip()
-        channels = [c.strip() for c in raw_channels.split(",") if c.strip()]
         return {
             "enabled": self.twitch_enabled.isChecked(),
             "oauth_token": self.twitch_token.text().strip(),
-            "channels": channels,
+            "channels": self._parse_comma_list(self.twitch_channels.text()),
             "prefix": self.twitch_prefix.text().strip() or "!",
             "command": self.twitch_command.text().strip() or "revia",
             "respond_to_all": self.twitch_respond_all.isChecked(),

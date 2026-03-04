@@ -35,6 +35,9 @@ class REVIADiscordBot:
         self.status = "stopped"
         self.last_error = None
         self.messages_processed = 0
+        # Pre-convert ID lists to sets of strings for O(1) per-message lookup
+        self._allowed_guilds: set[str] = {str(g) for g in config.get("guild_ids", [])}
+        self._allowed_channels: set[str] = {str(c) for c in config.get("channel_ids", [])}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -63,14 +66,12 @@ class REVIADiscordBot:
 
             cfg = bot_ref.config
 
-            # Guild filter
-            allowed_guilds = cfg.get("guild_ids", [])
-            if allowed_guilds and str(message.guild.id) not in [str(g) for g in allowed_guilds]:
+            # Guild filter (sets pre-built at init for O(1) lookup)
+            if bot_ref._allowed_guilds and str(message.guild.id) not in bot_ref._allowed_guilds:
                 return
 
             # Channel filter
-            allowed_channels = cfg.get("channel_ids", [])
-            if allowed_channels and str(message.channel.id) not in [str(c) for c in allowed_channels]:
+            if bot_ref._allowed_channels and str(message.channel.id) not in bot_ref._allowed_channels:
                 return
 
             content = message.content.strip()
@@ -171,6 +172,7 @@ class REVIADiscordBot:
         if self._loop and not self._loop.is_closed():
             asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
 
+        self._executor.shutdown(wait=False)
         self.running = False
         self.status = "stopped"
 
