@@ -20,6 +20,7 @@ from gui.tabs.filters_tab import FiltersTab
 from gui.tabs.logs_tab import LogsTab
 from gui.tabs.system_tab import SystemTab
 from gui.tabs.emotions_tab import EmotionsTab
+from gui.tabs.integrations_tab import IntegrationsTab
 
 
 class MainWindow(QMainWindow):
@@ -109,6 +110,9 @@ class MainWindow(QMainWindow):
             FiltersTab(self.event_bus, self.client), "Filters"
         )
         self.tabs.addTab(LogsTab(self.event_bus), "Logs")
+        self.tabs.addTab(
+            IntegrationsTab(self.event_bus, self.client), "Integrations"
+        )
         self.system_tab = SystemTab(
             self.event_bus, self.client, self.theme_mgr
         )

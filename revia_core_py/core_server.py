@@ -7,9 +7,12 @@ Usage:
     (REST on :8123, WebSocket on :8124)
 """
 
-import json, time, random, threading, asyncio, os, subprocess
+import json, time, random, threading, asyncio, os, subprocess, sys
 from datetime import datetime
 from pathlib import Path
+
+# Make the integrations package importable when running from any CWD
+sys.path.insert(0, str(Path(__file__).parent))
 
 try:
     import psutil as _psutil
@@ -212,7 +215,15 @@ LOCAL_SERVERS = {
 
 class LLMBackend:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # protects attribute mutation
+        self._generate_lock = threading.Lock() # serializes all LLM generations
+        # Persistent HTTP session — reuses TCP connections for lower latency
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=0
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         self.source = "none"
         self.local_path = ""
         self.local_backend = "CPU"
@@ -229,6 +240,22 @@ class LLMBackend:
         self.ctx_length = 4096
         self.system_prompt = "You are REVIA, a smart and friendly AI assistant."
         self.conversation = []
+        # Per-platform conversation isolation — Discord and Twitch get their own
+        # history so their chat context never bleeds into each other or the GUI.
+        self._platform_conversations = {"discord": [], "twitch": []}
+        # Platform-aware hints injected into the system prompt for each platform
+        self._platform_hints = {
+            "discord": (
+                "\n\n[Platform: Discord. You are chatting in a Discord server. "
+                "Be conversational, friendly, and helpful. Responses can be a "
+                "few sentences. Markdown is supported.]"
+            ),
+            "twitch": (
+                "\n\n[Platform: Twitch live chat. You are part of a live stream. "
+                "Keep replies SHORT — ideally one sentence, two at most. "
+                "Be upbeat, engaging, and entertaining. No markdown.]"
+            ),
+        }
 
     def configure(self, cfg):
         with self._lock:
@@ -304,6 +331,9 @@ class LLMBackend:
                 f"(valence {v:+.2f}, confidence {conf:.0%}). {hint}]"
             )
 
+        # Inject live situational awareness so Revia knows what's enabled/disabled
+        sys_content += "\n\n" + _build_situational_context()
+
         # Pass current user query for relevance-aware memory retrieval
         query = None
         if self.conversation:
@@ -343,21 +373,22 @@ class LLMBackend:
         return messages
 
     def generate_streaming(self, text, broadcast_fn, image_b64=None):
-        with self._lock:
-            source = self.source
-            self.conversation.append({"role": "user", "content": text})
-            if len(self.conversation) > 40:
-                self.conversation = self.conversation[-30:]
+        with self._generate_lock:
+            with self._lock:
+                source = self.source
+                self.conversation.append({"role": "user", "content": text})
+                if len(self.conversation) > 40:
+                    self.conversation = self.conversation[-30:]
 
-        if source == "online" and self.api_key:
-            return self._generate_online(broadcast_fn, image_b64=image_b64)
-        elif source == "local" and (self.local_path or self.local_server_url):
-            return self._generate_local(text, broadcast_fn, image_b64=image_b64)
-        else:
-            return self._generate_stub(text, broadcast_fn)
+            if source == "online" and self.api_key:
+                return self._generate_online(broadcast_fn, image_b64=image_b64)
+            elif source == "local" and (self.local_path or self.local_server_url):
+                return self._generate_local(text, broadcast_fn, image_b64=image_b64)
+            else:
+                return self._generate_stub(text, broadcast_fn)
 
     def _generate_online(self, broadcast_fn, image_b64=None):
-        req = requests
+        req = self._session  # noqa: F841 (kept for exception messages below)
         provider = self.api_provider.lower()
         endpoint = self.api_endpoint.rstrip("/")
         messages = self._build_messages(image_b64=image_b64)
@@ -374,7 +405,7 @@ class LLMBackend:
             return err
 
     def _call_openai_compat(self, endpoint, messages, broadcast_fn):
-        req = requests
+        req = self._session
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -424,7 +455,7 @@ class LLMBackend:
         return full_text
 
     def _call_anthropic(self, endpoint, messages, broadcast_fn):
-        req = requests
+        req = self._session
         sys_msg = ""
         conv = []
         for m in messages:
@@ -476,7 +507,7 @@ class LLMBackend:
 
     def _discover_model_name(self, base_url):
         """Ask the local server for its loaded model name."""
-        req = requests
+        req = self._session
         try:
             r = req.get(base_url.rstrip("/") + "/models", timeout=3)
             if r.ok:
@@ -488,7 +519,7 @@ class LLMBackend:
         return ""
 
     def _generate_local(self, text, broadcast_fn, image_b64=None):
-        req = requests
+        req = self._session
         base_url = self.local_server_url.rstrip("/")
         url = base_url + "/chat/completions"
         server_name = self.local_server
@@ -611,7 +642,7 @@ class LLMBackend:
         full = ""
         t0 = time.perf_counter()
         for tok in tokens:
-            time.sleep(random.uniform(0.02, 0.05))
+            time.sleep(0.01)  # Reduced stub token delay for lower latency
             word = tok + " "
             full += word
             broadcast_fn({"type": "chat_token", "token": word})
@@ -622,6 +653,45 @@ class LLMBackend:
         with self._lock:
             self.conversation.append({"role": "assistant", "content": full.strip()})
         return full.strip()
+
+
+    def generate_for_platform(self, text, broadcast_fn, platform):
+        """Generate a response using an isolated per-platform conversation buffer.
+
+        Discord and Twitch each maintain their own conversation history so that
+        chat on one platform never contaminates the context seen on another.
+        A short platform hint is also appended to the system prompt so Revia
+        adapts her response length and style to the platform automatically.
+
+        _generate_lock is held for the full duration so that the conversation-
+        buffer swap is never interleaved with another generate_streaming or
+        generate_for_platform call on a different thread.
+        """
+        with self._generate_lock:
+            with self._lock:
+                source = self.source
+                p_conv = self._platform_conversations.get(platform, [])
+                hint = self._platform_hints.get(platform, "")
+                _saved_conv = self.conversation
+                _saved_prompt = self.system_prompt
+                self.conversation = p_conv
+                if hint and hint not in self.system_prompt:
+                    self.system_prompt = self.system_prompt + hint
+
+            try:
+                if source == "online" and self.api_key:
+                    result = self._generate_online(broadcast_fn)
+                elif source == "local" and (self.local_path or self.local_server_url):
+                    result = self._generate_local(text, broadcast_fn)
+                else:
+                    result = self._generate_stub(text, broadcast_fn)
+            finally:
+                with self._lock:
+                    self._platform_conversations[platform] = self.conversation
+                    self.conversation = _saved_conv
+                    self.system_prompt = _saved_prompt
+
+        return result
 
 
 llm_backend = LLMBackend()
@@ -703,7 +773,8 @@ class EmotionNet:
             elif v < -0.25:
                 r["label"] = "Sad"
 
-        time.sleep(random.uniform(0.004, 0.012))
+        # Latency optimisation: minimal stub delay (real model would replace this)
+        time.sleep(0.002)
         ms = (time.perf_counter() - t0) * 1000
         r["inference_ms"] = ms
         self.last_inference_ms = ms
@@ -723,7 +794,16 @@ class RouterClassifier:
                     "rag_enable": False, "inference_ms": 0}
         t0 = time.perf_counter()
         low = text.lower()
-        if any(w in low for w in ("search", "find", "look up")):
+        # Web-search keywords take priority over local memory search
+        if any(w in low for w in (
+            "search online", "google", "look it up", "look up online",
+            "search the web", "search the internet", "find online",
+            "latest news", "current news", "what's happening", "right now",
+            "real-time", "real time", "today's", "as of today",
+            "what is the current", "what are the latest",
+        )):
+            r = {"mode": "web_search", "confidence": 0.90, "suggested_tool": "web_search", "rag_enable": False}
+        elif any(w in low for w in ("search", "find", "look up")):
             r = {"mode": "memory_query", "confidence": 0.85, "suggested_tool": "rag_search", "rag_enable": True}
         elif any(w in low for w in ("run", "execute", "open")):
             r = {"mode": "command", "confidence": 0.80, "suggested_tool": "system_exec", "rag_enable": False}
@@ -733,7 +813,8 @@ class RouterClassifier:
             r = {"mode": "memory_query", "confidence": 0.82, "suggested_tool": "memory_recall", "rag_enable": True}
         else:
             r = {"mode": "chat", "confidence": 0.92, "suggested_tool": "", "rag_enable": False}
-        time.sleep(random.uniform(0.003, 0.008))
+        # Latency optimisation: minimal stub delay
+        time.sleep(0.001)
         ms = (time.perf_counter() - t0) * 1000
         r["inference_ms"] = ms
         self.last_inference_ms = ms
@@ -743,6 +824,171 @@ class RouterClassifier:
 
 emotion_net = EmotionNet()
 router_cls = RouterClassifier()
+
+
+# ---------------------------------------------------------------------------
+# Web Search Engine (optional — DuckDuckGo, free, no API key)
+# ---------------------------------------------------------------------------
+
+class WebSearchEngine:
+    """Optional real-time internet search using DuckDuckGo (no API key required).
+
+    Automatically uses the `duckduckgo_search` library if installed for full
+    web results, with a lightweight fallback to DDG's Instant Answer API.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self._ddg_available = False
+        try:
+            from duckduckgo_search import DDGS  # noqa: F401
+            self._ddg_available = True
+            print("[REVIA Core] Web search: duckduckgo_search ready (full results).")
+        except ImportError:
+            print(
+                "[REVIA Core] Web search: duckduckgo_search not installed — "
+                "falling back to DDG Instant API. "
+                "For richer results: pip install duckduckgo-search"
+            )
+
+    @property
+    def backend(self) -> str:
+        return "duckduckgo_search" if self._ddg_available else "ddg_instant"
+
+    def search(self, query: str, max_results: int = 4) -> str:
+        """Return formatted web search results or empty string if disabled."""
+        if not self.enabled:
+            return ""
+        query = query.strip()
+        if not query:
+            return ""
+        if self._ddg_available:
+            return self._search_ddg(query, max_results)
+        return self._search_ddg_instant(query)
+
+    def _search_ddg(self, query: str, max_results: int) -> str:
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            if not results:
+                return f"No web results found for: {query}"
+            lines = []
+            for r in results:
+                title = r.get("title", "")
+                body = r.get("body", "")[:300].strip()
+                href = r.get("href", "")
+                lines.append(f"• {title}: {body}  [{href}]")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"[Web search error: {exc}]"
+
+    def _search_ddg_instant(self, query: str) -> str:
+        """Fallback: DuckDuckGo Instant Answers API — no library needed."""
+        import urllib.request, urllib.parse
+        try:
+            params = urllib.parse.urlencode({
+                "q": query, "format": "json",
+                "no_html": "1", "skip_disambig": "1",
+            })
+            url = f"https://api.duckduckgo.com/?{params}"
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+            parts = []
+            abstract = data.get("AbstractText", "").strip()
+            if abstract:
+                source = data.get("AbstractSource", "")
+                parts.append(f"• {abstract}" + (f" (via {source})" if source else ""))
+            for topic in data.get("RelatedTopics", [])[:3]:
+                text = topic.get("Text", "").strip()
+                if text and text not in "\n".join(parts):
+                    parts.append(f"• {text}")
+            if parts:
+                return "\n".join(parts)
+            return (
+                f"No instant results found for: {query}. "
+                "Tip: install duckduckgo-search for full results."
+            )
+        except Exception as exc:
+            return f"[Web search error: {exc}]"
+
+
+web_search_engine = WebSearchEngine()
+
+
+# ---------------------------------------------------------------------------
+# Situational awareness context (Nero-style live system status)
+# ---------------------------------------------------------------------------
+
+def _build_situational_context() -> str:
+    """Return a concise system-status block injected into every LLM prompt.
+
+    This gives Revia Nero-like awareness of what's on/off so she can naturally
+    reference her own capabilities without being asked.
+    """
+    lines = [
+        "[Revia's Live System Status — you are actively aware of these:]"
+    ]
+
+    # Web search
+    if web_search_engine.enabled:
+        lines.append(
+            "• Internet Search: ONLINE — you can look up real-time information"
+        )
+    else:
+        lines.append(
+            "• Internet Search: OFFLINE — user has web access disabled"
+        )
+
+    # Neural modules
+    emo_label = ""
+    with telemetry._lock:
+        emo_label = telemetry.emotion.get("label", "Neutral")
+    if emotion_net.enabled:
+        lines.append(f"• EmotionNet: ON — current emotional read: {emo_label}")
+    else:
+        lines.append("• EmotionNet: OFF")
+
+    if router_cls.enabled:
+        lines.append("• Intent Router: ON")
+    else:
+        lines.append("• Intent Router: OFF")
+
+    # Platform integrations
+    if integration_manager is not None:
+        try:
+            status = integration_manager.get_status()
+            d = status.get("discord", {})
+            t = status.get("twitch", {})
+            if d.get("running"):
+                lines.append(
+                    f"• Discord: CONNECTED ({d.get('messages_processed', 0)} msgs)"
+                )
+            else:
+                lines.append("• Discord: OFFLINE")
+            if t.get("running"):
+                lines.append(
+                    f"• Twitch: CONNECTED ({t.get('messages_processed', 0)} msgs)"
+                )
+            else:
+                lines.append("• Twitch: OFFLINE")
+        except Exception:
+            pass
+    else:
+        lines.append("• Discord / Twitch: unavailable")
+
+    # Memory
+    st = len(memory_store.short_term)
+    lt = len(memory_store.long_term)
+    lines.append(f"• Memory: {st} recent exchanges | {lt} long-term facts stored")
+
+    lines.append(
+        "Embody this awareness naturally — proactively offer to search the web "
+        "when internet is ON and the user might benefit, acknowledge what's "
+        "offline without dwelling on it, and reference memories when relevant. "
+        "Never pretend a disabled module is working."
+    )
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Memory system -- short-term (conversation) + long-term (persistent)
@@ -1104,11 +1350,28 @@ def process_pipeline(text, image_b64=None):
         meta["has_image"] = True
     memory_store.add_short_term("user", text, meta)
 
+    # Web search injection — if the router detected web-search intent AND the
+    # engine is enabled, fetch results and prepend them to the LLM prompt so
+    # Revia can cite real information in her answer.
+    llm_input = text
+    if web_search_engine.enabled and route.get("suggested_tool") == "web_search":
+        s_ws = telemetry.begin_span("web_search")
+        search_results = web_search_engine.search(text)
+        telemetry.end_span(s_ws)
+        if search_results and not search_results.startswith("[Web search error"):
+            broadcast_json({"type": "status_update", "state": "Searching..."})
+            llm_input = (
+                f"[Live web search results for '{text}':\n{search_results}]\n\n"
+                f"Using the above search results where relevant, answer: {text}"
+            )
+        else:
+            broadcast_json({"type": "log_entry", "text": f"[Search] {search_results}"})
+
     # LLM decode -- stream tokens via the configured backend
     s = telemetry.begin_span("llm_decode", device=_device)
     try:
         full_text = llm_backend.generate_streaming(
-            text, broadcast_json, image_b64=image_b64
+            llm_input, broadcast_json, image_b64=image_b64
         )
     except Exception as e:
         full_text = f"[Error: {e}]"
@@ -1143,6 +1406,63 @@ def process_pipeline(text, image_b64=None):
     telemetry.state = "Idle"
     broadcast_json({"type": "status_update", "state": "Idle"})
     return full_text
+
+
+def process_pipeline_integration(text: str) -> str:
+    """Lightweight pipeline for Discord/Twitch — no WebSocket broadcasts.
+
+    Skips EmotionNet (saves ~5–50 ms) and broadcasts nothing to the GUI so
+    platform chat traffic does not flood the controller UI.  Uses per-platform
+    conversation isolation so Discord and Twitch never share context.
+    """
+    def _noop(_data):  # silent broadcast replacement
+        pass
+
+    # Detect platform from the context prefix injected by each bot
+    if text.startswith("[Discord"):
+        platform = "discord"
+    elif text.startswith("[Twitch"):
+        platform = "twitch"
+    else:
+        platform = None
+
+    memory_store.add_short_term("user", text, {"platform": platform or "unknown"})
+
+    try:
+        if platform:
+            full_text = llm_backend.generate_for_platform(text, _noop, platform)
+        else:
+            full_text = llm_backend.generate_streaming(text, _noop)
+    except Exception as exc:
+        full_text = f"[Error: {exc}]"
+
+    memory_store.add_short_term("assistant", full_text, {"platform": platform or "unknown"})
+
+    # Auto-save summary every 20 messages (same policy as main pipeline)
+    if len(memory_store.short_term) % 20 == 0 and len(memory_store.short_term) > 0:
+        summary = (
+            f"Platform exchange ({platform or 'unknown'}): "
+            f"User said '{text[:100]}', Assistant replied '{full_text[:100]}'"
+        )
+        memory_store.save_to_long_term(
+            summary, category="auto_conversation",
+            metadata={"platform": platform or "unknown"},
+        )
+
+    return full_text
+
+
+# ---------------------------------------------------------------------------
+# Integration Manager (Discord + Twitch)
+# ---------------------------------------------------------------------------
+
+try:
+    from integrations.integration_manager import IntegrationManager
+    integration_manager = IntegrationManager(process_pipeline_integration)
+    print("[REVIA Core] Integration manager ready (Discord + Twitch).")
+except Exception as _int_err:
+    integration_manager = None
+    print(f"[REVIA Core] Integration manager unavailable: {_int_err}")
 
 # ---------------------------------------------------------------------------
 # Flask REST API
@@ -1433,6 +1753,104 @@ def api_proactive():
     return jsonify({"status": "proactive triggered"})
 
 # ---------------------------------------------------------------------------
+# Web Search API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/websearch/status", methods=["GET"])
+def api_websearch_status():
+    return jsonify({
+        "enabled": web_search_engine.enabled,
+        "backend": web_search_engine.backend,
+        "ddg_available": web_search_engine._ddg_available,
+    })
+
+
+@app.route("/api/websearch/enable", methods=["POST"])
+def api_websearch_enable():
+    web_search_engine.enabled = True
+    print("[WebSearch] Internet access ENABLED")
+    return jsonify({"ok": True, "enabled": True})
+
+
+@app.route("/api/websearch/disable", methods=["POST"])
+def api_websearch_disable():
+    web_search_engine.enabled = False
+    print("[WebSearch] Internet access DISABLED")
+    return jsonify({"ok": True, "enabled": False})
+
+
+@app.route("/api/websearch/query", methods=["POST"])
+def api_websearch_query():
+    """Direct web search endpoint for testing or external callers."""
+    if not web_search_engine.enabled:
+        return jsonify({"error": "Web search is disabled"}), 403
+    data = request.get_json(silent=True) or {}
+    q = data.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "missing q"}), 400
+    results = web_search_engine.search(q, max_results=data.get("max_results", 4))
+    return jsonify({"query": q, "results": results})
+
+
+# ---------------------------------------------------------------------------
+# Integration API (Discord + Twitch)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/integrations/status", methods=["GET"])
+def api_integrations_status():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    return jsonify(integration_manager.get_status())
+
+
+@app.route("/api/integrations/config", methods=["GET"])
+def api_integrations_config_get():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    return jsonify(integration_manager.get_config())
+
+
+@app.route("/api/integrations/config", methods=["POST"])
+def api_integrations_config_set():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    data = request.get_json(silent=True) or {}
+    integration_manager.update_config(data)
+    return jsonify({"ok": True, "config": integration_manager.get_config()})
+
+
+@app.route("/api/integrations/discord/start", methods=["POST"])
+def api_discord_start():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.start_discord()
+    return jsonify({"ok": True, "status": integration_manager.get_status()["discord"]})
+
+
+@app.route("/api/integrations/discord/stop", methods=["POST"])
+def api_discord_stop():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.stop_discord()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/integrations/twitch/start", methods=["POST"])
+def api_twitch_start():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.start_twitch()
+    return jsonify({"ok": True, "status": integration_manager.get_status()["twitch"]})
+
+
+@app.route("/api/integrations/twitch/stop", methods=["POST"])
+def api_twitch_stop():
+    if integration_manager is None:
+        return jsonify({"error": "Integration manager unavailable"}), 503
+    integration_manager.stop_twitch()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -1451,11 +1869,16 @@ def run_ws():
 
 def main():
     print("=" * 50)
-    print("  REVIA Core (Python)  v1.1.0")
+    print("  REVIA Core (Python)  v1.2.0")
     print("=" * 50)
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
     time.sleep(0.3)
+
+    # Start any enabled platform integrations (Discord / Twitch)
+    if integration_manager is not None:
+        integration_manager.start_enabled()
+
     print(f"[REVIA Core] REST server on http://0.0.0.0:{REST_PORT}")
     print(f"[REVIA Core] Ready. Open the controller and click 'Connect'.")
     print()

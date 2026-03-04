@@ -184,6 +184,33 @@ class ControllerClient(QObject):
         except Exception:
             return {}
 
+    # ------------------------------------------------------------------
+    # Generic helpers (used by integrations tab and other dynamic callers)
+    # ------------------------------------------------------------------
+
+    def get(self, path: str, params=None, timeout: int = 3):
+        """Synchronous GET against the core REST API. Returns parsed JSON or None."""
+        try:
+            r = requests.get(f"{self.BASE_URL}{path}", params=params, timeout=timeout)
+            return r.json() if r.ok else None
+        except Exception:
+            return None
+
+    def post(self, path: str, json=None, timeout: int = 5):
+        """Synchronous POST against the core REST API. Returns parsed JSON or None."""
+        try:
+            r = requests.post(f"{self.BASE_URL}{path}", json=json or {}, timeout=timeout)
+            return r.json() if r.ok else None
+        except Exception:
+            return None
+
+    def get_websearch_status(self) -> dict:
+        return self.get("/api/websearch/status") or {}
+
+    def toggle_websearch(self, enable: bool):
+        action = "enable" if enable else "disable"
+        self.post(f"/api/websearch/{action}")
+
     def send_proactive(self):
         """Ask the core server to generate a proactive message from Revia."""
         def _do():
