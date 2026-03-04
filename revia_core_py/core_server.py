@@ -215,7 +215,8 @@ LOCAL_SERVERS = {
 
 class LLMBackend:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # protects attribute mutation
+        self._generate_lock = threading.Lock() # serializes all LLM generations
         # Persistent HTTP session — reuses TCP connections for lower latency
         self._session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
@@ -372,18 +373,19 @@ class LLMBackend:
         return messages
 
     def generate_streaming(self, text, broadcast_fn, image_b64=None):
-        with self._lock:
-            source = self.source
-            self.conversation.append({"role": "user", "content": text})
-            if len(self.conversation) > 40:
-                self.conversation = self.conversation[-30:]
+        with self._generate_lock:
+            with self._lock:
+                source = self.source
+                self.conversation.append({"role": "user", "content": text})
+                if len(self.conversation) > 40:
+                    self.conversation = self.conversation[-30:]
 
-        if source == "online" and self.api_key:
-            return self._generate_online(broadcast_fn, image_b64=image_b64)
-        elif source == "local" and (self.local_path or self.local_server_url):
-            return self._generate_local(text, broadcast_fn, image_b64=image_b64)
-        else:
-            return self._generate_stub(text, broadcast_fn)
+            if source == "online" and self.api_key:
+                return self._generate_online(broadcast_fn, image_b64=image_b64)
+            elif source == "local" and (self.local_path or self.local_server_url):
+                return self._generate_local(text, broadcast_fn, image_b64=image_b64)
+            else:
+                return self._generate_stub(text, broadcast_fn)
 
     def _generate_online(self, broadcast_fn, image_b64=None):
         req = self._session  # noqa: F841 (kept for exception messages below)
@@ -660,31 +662,34 @@ class LLMBackend:
         chat on one platform never contaminates the context seen on another.
         A short platform hint is also appended to the system prompt so Revia
         adapts her response length and style to the platform automatically.
-        """
-        with self._lock:
-            source = self.source
-            p_conv = self._platform_conversations.get(platform, [])
-            hint = self._platform_hints.get(platform, "")
-            # Temporarily swap in the platform conversation and inject platform hint
-            _saved_conv = self.conversation
-            _saved_prompt = self.system_prompt
-            self.conversation = p_conv
-            if hint and hint not in self.system_prompt:
-                self.system_prompt = self.system_prompt + hint
 
-        try:
-            if source == "online" and self.api_key:
-                result = self._generate_online(broadcast_fn)
-            elif source == "local" and (self.local_path or self.local_server_url):
-                result = self._generate_local(text, broadcast_fn)
-            else:
-                result = self._generate_stub(text, broadcast_fn)
-        finally:
+        _generate_lock is held for the full duration so that the conversation-
+        buffer swap is never interleaved with another generate_streaming or
+        generate_for_platform call on a different thread.
+        """
+        with self._generate_lock:
             with self._lock:
-                # Persist the updated platform conversation, restore main state
-                self._platform_conversations[platform] = self.conversation
-                self.conversation = _saved_conv
-                self.system_prompt = _saved_prompt
+                source = self.source
+                p_conv = self._platform_conversations.get(platform, [])
+                hint = self._platform_hints.get(platform, "")
+                _saved_conv = self.conversation
+                _saved_prompt = self.system_prompt
+                self.conversation = p_conv
+                if hint and hint not in self.system_prompt:
+                    self.system_prompt = self.system_prompt + hint
+
+            try:
+                if source == "online" and self.api_key:
+                    result = self._generate_online(broadcast_fn)
+                elif source == "local" and (self.local_path or self.local_server_url):
+                    result = self._generate_local(text, broadcast_fn)
+                else:
+                    result = self._generate_stub(text, broadcast_fn)
+            finally:
+                with self._lock:
+                    self._platform_conversations[platform] = self.conversation
+                    self.conversation = _saved_conv
+                    self.system_prompt = _saved_prompt
 
         return result
 
