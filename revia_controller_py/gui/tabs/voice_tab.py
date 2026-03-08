@@ -93,6 +93,7 @@ class VoiceTab(QScrollArea):
         self._tts_process = None
         self._tts_ready_timer = None
         self._tts_last_lines: list[str] = []
+        self._tts_launcher_tmp = None  # temp wrapper script for CPU-only builds
         layout.addWidget(srv_group)
 
         # ── 3 Mode Tabs (matching Qwen3-TTS demo) ──
@@ -911,18 +912,70 @@ class VoiceTab(QScrollArea):
 
     def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str):
         """Build launch args and prefer CUDA when available."""
-        device = self._detect_tts_device()
-        args = [
-            "-m", qwen_module,
-            model_id, "--port", port, "--ip", "0.0.0.0",
-            "--no-flash-attn",
-        ]
-        if self._qwen_cli_supports_flag(qwen_module, "--device"):
-            args.extend(["--device", device])
+        device, is_cpu_only = self._detect_tts_device()
+        model_args = [model_id, "--port", port, "--ip", "0.0.0.0", "--no-flash-attn"]
+
+        if is_cpu_only:
+            # PyTorch is not compiled with CUDA.  Any call to torch.cuda.*
+            # raises AssertionError unconditionally — CUDA_VISIBLE_DEVICES
+            # cannot help here.  Run qwen_tts via a small wrapper script
+            # that monkey-patches torch.cuda.is_available() to return False
+            # safely before the module is imported.
+            launcher = self._create_tts_launcher(qwen_module)
+            self._tts_launcher_tmp = launcher
+            args = [launcher] + model_args
+        else:
+            self._tts_launcher_tmp = None
+            args = ["-m", qwen_module] + model_args
+            if self._qwen_cli_supports_flag(qwen_module, "--device"):
+                args.extend(["--device", device])
+
         return args, device.upper()
 
-    def _detect_tts_device(self) -> str:
-        """Auto-select CUDA when available, otherwise force CPU."""
+    def _create_tts_launcher(self, qwen_module: str) -> str:
+        """Write a temp launcher that patches torch.cuda before running qwen_tts.
+
+        On CPU-only PyTorch builds torch.cuda.is_available() raises
+        AssertionError instead of returning False.  This wrapper intercepts
+        that error so qwen_tts falls back to CPU without crashing.
+
+        Returns the path to the temp script (caller is responsible for
+        deleting it via self._tts_launcher_tmp when the server stops).
+        """
+        import tempfile
+        code = (
+            "import sys\n"
+            "try:\n"
+            "    import torch as _t\n"
+            "    _orig = _t.cuda.is_available\n"
+            "    def _safe():\n"
+            "        try:\n"
+            "            return _orig()\n"
+            "        except (AssertionError, RuntimeError):\n"
+            "            return False\n"
+            "    _t.cuda.is_available = _safe\n"
+            "except Exception:\n"
+            "    pass\n"
+            "import runpy\n"
+            f"runpy.run_module({qwen_module!r}, run_name='__main__', alter_sys=True)\n"
+        )
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_tts_launch.py", delete=False, prefix="revia_"
+        )
+        tmp.write(code)
+        tmp.close()
+        return tmp.name
+
+    def _detect_tts_device(self):
+        """Auto-select CUDA when available, otherwise force CPU.
+
+        Returns:
+            (device_str, is_cpu_only_build) where is_cpu_only_build=True
+            means PyTorch was not compiled with CUDA at all (as opposed to
+            simply having no GPU attached).  The distinction matters: for a
+            CPU-only build, torch.cuda.* raises AssertionError rather than
+            returning a safe False, so the subprocess needs special handling.
+        """
         try:
             import torch
             # torch.cuda.is_available() raises AssertionError on CPU-only
@@ -930,12 +983,13 @@ class VoiceTab(QScrollArea):
             # wrap it separately to avoid that surfacing to the user.
             try:
                 if torch.cuda.is_available():
-                    return "cuda"
+                    return "cuda", False
+                return "cpu", False   # CUDA compiled but no GPU attached
             except (AssertionError, RuntimeError):
-                pass
+                return "cpu", True    # CUDA not compiled into this torch
         except Exception:
             pass
-        return "cpu"
+        return "cpu", False
 
     def _qwen_cli_supports_flag(self, qwen_module: str, flag: str) -> bool:
         """Check whether qwen_tts demo CLI accepts a given option."""
@@ -977,6 +1031,14 @@ class VoiceTab(QScrollArea):
             self._tts_process.kill()
             self._tts_process.waitForFinished(3000)
         self._kill_port(8000)
+        # Clean up any temp launcher script written for CPU-only builds.
+        if self._tts_launcher_tmp:
+            try:
+                import os as _os
+                _os.unlink(self._tts_launcher_tmp)
+            except OSError:
+                pass
+            self._tts_launcher_tmp = None
         self.tts_server_status.setText("Stopped")
         self.tts_server_status.setStyleSheet("")
         self.start_tts_btn.setEnabled(True)
