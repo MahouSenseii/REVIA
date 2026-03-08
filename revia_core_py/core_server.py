@@ -20,7 +20,35 @@ try:
 except ImportError:
     _psutil = None
 
-import requests
+try:
+    import requests
+    _requests_available = True
+except ImportError:
+    _requests_available = False
+    import urllib.request as _urllib_req
+    import urllib.error as _urllib_err
+    # Minimal shim so the rest of the file can still reference requests.*
+    class _RequestsShim:
+        class exceptions:
+            class ConnectionError(OSError): pass
+            class HTTPError(OSError): pass
+            class RequestException(OSError): pass
+        class Session:
+            def __init__(self): pass
+            def mount(self, *a, **kw): pass
+            def post(self, url, json=None, stream=False, timeout=None, headers=None):
+                raise _RequestsShim.exceptions.ConnectionError(
+                    f"requests not installed — cannot POST to {url}"
+                )
+            def get(self, url, params=None, timeout=None):
+                raise _RequestsShim.exceptions.ConnectionError(
+                    f"requests not installed — cannot GET {url}"
+                )
+        class adapters:
+            class HTTPAdapter:
+                def __init__(self, **kw): pass
+    requests = _RequestsShim()
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -1729,12 +1757,21 @@ def _run_proactive_pipeline():
             llm_backend.conversation.append({"role": "user", "content": prompt})
 
         try:
-            if source == "online" and llm_backend.api_key:
+            if not _requests_available:
+                # requests library not installed — fall back to stub immediately
+                full_text = llm_backend._generate_stub(prompt, broadcast_json)
+            elif source == "online" and llm_backend.api_key:
                 full_text = llm_backend._generate_online(broadcast_json)
-            elif source == "local" and (llm_backend.local_path or llm_backend.local_server_url):
+            elif source == "local" and llm_backend.local_path:
+                # Only use local path when user has actually selected a model file
+                full_text = llm_backend._generate_local(prompt, broadcast_json)
+            elif source == "local" and llm_backend.local_server_url:
                 full_text = llm_backend._generate_local(prompt, broadcast_json)
             else:
                 full_text = llm_backend._generate_stub(prompt, broadcast_json)
+        except ModuleNotFoundError:
+            # requests (or a dependency) not importable in this environment
+            full_text = llm_backend._generate_stub(prompt, broadcast_json)
         except Exception as e:
             full_text = f"[Proactive error: {e}]"
             broadcast_json({"type": "chat_token", "token": full_text})
