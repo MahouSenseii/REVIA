@@ -858,7 +858,6 @@ class VoiceTab(QScrollArea):
         env = QProcessEnvironment.systemEnvironment()
         sox_dir = str(Path.home() / "sox" / "sox-14.4.2")
         env.insert("PATH", sox_dir + ";" + env.value("PATH", ""))
-        self._tts_process.setProcessEnvironment(env)
 
         qwen_module = self._resolve_qwen_module()
         if not qwen_module:
@@ -871,6 +870,13 @@ class VoiceTab(QScrollArea):
             return
 
         args, device_label = self._build_tts_server_args(qwen_module, model_id, port)
+
+        # If using CPU, hide all GPUs from the subprocess so PyTorch/CUDA
+        # can't accidentally try to initialise a CUDA device and crash.
+        if device_label == "CPU":
+            env.insert("CUDA_VISIBLE_DEVICES", "")
+
+        self._tts_process.setProcessEnvironment(env)
         self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
         self.tts_server_status.setStyleSheet("color: #ccaa00;")
         self.start_tts_btn.setEnabled(False)
@@ -919,8 +925,14 @@ class VoiceTab(QScrollArea):
         """Auto-select CUDA when available, otherwise force CPU."""
         try:
             import torch
-            if torch.cuda.is_available():
-                return "cuda"
+            # torch.cuda.is_available() raises AssertionError on CPU-only
+            # torch builds ("Torch not compiled with CUDA enabled"), so
+            # wrap it separately to avoid that surfacing to the user.
+            try:
+                if torch.cuda.is_available():
+                    return "cuda"
+            except (AssertionError, RuntimeError):
+                pass
         except Exception:
             pass
         return "cpu"
