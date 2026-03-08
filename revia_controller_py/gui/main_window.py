@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
         self.camera_service = CameraService(self)
         self.audio_service = AudioService(self)
         self.conversation_starter = ConversationStarter(
-            client, event_bus, interval_ms=300_000, parent=self
+            client, event_bus, interval_ms=120_000, parent=self
         )
         self.setWindowTitle("REVIA \u2014 Neural Assistant Controller")
         self.setMinimumSize(1400, 900)
