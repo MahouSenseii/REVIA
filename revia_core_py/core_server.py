@@ -411,6 +411,8 @@ class LLMBackend:
                 if len(self.conversation) > 40:
                     self.conversation = self.conversation[-30:]
 
+            if not _requests_available:
+                return self._generate_stub(text, broadcast_fn)
             if source == "online" and self.api_key:
                 return self._generate_online(broadcast_fn, image_b64=image_b64)
             elif source == "local" and (self.local_path or self.local_server_url):
@@ -614,6 +616,20 @@ class LLMBackend:
             telemetry.llm["tokens_per_second"] = round(tps, 1)
             if model_name:
                 telemetry.system["model"] = model_name
+
+            # Guard: if the server responded 200 OK but produced zero tokens,
+            # surface a visible warning instead of silently returning empty string.
+            if not full_text:
+                err = (
+                    f"[LLM Warning] {server_name} returned an empty response. "
+                    "The model may still be loading or the generation was cancelled. "
+                    "Please wait a moment and try again."
+                )
+                broadcast_fn({"type": "chat_token", "token": err})
+                with self._lock:
+                    self.conversation.append({"role": "assistant", "content": err})
+                return err
+
             with self._lock:
                 self.conversation.append({"role": "assistant", "content": full_text})
             return full_text
@@ -1769,9 +1785,12 @@ def _run_proactive_pipeline():
                 full_text = llm_backend._generate_local(prompt, broadcast_json)
             else:
                 full_text = llm_backend._generate_stub(prompt, broadcast_json)
-        except ModuleNotFoundError:
+        except (ModuleNotFoundError, ImportError):
             # requests (or a dependency) not importable in this environment
-            full_text = llm_backend._generate_stub(prompt, broadcast_json)
+            try:
+                full_text = llm_backend._generate_stub(prompt, broadcast_json)
+            except Exception:
+                full_text = ""
         except Exception as e:
             full_text = f"[Proactive error: {e}]"
             broadcast_json({"type": "chat_token", "token": full_text})
