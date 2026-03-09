@@ -847,8 +847,24 @@ class VoiceTab(QScrollArea):
 
         self._kill_port(int(port))
 
-        # Use python -m to launch -- more reliable than .exe on Windows
-        exe = sys.executable
+        # Resolve to the project venv Python when available so the TTS
+        # subprocess always has the correct torch/CUDA packages regardless
+        # of which interpreter launched the GUI.
+        exe = self._resolve_python_exe()
+
+        # Diagnostic: confirm which interpreter and torch will be used.
+        print(f"[TTS-SRV] GUI Python    : {sys.executable}")
+        print(f"[TTS-SRV] Subprocess exe: {exe}")
+        try:
+            import torch as _t
+            print(f"[TTS-SRV] GUI torch     : {_t.__version__}")
+            print(f"[TTS-SRV] GUI CUDA built: {_t.version.cuda}")
+            try:
+                print(f"[TTS-SRV] GUI CUDA avail: {_t.cuda.is_available()}")
+            except Exception as _ce:
+                print(f"[TTS-SRV] GUI CUDA avail: ERROR – {_ce}")
+        except Exception as _te:
+            print(f"[TTS-SRV] GUI torch check failed: {_te}")
 
         self._tts_process = QProcess(self)
         self._tts_process.setProcessChannelMode(QProcess.MergedChannels)
@@ -883,6 +899,7 @@ class VoiceTab(QScrollArea):
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
 
+        print(f"[TTS-SRV] Qwen module   : {qwen_module}")
         print(f"[TTS-SRV] Starting: {exe} {' '.join(args)}")
         self._tts_process.start(exe, args)
 
@@ -895,6 +912,29 @@ class VoiceTab(QScrollArea):
         self._tts_ready_timer = QTimer(self)
         self._tts_ready_timer.timeout.connect(self._poll_tts_ready)
         self._tts_ready_timer.start(5000)
+
+    @staticmethod
+    def _resolve_python_exe() -> str:
+        """Return the best available Python executable for the TTS subprocess.
+
+        Preference order:
+        1. <project_root>/.venv/Scripts/python.exe  (Windows venv)
+        2. <project_root>/.venv/bin/python           (Linux/macOS venv)
+        3. sys.executable                             (whatever launched the GUI)
+
+        Using the project venv explicitly makes the TTS server immune to the
+        interpreter used by the IDE or the OS-level 'python' on PATH.
+        """
+        # voice_tab.py lives at <root>/revia_controller_py/gui/tabs/voice_tab.py
+        project_root = Path(__file__).resolve().parents[3]
+        candidates = [
+            project_root / ".venv" / "Scripts" / "python.exe",  # Windows
+            project_root / ".venv" / "bin" / "python",           # Linux/macOS
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return sys.executable
 
     def _resolve_qwen_module(self):
         """Resolve the Qwen TTS demo module across known package layouts."""
@@ -996,7 +1036,7 @@ class VoiceTab(QScrollArea):
         try:
             import subprocess
             result = subprocess.run(
-                [sys.executable, "-m", qwen_module, "--help"],
+                [self._resolve_python_exe(), "-m", qwen_module, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=8,
