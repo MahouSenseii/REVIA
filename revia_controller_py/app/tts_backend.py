@@ -6,6 +6,7 @@ import shutil
 import struct
 import threading
 import tempfile
+import urllib.request
 from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
@@ -54,14 +55,22 @@ class QwenTTSBackend(QObject):
     synthesis_started = Signal()
     synthesis_finished = Signal(object)  # TTSMetrics
     error_occurred = Signal(str)
+    playback_started = Signal()
+    playback_finished = Signal()
+    playback_interrupted = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._lock = threading.Lock()
         self._engine_name = "qwen3-tts"
         self._qwen_url = ""  # custom Qwen3-TTS server URL (Gradio)
+        self._qwen_clients = {}
         self._pyttsx3_voice_id = None
+        self._pyttsx3_engine = None
         self.last_metrics = TTSMetrics()
+        self._playback_lock = threading.Lock()
+        self._interrupt_requested = False
+        self._playback_active = False
 
     @property
     def engine_name(self):
@@ -72,6 +81,51 @@ class QwenTTSBackend(QObject):
 
     def set_qwen_server(self, url):
         self._qwen_url = url.rstrip("/") if url else ""
+
+    def is_ready(self):
+        if self._engine_name == "pyttsx3":
+            return True
+        url = (self._qwen_url or "http://localhost:8000").rstrip("/")
+        try:
+            with urllib.request.urlopen(url + "/gradio_api/info", timeout=1.5):
+                return True
+        except Exception:
+            return False
+
+    def stop_output(self):
+        with self._playback_lock:
+            self._interrupt_requested = True
+        try:
+            if self._pyttsx3_engine is not None:
+                self._pyttsx3_engine.stop()
+        except Exception:
+            pass
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+    def _begin_playback(self):
+        with self._playback_lock:
+            self._playback_active = True
+            self._interrupt_requested = False
+        self.playback_started.emit()
+
+    def _finish_playback(self):
+        with self._playback_lock:
+            interrupted = self._interrupt_requested
+            self._interrupt_requested = False
+            self._playback_active = False
+        if interrupted:
+            self.playback_interrupted.emit()
+        else:
+            self.playback_finished.emit()
 
     def list_system_voices(self):
         try:
@@ -125,16 +179,24 @@ class QwenTTSBackend(QObject):
     def play_wav(self, wav_path):
         """Play a WAV file through the default audio device."""
         def _do():
+            started = False
             try:
                 import sounddevice as sd
                 import soundfile as sf
                 data, sr = sf.read(str(wav_path))
+                self._begin_playback()
+                started = True
                 sd.play(data, sr)
                 sd.wait()
             except ImportError:
+                self._begin_playback()
+                started = True
                 self._play_wav_winsound(wav_path)
             except Exception as e:
                 self.error_occurred.emit(f"Playback error: {e}")
+            finally:
+                if started:
+                    self._finish_playback()
         threading.Thread(target=_do, daemon=True).start()
 
     def speak_from_profile(self, text, voice_profile, emotion="neutral"):
@@ -176,7 +238,7 @@ class QwenTTSBackend(QObject):
                 voice_profile.language or "Auto",
                 not bool(voice_profile.clone_ref_text),
                 None,
-                voice_profile.model_size or "1.7B",
+                voice_profile.model_size or "0.6B",
             )
         except Exception as e:
             wav_result = None
@@ -189,16 +251,24 @@ class QwenTTSBackend(QObject):
 
     def _play_wav_blocking(self, wav_path):
         """Play WAV synchronously (called from background thread)."""
+        started = False
         try:
             import sounddevice as sd
             import soundfile as sf
             data, sr = sf.read(str(wav_path))
+            self._begin_playback()
+            started = True
             sd.play(data, sr)
             sd.wait()
         except ImportError:
+            self._begin_playback()
+            started = True
             self._play_wav_winsound(wav_path)
         except Exception as e:
             self.error_occurred.emit(f"Playback error: {e}")
+        finally:
+            if started:
+                self._finish_playback()
 
     # ── Qwen3-TTS gradio_client calls ──
 
@@ -213,7 +283,12 @@ class QwenTTSBackend(QObject):
         from gradio_client import Client
         url = self._qwen_url or QWEN_SPACES.get(space_key, QWEN_SPACES["custom"])
         try:
-            return Client(url)
+            cached = self._qwen_clients.get(url)
+            if cached is not None:
+                return cached
+            client = Client(url)
+            self._qwen_clients[url] = client
+            return client
         except Exception as e:
             raise ConnectionError(f"Cannot connect to Qwen3-TTS at {url}: {e}")
 
@@ -384,18 +459,23 @@ class QwenTTSBackend(QObject):
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
+            started = False
             try:
                 import pyttsx3
-                engine = pyttsx3.init()
+                if self._pyttsx3_engine is None:
+                    self._pyttsx3_engine = pyttsx3.init()
+                engine = self._pyttsx3_engine
                 voices = engine.getProperty("voices")
                 if self._pyttsx3_voice_id:
                     engine.setProperty("voice", self._pyttsx3_voice_id)
                 elif voices:
                     engine.setProperty("voice", voices[0].id)
-                engine.setProperty("rate", int(180 * speed))
+                # Favor lower perceived latency for conversational turns.
+                engine.setProperty("rate", int(205 * speed))
+                self._begin_playback()
+                started = True
                 engine.say(text)
                 engine.runAndWait()
-                engine.stop()
                 elapsed = time.perf_counter() - t0
                 m = TTSMetrics()
                 m.synthesis_time = round(elapsed, 3)
@@ -404,7 +484,11 @@ class QwenTTSBackend(QObject):
                 self.last_metrics = m
                 self.synthesis_finished.emit(m)
             except Exception as e:
+                self._pyttsx3_engine = None
                 self.error_occurred.emit(str(e))
+            finally:
+                if started:
+                    self._finish_playback()
 
     def _play_wav_winsound(self, wav_path):
         try:

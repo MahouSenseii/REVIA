@@ -15,6 +15,8 @@ PyAudio>=0.2.14
 pyttsx3>=2.90
 sounddevice>=0.4.6
 numpy>=1.24.0
+ultralytics>=8.2.0  # YOLOv8 / YOLO-World live camera detection
+depthai>=2.24.0     # Luxonis OAK camera support
 
 # === Platform Integrations ===
 discord.py>=2.3.0      # Discord bot — pip install "discord.py"
@@ -27,3 +29,4 @@ duckduckgo-search>=6.0.0  # Free, no API key — pip install duckduckgo-search
 psutil>=5.9.0
 gradio_client>=0.14.0
 soundfile>=0.12.0
+ultralytics>=8.4.21

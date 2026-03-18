@@ -11,6 +11,11 @@ class AudioService(QObject):
     tts_started = Signal()
     tts_finished = Signal()
     status_changed = Signal(str)
+    stt_listening_started = Signal()
+    stt_listening_stopped = Signal()
+    stt_processing_started = Signal()
+    stt_processing_finished = Signal(bool, str)
+    stt_error = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -22,6 +27,7 @@ class AudioService(QObject):
         self._stop_event = threading.Event()
         self._input_device_index = None
         self._output_device_name = None
+        self._stt_phase = "idle"
 
         # Volume monitoring
         self._vol_timer = QTimer(self)
@@ -43,10 +49,12 @@ class AudioService(QObject):
         self._listening = True
         self._always_listening = always
         self._stop_event.clear()
+        self._stt_phase = "listening"
         self._stt_thread = threading.Thread(
             target=self._stt_loop, daemon=True
         )
         self._stt_thread.start()
+        self.stt_listening_started.emit()
         self.status_changed.emit("Listening...")
         self._start_volume_monitor()
 
@@ -55,15 +63,29 @@ class AudioService(QObject):
         self._always_listening = False
         self._stop_event.set()
         self._stop_volume_monitor()
+        if self._stt_phase == "listening":
+            self.stt_listening_stopped.emit()
+        elif self._stt_phase == "processing":
+            self.stt_processing_finished.emit(False, "Cancelled")
+        self._stt_phase = "idle"
         self.status_changed.emit("Stopped")
 
     def is_listening(self):
         return self._listening
 
+    def is_stt_available(self):
+        try:
+            import speech_recognition  # noqa: F401
+            return True
+        except Exception:
+            return False
+
     def _stt_loop(self):
         try:
             import speech_recognition as sr
         except ImportError:
+            self._stt_phase = "error"
+            self.stt_error.emit("speech_recognition not installed")
             self.status_changed.emit("speech_recognition not installed")
             self._listening = False
             return
@@ -80,6 +102,8 @@ class AudioService(QObject):
         try:
             mic = sr.Microphone(**mic_kwargs)
         except Exception as e:
+            self._stt_phase = "error"
+            self.stt_error.emit(f"Mic error: {e}")
             self.status_changed.emit(f"Mic error: {e}")
             self._listening = False
             return
@@ -89,6 +113,9 @@ class AudioService(QObject):
             self.status_changed.emit("Listening... speak now")
 
             while self._listening and not self._stop_event.is_set():
+                if self._stt_phase != "listening":
+                    self._stt_phase = "listening"
+                    self.stt_listening_started.emit()
                 try:
                     audio = recognizer.listen(
                         source, timeout=5, phrase_time_limit=15
@@ -103,20 +130,34 @@ class AudioService(QObject):
 
                 # Transcribe in background
                 try:
+                    if self._stt_phase == "listening":
+                        self.stt_listening_stopped.emit()
+                    self._stt_phase = "processing"
+                    self.stt_processing_started.emit()
                     text = recognizer.recognize_google(audio)
                     if text.strip():
                         self.speech_recognized.emit(text.strip())
+                        self.stt_processing_finished.emit(True, "")
                         if not self._always_listening:
                             self._listening = False
+                            self._stt_phase = "idle"
                             self.status_changed.emit("Got speech")
                             break
+                        self._stt_phase = "listening"
                 except sr.UnknownValueError:
-                    pass
+                    self.stt_processing_finished.emit(False, "")
+                    self._stt_phase = "listening" if self._listening else "idle"
                 except sr.RequestError as e:
+                    self._stt_phase = "error"
+                    self.stt_error.emit(f"STT API error: {e}")
+                    self.stt_processing_finished.emit(False, f"STT API error: {e}")
                     self.status_changed.emit(f"STT API error: {e}")
 
         if not self._always_listening:
             self._listening = False
+        if self._stt_phase == "listening":
+            self.stt_listening_stopped.emit()
+        self._stt_phase = "idle"
 
     # ---- TTS ----
 

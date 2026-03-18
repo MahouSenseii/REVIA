@@ -81,6 +81,12 @@ class VoiceManager(QObject):
     def play_wav(self, wav_path):
         self.backend.play_wav(wav_path)
 
+    def is_output_ready(self):
+        return self.backend.is_ready()
+
+    def stop_output(self):
+        self.backend.stop_output()
+
     # ── Profile management ──
 
     def save_voice(self, profile):

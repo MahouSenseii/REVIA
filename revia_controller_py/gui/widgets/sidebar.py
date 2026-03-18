@@ -160,10 +160,7 @@ class SidebarWidget(QFrame):
     def _on_connection(self, connected):
         if connected:
             self.status_dot.setStyleSheet("color: #00dc50; font-size: 10px;")
-            self.status_label.setText("Online")
-            self.mod_stt.set_status("active")
-            self.mod_tts.set_status("active")
-            self.mod_memory.set_status("active")
+            self.status_label.setText("Connecting")
             self.mod_vision.set_status("idle")
         else:
             self.status_dot.setStyleSheet("color: #dc3250; font-size: 10px;")
@@ -174,11 +171,34 @@ class SidebarWidget(QFrame):
                 m.set_status("error")
 
     def _on_telemetry(self, data):
-        state = data.get("state", "")
-        if "listen" in state.lower():
+        state = str(data.get("state", "")).lower()
+        llm = data.get("llm_connection", {}) or {}
+        readiness = data.get("conversation_readiness", {}) or {}
+        checks = readiness.get("checks", {}) or {}
+
+        if readiness.get("ready", False):
+            self.status_dot.setStyleSheet("color: #00dc50; font-size: 10px;")
+            self.status_label.setText(data.get("state", "Ready"))
+        elif llm.get("state") == "Connecting" or state in ("booting", "initializing", "thinking", "cooldown"):
+            self.status_dot.setStyleSheet("color: #ccaa00; font-size: 10px;")
+            self.status_label.setText(data.get("state", "Connecting"))
+        elif llm.get("state") == "Error" or state == "error":
+            self.status_dot.setStyleSheet("color: #dc3250; font-size: 10px;")
+            self.status_label.setText("Error")
+
+        if "listen" in state:
             self.mod_stt.set_status("active")
             self.activity.value = 0.7
-        elif "generat" in state.lower():
+        elif "speak" in state or "think" in state:
             self.activity.value = 0.9
         else:
             self.activity.value = 0.3
+
+        self.mod_stt.set_status(
+            "active" if (checks.get("stt", {}) or {}).get("ready", False) else "error"
+        )
+        self.mod_tts.set_status(
+            "active" if (checks.get("tts", {}) or {}).get("ready", False) else "error"
+        )
+        self.mod_memory.set_status("active")
+        self.mod_vision.set_status("active" if data.get("architecture", {}).get("modules", {}).get("vision", {}).get("online", False) else "idle")

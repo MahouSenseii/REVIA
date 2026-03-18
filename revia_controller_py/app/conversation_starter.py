@@ -1,44 +1,28 @@
-"""ConversationStarter — lets Revia initiate conversations proactively.
+"""ConversationStarter manages deliberate autonomous chat triggers."""
 
-Behaviour
----------
-* On startup (after a short delay) Revia sends a greeting.
-* A repeating timer fires every `interval_ms` milliseconds of *user inactivity*.
-  If the user has been active recently the tick is skipped until the next one.
-* The host panel can call `record_user_activity()` on every user send so the
-  idle window resets properly.
-* The starter can be enabled/disabled at runtime.
-"""
 import time
 
 from PySide6.QtCore import QObject, QTimer
 
 
 class ConversationStarter(QObject):
-    def __init__(self, client, event_bus, interval_ms=300_000, parent=None):
-        """
-        Parameters
-        ----------
-        client       : ControllerClient — used to call send_proactive()
-        event_bus    : EventBus
-        interval_ms  : milliseconds of inactivity before triggering (default 5 min)
-        """
+    def __init__(self, client, event_bus, behavior_controller, interval_ms=300_000, parent=None):
         super().__init__(parent)
         self._client = client
         self._event_bus = event_bus
+        self._behavior = behavior_controller
         self._interval_ms = interval_ms
         self._enabled = False
         self._last_activity = time.monotonic()
-        self._greeted = False  # Prevent repeated startup greetings on reconnect
+        self._startup_delay_ms = 4000
+        self._startup_scheduled = False
+        self._startup_sent = False
 
-        # Repeating inactivity timer
         self._timer = QTimer(self)
         self._timer.setInterval(interval_ms)
         self._timer.timeout.connect(self._on_tick)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._event_bus.telemetry_updated.connect(self._on_telemetry)
 
     def enable(self, interval_ms=None):
         if interval_ms is not None:
@@ -56,31 +40,61 @@ class ConversationStarter(QObject):
         return self._enabled
 
     def record_user_activity(self):
-        """Call this whenever the user sends a message to reset the idle clock."""
         self._last_activity = time.monotonic()
 
     def greet_on_startup(self, delay_ms=4_000):
-        """Send an opening greeting *delay_ms* milliseconds after startup.
-        Only fires once per session regardless of reconnects.
-        """
-        if self._greeted:
-            return
-        self._greeted = True
-        QTimer.singleShot(delay_ms, self._trigger)
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+        self._startup_delay_ms = int(delay_ms)
+        self._maybe_schedule_startup()
 
     def _on_tick(self):
-        idle_s = time.monotonic() - self._last_activity
-        # Only trigger if the user has been idle for at least half the interval
-        if idle_s >= (self._interval_ms / 1000) * 0.5:
-            self._trigger()
-
-    def _trigger(self):
         if not self._enabled:
             return
-        if not self._client.connected:
+        idle_s = time.monotonic() - self._last_activity
+        if idle_s >= (self._interval_ms / 1000.0):
+            self._trigger(
+                source="IdleTimer",
+                reason="idle autonomous conversation",
+                force=False,
+            )
+
+    def _on_telemetry(self, data):
+        if not isinstance(data, dict):
             return
-        self._client.send_proactive()
+        self._maybe_schedule_startup(data)
+
+    def _maybe_schedule_startup(self, data=None):
+        if not self._enabled or self._startup_sent or self._startup_scheduled:
+            return
+        snapshot = data if isinstance(data, dict) else self._client.get_status_snapshot()
+        readiness = (snapshot.get("conversation_readiness", {}) or {})
+        if not readiness.get("can_auto_initiate", False):
+            return
+        self._startup_scheduled = True
+        self._event_bus.log_entry.emit("[Revia] Startup autonomous line armed.")
+        QTimer.singleShot(
+            self._startup_delay_ms,
+            lambda: self._trigger(
+                source="Startup",
+                reason="startup warmup complete",
+                force=False,
+                startup=True,
+            ),
+        )
+
+    def _trigger(self, source, reason, force=False, startup=False):
+        if not self._enabled:
+            return
+        decision = self._behavior.should_initiate_conversation(
+            source=source,
+            reason=reason,
+            force=force,
+            require_speech_output=True,
+        )
+        if not decision.allowed:
+            if startup:
+                self._startup_scheduled = False
+            return
+        self._last_activity = time.monotonic()
+        if startup:
+            self._startup_sent = True
+        self._client.send_proactive(force=force, source=source, reason=reason)

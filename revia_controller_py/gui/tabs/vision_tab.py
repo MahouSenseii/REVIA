@@ -67,7 +67,7 @@ class VisionTab(QScrollArea):
         wireless_row.addWidget(wireless_label)
         self.wireless_url = QLineEdit()
         self.wireless_url.setPlaceholderText(
-            "rtsp://user:pass@192.168.1.100:554/stream"
+            "rtsp://user:pass@192.168.1.100:554/stream (leave blank for USB/Luxonis)"
         )
         wireless_row.addWidget(self.wireless_url, stretch=1)
         cg.addLayout(wireless_row)
@@ -126,7 +126,7 @@ class VisionTab(QScrollArea):
         og.addLayout(obj_form)
 
         self.obj_realtime = QCheckBox("Real-time detection overlay")
-        self.obj_realtime.setChecked(False)
+        self.obj_realtime.setChecked(True)
         og.addWidget(self.obj_realtime)
 
         self.obj_results = QTextEdit()
@@ -250,12 +250,23 @@ class VisionTab(QScrollArea):
             self.camera_service.camera_list_updated.connect(
                 self._on_cameras_detected
             )
+            self.camera_service.detection_updated.connect(
+                self._on_detection_updated
+            )
+
+        self.obj_engine.currentTextChanged.connect(self._sync_object_detector)
+        self.obj_confidence.valueChanged.connect(self._sync_object_detector)
+        self.obj_classes.textChanged.connect(self._sync_object_detector)
+        self.obj_realtime.toggled.connect(self._sync_object_detector)
+        self._sync_object_detector()
 
     def set_camera_service(self, svc):
         self.camera_service = svc
         svc.frame_ready.connect(self._on_frame)
         svc.status_changed.connect(self._on_cam_status)
         svc.camera_list_updated.connect(self._on_cameras_detected)
+        svc.detection_updated.connect(self._on_detection_updated)
+        self._sync_object_detector()
 
     # --- Camera ---
 
@@ -278,10 +289,20 @@ class VisionTab(QScrollArea):
     def _on_cameras_detected(self, cameras):
         self.camera_combo.clear()
         for cam in cameras:
-            self.camera_combo.addItem(cam["name"], userData=cam["id"])
+            if isinstance(cam, dict):
+                label = cam.get("name", "Camera")
+                self.camera_combo.addItem(label, userData=cam)
+            else:
+                self.camera_combo.addItem(str(cam), userData=cam)
         if cameras:
+            luxonis_count = sum(
+                1 for cam in cameras
+                if isinstance(cam, dict)
+                and str(cam.get("type", "")).lower() == "luxonis"
+            )
+            suffix = f" ({luxonis_count} Luxonis)" if luxonis_count else ""
             self.cam_status.setText(
-                f"Status: {len(cameras)} camera(s) detected"
+                f"Status: {len(cameras)} camera(s) detected{suffix}"
             )
 
     def _connect_camera(self):
@@ -294,9 +315,22 @@ class VisionTab(QScrollArea):
         if wireless:
             source = wireless
         elif self.camera_combo.count() > 0:
-            source = self.camera_combo.currentData()
-            if source is None:
+            selected = self.camera_combo.currentData()
+            if isinstance(selected, dict):
+                source = selected.get("source", selected.get("id", 0))
+                if isinstance(source, dict):
+                    source = dict(source)
+                    source.setdefault("name", selected.get("name", ""))
+                elif str(selected.get("type", "")).lower() == "luxonis":
+                    source = {
+                        "type": "luxonis",
+                        "mxid": selected.get("mxid", ""),
+                        "name": selected.get("name", ""),
+                    }
+            elif selected is None:
                 source = 0
+            else:
+                source = selected
         else:
             source = 0
         res = self.resolution.currentText()
@@ -305,14 +339,21 @@ class VisionTab(QScrollArea):
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
             self.snapshot_btn.setEnabled(True)
+            self._sync_object_detector()
         else:
             QMessageBox.warning(
                 self, "Camera",
-                f"Failed to open camera source: {source}",
+                f"Failed to open camera source: {self._format_camera_source(source)}",
             )
 
     def _disconnect_camera(self):
         if self.camera_service:
+            self.camera_service.configure_object_detection(
+                engine=self.obj_engine.currentText(),
+                enabled=False,
+                confidence=self.obj_confidence.value() / 100.0,
+                classes=self.obj_classes.text(),
+            )
             self.camera_service.disconnect_camera()
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
@@ -350,26 +391,106 @@ class VisionTab(QScrollArea):
     # --- Object detection (stub) ---
 
     def _detect_objects(self):
-        engine = self.obj_engine.currentText()
-        if "None" in engine:
-            self.obj_results.setPlainText("No engine selected.")
-            return
-        self.obj_results.setPlainText(f"Running {engine}...")
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(500, self._do_detect_objects)
-
-    def _do_detect_objects(self):
-        engine = self.obj_engine.currentText()
-        if self.camera_service and self.camera_service.is_active():
-            self.obj_results.setPlainText(
-                f"[{engine}] Detected objects:\n"
-                f"  - person (92%)\n"
-                f"  - laptop (87%)\n"
-                f"  - chair (74%)\n"
-                f"  - cup (68%)\n"
-                f"\nNote: Connect a real {engine} model for actual detection."
-            )
-        else:
+        if not self.camera_service or not self.camera_service.is_active():
             self.obj_results.setPlainText(
                 "Camera not connected. Connect a camera first."
             )
+            return
+        if "None" in self.obj_engine.currentText():
+            self.obj_results.setPlainText("No engine selected.")
+            return
+        self._sync_object_detector()
+        self.obj_results.setPlainText(
+            f"Running {self.obj_engine.currentText()} on current frame..."
+        )
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(20, self._do_detect_objects)
+
+    def _do_detect_objects(self):
+        if not self.camera_service or not self.camera_service.is_active():
+            self.obj_results.setPlainText(
+                "Camera not connected. Connect a camera first."
+            )
+            return
+        detections, err = self.camera_service.detect_objects_now()
+        if err:
+            self.obj_results.setPlainText(err)
+            return
+        self.obj_results.setPlainText(
+            self._format_detection_text(
+                self.obj_engine.currentText(),
+                detections,
+                realtime=self.obj_realtime.isChecked(),
+            )
+        )
+
+    def _sync_object_detector(self, *_args):
+        if not self.camera_service:
+            return
+        engine = self.obj_engine.currentText()
+        enabled = self.obj_realtime.isChecked() and ("None" not in engine)
+        self.camera_service.configure_object_detection(
+            engine=engine,
+            enabled=enabled,
+            confidence=self.obj_confidence.value() / 100.0,
+            classes=self.obj_classes.text(),
+            frame_stride=2,
+        )
+        if enabled:
+            self.obj_results.setPlainText(
+                f"Live {engine} overlay enabled. "
+                "Bounding boxes will be drawn on the camera feed."
+            )
+        elif "None" in engine:
+            self.obj_results.setPlainText("Object detection disabled (engine: None).")
+        else:
+            self.obj_results.setPlainText(
+                f"{engine} loaded for manual 'Detect Now'. "
+                "Enable real-time overlay to run continuously."
+            )
+
+    def _on_detection_updated(self, payload):
+        if not isinstance(payload, dict):
+            return
+        engine = payload.get("engine", self.obj_engine.currentText())
+        detections = payload.get("detections", []) or []
+        error = str(payload.get("error", "")).strip()
+        latency = float(payload.get("latency_ms", 0.0) or 0.0)
+        realtime = bool(payload.get("realtime", False))
+        if error:
+            self.obj_results.setPlainText(error)
+            return
+        self.obj_results.setPlainText(
+            self._format_detection_text(
+                engine, detections, latency_ms=latency, realtime=realtime
+            )
+        )
+
+    @staticmethod
+    def _format_detection_text(engine, detections, latency_ms=0.0, realtime=False):
+        prefix = "Live" if realtime else "Manual"
+        lines = [f"[{prefix} {engine}] {len(detections)} object(s)"]
+        if latency_ms > 0:
+            lines[0] += f" | {latency_ms:.1f} ms"
+        if not detections:
+            lines.append("No objects detected in the current frame.")
+            return "\n".join(lines)
+        for d in detections[:8]:
+            label = d.get("label", "object")
+            conf = float(d.get("confidence", 0.0))
+            box = d.get("box", [0, 0, 0, 0])
+            lines.append(
+                f" - {label} ({conf * 100:.0f}%) box={box}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_camera_source(source):
+        if isinstance(source, dict):
+            name = str(source.get("name", "")).strip()
+            if name:
+                return name
+            src_type = str(source.get("type", "")).strip()
+            if src_type:
+                return src_type
+        return str(source)

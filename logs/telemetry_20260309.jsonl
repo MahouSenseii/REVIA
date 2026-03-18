@@ -1,0 +1,10 @@
+{"stage": "emotion_analysis", "device": "CPU", "start_ms": 729072.2671999829, "end_ms": 729074.6594000375, "duration_ms": 2.392200054600835}
+{"stage": "router_classify", "device": "CPU", "start_ms": 729074.7452999931, "end_ms": 729076.3546000235, "duration_ms": 1.6093000303953886}
+{"stage": "llm_decode", "device": "CUDA", "start_ms": 729076.4131000033, "end_ms": 753334.2952999519, "duration_ms": 24257.882199948654}
+{"stage": "output_deliver", "device": "CPU", "start_ms": 753334.3359000282, "end_ms": 753334.5155999996, "duration_ms": 0.17969997134059668}
+{"stage": "emotion_analysis", "device": "CPU", "start_ms": 2873080.713400035, "end_ms": 2873084.0449000243, "duration_ms": 3.331499989144504}
+{"stage": "router_classify", "device": "CPU", "start_ms": 2873084.085999988, "end_ms": 2873085.335199954, "duration_ms": 1.249199965968728}
+{"stage": "llm_decode", "device": "CUDA", "start_ms": 2873085.400299984, "end_ms": 2909755.2255999763, "duration_ms": 36669.825299992226}
+{"stage": "output_deliver", "device": "CPU", "start_ms": 2909755.2710999735, "end_ms": 2909755.3967999993, "duration_ms": 0.125700025819242}
+{"stage": "emotion_analysis", "device": "CPU", "start_ms": 3035204.772099969, "end_ms": 3035207.570699975, "duration_ms": 2.798600005917251}
+{"stage": "router_classify", "device": "CPU", "start_ms": 3035207.6050000032, "end_ms": 3035209.4701000024, "duration_ms": 1.8650999991223216}

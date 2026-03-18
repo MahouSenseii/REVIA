@@ -1,11 +1,14 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from app.camera_service import CameraService
 from app.audio_service import AudioService
+from app.assistant_status_manager import AssistantStatusManager
+from app.conversation_policy import ConversationBehaviorController
 from app.conversation_starter import ConversationStarter
+from app.runtime_state_sync import RuntimeStateSync
 from gui.widgets.sidebar import SidebarWidget
 from gui.widgets.topbar import TopBar
 from gui.widgets.chat_panel import ChatPanel
@@ -31,13 +34,17 @@ class MainWindow(QMainWindow):
         self.theme_mgr = theme_mgr
         self.camera_service = CameraService(self)
         self.audio_service = AudioService(self)
-        self.conversation_starter = ConversationStarter(
-            client, event_bus, interval_ms=120_000, parent=self
-        )
+        self.behavior_controller = None
+        self.conversation_starter = None
+        self.runtime_state_sync = None
+        self.assistant_status_manager = None
         self.setWindowTitle("REVIA \u2014 Neural Assistant Controller")
         self.setMinimumSize(1400, 900)
         self._build_ui()
         self._connect_signals()
+        self.conversation_starter.enable()
+        self.conversation_starter.greet_on_startup(delay_ms=6_000)
+        QTimer.singleShot(600, self._auto_start_services_on_launch)
 
     def _build_ui(self):
         central = QWidget()
@@ -81,12 +88,15 @@ class MainWindow(QMainWindow):
         self.tabs.setMinimumWidth(360)
         self.tabs.setMaximumWidth(440)
 
+        self.profile_tab = ProfileTab(self.event_bus, self.client)
         self.tabs.addTab(
-            ProfileTab(self.event_bus, self.client), "Profile"
+            self.profile_tab, "Profile"
         )
-        self.tabs.addTab(ModelTab(self.event_bus, self.client), "Model")
+        self.model_tab = ModelTab(self.event_bus, self.client)
+        self.tabs.addTab(self.model_tab, "Model")
+        self.memory_tab = MemoryTab(self.event_bus, self.client)
         self.tabs.addTab(
-            MemoryTab(self.event_bus, self.client), "Memory"
+            self.memory_tab, "Memory"
         )
         self.voice_tab = VoiceTab(
             self.event_bus, self.client, self.audio_service
@@ -95,8 +105,24 @@ class MainWindow(QMainWindow):
 
         # Give chat panel access to the voice manager for TTS
         self.chat_panel.set_voice_manager(self.voice_tab.voice_mgr)
-        # Give chat panel access to the conversation starter for activity tracking
+        self.behavior_controller = ConversationBehaviorController(
+            status_provider=self.client.get_status_snapshot,
+            log_fn=self.event_bus.log_entry.emit,
+            is_user_speaking=self.audio_service.is_listening,
+            is_assistant_speaking=self.chat_panel.is_assistant_speaking,
+            is_tts_enabled=self.chat_panel.is_tts_enabled,
+            is_tts_ready=self.voice_tab.voice_mgr.is_output_ready,
+            is_stt_ready=self.audio_service.is_stt_available,
+        )
+        self.conversation_starter = ConversationStarter(
+            self.client,
+            self.event_bus,
+            self.behavior_controller,
+            interval_ms=120_000,
+            parent=self,
+        )
         self.chat_panel.set_conversation_starter(self.conversation_starter)
+        self.chat_panel.set_behavior_controller(self.behavior_controller)
 
         self.vision_tab = VisionTab(
             self.event_bus, self.client, self.camera_service
@@ -106,8 +132,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(
             EmotionsTab(self.event_bus, self.client), "Emotions"
         )
+        self.filters_tab = FiltersTab(self.event_bus, self.client)
         self.tabs.addTab(
-            FiltersTab(self.event_bus, self.client), "Filters"
+            self.filters_tab, "Filters"
         )
         self.tabs.addTab(LogsTab(self.event_bus), "Logs")
         self.tabs.addTab(
@@ -118,6 +145,35 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.system_tab, "System")
 
+        self.assistant_status_manager = AssistantStatusManager(
+            event_bus=self.event_bus,
+            model_tab=self.model_tab,
+            voice_tab=self.voice_tab,
+            vision_tab=self.vision_tab,
+            filters_tab=self.filters_tab,
+            memory_tab=self.memory_tab,
+            system_tab=self.system_tab,
+            profile_tab=self.profile_tab,
+            chat_panel=self.chat_panel,
+            audio_service=self.audio_service,
+            parent=self,
+        )
+
+        self.runtime_state_sync = RuntimeStateSync(
+            client=self.client,
+            event_bus=self.event_bus,
+            model_tab=self.model_tab,
+            voice_tab=self.voice_tab,
+            filters_tab=self.filters_tab,
+            memory_tab=self.memory_tab,
+            system_tab=self.system_tab,
+            profile_tab=self.profile_tab,
+            chat_panel=self.chat_panel,
+            audio_service=self.audio_service,
+            assistant_status_manager=self.assistant_status_manager,
+            parent=self,
+        )
+
         main_layout.addWidget(self.tabs)
 
     def _connect_signals(self):
@@ -125,26 +181,33 @@ class MainWindow(QMainWindow):
         self.camera_service.frame_ready.connect(
             self.inference_panel.on_camera_frame
         )
+        if self.runtime_state_sync:
+            self.event_bus.connection_changed.connect(
+                lambda _connected: self.runtime_state_sync.schedule_sync()
+            )
 
     def _on_connection(self, connected):
-        self.topbar.set_health("Online" if connected else "Offline")
-        if connected:
-            if not self.conversation_starter.is_enabled:
-                self.conversation_starter.enable()
-                self.conversation_starter.greet_on_startup(delay_ms=4_000)
-        else:
-            self.conversation_starter.disable()
+        self.topbar.set_health("Connecting" if connected else "Offline")
+
+    def _auto_start_services_on_launch(self):
+        if hasattr(self.system_tab, "auto_start_on_launch"):
+            self.system_tab.auto_start_on_launch()
+        if hasattr(self.model_tab, "auto_start_on_launch"):
+            QTimer.singleShot(1200, self.model_tab.auto_start_on_launch)
+        if self.runtime_state_sync:
+            QTimer.singleShot(1400, self.runtime_state_sync.schedule_sync)
 
     def closeEvent(self, event):
         self.camera_service.disconnect_camera()
-        model_tab = self.tabs.widget(1)
-        if (getattr(model_tab, '_llm_process', None)
-                and model_tab._llm_process.state() != 0):
-            model_tab._stop_llm_server()
+        if (getattr(self.model_tab, '_llm_process', None)
+                and self.model_tab._llm_process.state() != 0):
+            self.model_tab._stop_llm_server()
         if (self.system_tab._core_process
                 and self.system_tab._core_process.state() != 0):
             self.system_tab._stop_core_server()
         if (self.voice_tab._tts_process
                 and self.voice_tab._tts_process.state() != 0):
             self.voice_tab._stop_tts_server()
+        if hasattr(self.client, "shutdown"):
+            self.client.shutdown()
         super().closeEvent(event)

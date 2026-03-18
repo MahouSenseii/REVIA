@@ -16,34 +16,39 @@ try:
 except ImportError:
     _CHARTS_AVAILABLE = False
 
-# Emotion → hex colour
+
 _EMOTION_COLORS = {
-    "Happy":      "#4ade80",
-    "Excited":    "#34d399",
-    "Curious":    "#60a5fa",
-    "Neutral":    "#94a3b8",
+    "Happy": "#4ade80",
+    "Excited": "#34d399",
+    "Curious": "#60a5fa",
+    "Neutral": "#94a3b8",
     "Frustrated": "#f59e0b",
-    "Fear":       "#a78bfa",
-    "Sad":        "#818cf8",
-    "Angry":      "#f87171",
+    "Angry": "#f87171",
+    "Sad": "#818cf8",
+    "Fear": "#a78bfa",
+    "Lonely": "#5b8def",
+    "Concerned": "#fca5a5",
+    "Confident": "#2dd4bf",
 }
 
 _INJECT_HINTS = {
-    "Happy":      "Match their energy with warmth and enthusiasm.",
-    "Angry":      "Stay calm and understanding. Acknowledge their frustration without being defensive.",
-    "Sad":        "Be gentle, empathetic, and supportive. Offer comfort.",
-    "Curious":    "Be thorough, engaging, and educational in your explanation.",
-    "Frustrated": "Be patient and clear. Acknowledge their concern and offer concrete help.",
-    "Fear":       "Be reassuring, calm, and supportive.",
-    "Excited":    "Share their enthusiasm and be energetic in your response.",
+    "Happy": "Match their energy with warmth and enthusiasm.",
+    "Angry": "Stay calm and understanding. Acknowledge frustration without defensiveness.",
+    "Sad": "Be gentle, empathetic, and supportive.",
+    "Curious": "Be thorough, engaging, and educational.",
+    "Frustrated": "Be patient and concrete. Offer clear next steps.",
+    "Fear": "Be reassuring, calm, and supportive.",
+    "Excited": "Share enthusiasm and be energetic.",
+    "Lonely": "Use warm engagement and inclusive language so they feel heard.",
+    "Concerned": "Use clear, low-ambiguity guidance and reassurance.",
+    "Confident": "Match directness with concise, action-oriented responses.",
 }
 
 _CHART_MAX_POINTS = 50
 
 
 class EmotionsTab(QScrollArea):
-    """Live emotion monitor — current state, VAD values, line chart history,
-    and the emotion text injected into the AI's system prompt."""
+    """Live monitor for probabilistic emotion inference."""
 
     def __init__(self, event_bus, client, parent=None):
         super().__init__(parent)
@@ -51,7 +56,8 @@ class EmotionsTab(QScrollArea):
         self.client = client
         self.setWidgetResizable(True)
 
-        self._chart_tick = 0  # increments on each data point
+        self._chart_tick = 0
+        self._prob_rows = []
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -63,10 +69,9 @@ class EmotionsTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        # ── Current emotional state ─────────────────────────────────────
-        emo_group = QGroupBox("Current Emotional State (User)")
-        emo_group.setObjectName("settingsGroup")
-        eg = QVBoxLayout(emo_group)
+        state_group = QGroupBox("Current Emotional State (User)")
+        state_group.setObjectName("settingsGroup")
+        sg = QVBoxLayout(state_group)
 
         label_row = QHBoxLayout()
         self.emo_label = QLabel("Neutral")
@@ -74,18 +79,17 @@ class EmotionsTab(QScrollArea):
         self.emo_label.setAlignment(Qt.AlignCenter)
         label_row.addWidget(self.emo_label, stretch=1)
 
-        self.emo_confidence = QLabel("conf: —")
+        self.emo_confidence = QLabel("conf: --")
         self.emo_confidence.setFont(QFont("Consolas", 9))
         self.emo_confidence.setObjectName("metricLabel")
         label_row.addWidget(self.emo_confidence)
-        eg.addLayout(label_row)
+        sg.addLayout(label_row)
 
-        # VAD progress bars — range -100…+100 (scaled from -1…+1)
-        def _make_bar(name, color):
+        def _make_vad_bar(name, color):
             row = QHBoxLayout()
-            lbl = QLabel(name)
-            lbl.setFixedWidth(80)
-            lbl.setFont(QFont("Segoe UI", 9))
+            name_lbl = QLabel(name)
+            name_lbl.setFixedWidth(82)
+            name_lbl.setFont(QFont("Segoe UI", 9))
             bar = QProgressBar()
             bar.setRange(-100, 100)
             bar.setValue(0)
@@ -94,31 +98,61 @@ class EmotionsTab(QScrollArea):
             bar.setStyleSheet(
                 f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
             )
-            row.addWidget(lbl)
+            row.addWidget(name_lbl)
             row.addWidget(bar)
             return row, bar
 
-        vrow, self.valence_bar   = _make_bar("Valence",   "#4ade80")
-        arow, self.arousal_bar   = _make_bar("Arousal",   "#f59e0b")
-        drow, self.dominance_bar = _make_bar("Dominance", "#818cf8")
-        eg.addLayout(vrow)
-        eg.addLayout(arow)
-        eg.addLayout(drow)
+        vrow, self.valence_bar = _make_vad_bar("Valence", "#4ade80")
+        arow, self.arousal_bar = _make_vad_bar("Arousal", "#f59e0b")
+        drow, self.dominance_bar = _make_vad_bar("Dominance", "#818cf8")
+        sg.addLayout(vrow)
+        sg.addLayout(arow)
+        sg.addLayout(drow)
+        layout.addWidget(state_group)
 
-        layout.addWidget(emo_group)
+        probs_group = QGroupBox("Neural Inference (Top Probabilities)")
+        probs_group.setObjectName("settingsGroup")
+        pg = QVBoxLayout(probs_group)
 
-        # ── Emotion line chart ──────────────────────────────────────────
+        for _ in range(5):
+            row = QHBoxLayout()
+            lbl = QLabel("-")
+            lbl.setMinimumWidth(80)
+            lbl.setFont(QFont("Consolas", 9))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("%v%%")
+            row.addWidget(lbl)
+            row.addWidget(bar)
+            pg.addLayout(row)
+            self._prob_rows.append((lbl, bar))
+
+        self.signals_view = QTextEdit()
+        self.signals_view.setReadOnly(True)
+        self.signals_view.setMaximumHeight(80)
+        self.signals_view.setFont(QFont("Consolas", 8))
+        self.signals_view.setPlaceholderText("Signal fusion values will appear here.")
+        pg.addWidget(self.signals_view)
+
+        self.temporal_view = QTextEdit()
+        self.temporal_view.setReadOnly(True)
+        self.temporal_view.setMaximumHeight(72)
+        self.temporal_view.setFont(QFont("Consolas", 8))
+        self.temporal_view.setPlaceholderText("Temporal/behavioral context will appear here.")
+        pg.addWidget(self.temporal_view)
+
+        layout.addWidget(probs_group)
+
         chart_group = QGroupBox("Emotion Timeline")
         chart_group.setObjectName("settingsGroup")
         cgl = QVBoxLayout(chart_group)
 
         if _CHARTS_AVAILABLE:
-            self._chart_view, self._emotion_series, self._x_axis = \
-                self._build_chart()
+            self._chart_view, self._emotion_series, self._x_axis = self._build_chart()
             self._chart_view.setMinimumHeight(220)
             cgl.addWidget(self._chart_view)
         else:
-            # Fallback: plain text history (QtCharts not installed)
             self._chart_view = None
             self._emotion_series = {}
             self._x_axis = None
@@ -127,11 +161,10 @@ class EmotionsTab(QScrollArea):
             self._fallback_hist.setMaximumHeight(200)
             self._fallback_hist.setFont(QFont("Consolas", 8))
             self._fallback_hist.setPlaceholderText(
-                "PySide6.QtCharts not available — showing text history…"
+                "PySide6.QtCharts not available. Showing text history."
             )
             cgl.addWidget(self._fallback_hist)
 
-        # Chart controls row
         ctrl_row = QHBoxLayout()
         ctrl_row.addWidget(QLabel("Show last"))
         self.hist_limit = QSpinBox()
@@ -152,10 +185,9 @@ class EmotionsTab(QScrollArea):
         ctrl_row.addWidget(refresh_btn)
         cgl.addLayout(ctrl_row)
 
-        # Compact legend below the chart
         if _CHARTS_AVAILABLE:
             legend_row = QHBoxLayout()
-            legend_row.setSpacing(14)
+            legend_row.setSpacing(12)
             for emo, color in _EMOTION_COLORS.items():
                 dot = QLabel("●")
                 dot.setStyleSheet(f"color: {color};")
@@ -173,54 +205,46 @@ class EmotionsTab(QScrollArea):
 
         layout.addWidget(chart_group)
 
-        # ── Emotion → AI injection ──────────────────────────────────────
         inject_group = QGroupBox("Emotion Injection to AI")
         inject_group.setObjectName("settingsGroup")
         ig = QVBoxLayout(inject_group)
 
         info = QLabel(
-            "The text below is appended to the AI's system prompt every turn, "
-            "telling it how to adapt its tone to the user's emotional state."
+            "This context is appended to the AI system prompt so responses adapt to "
+            "the inferred emotional state."
         )
         info.setFont(QFont("Segoe UI", 8))
         info.setWordWrap(True)
         ig.addWidget(info)
 
-        self.inject_enabled = QCheckBox("Feed emotion context to AI  (disable = EmotionNet off)")
+        self.inject_enabled = QCheckBox("Feed emotion context to AI (disable = EmotionNet off)")
         self.inject_enabled.setChecked(True)
         self.inject_enabled.toggled.connect(self._toggle_injection)
         ig.addWidget(self.inject_enabled)
 
         self.inject_preview = QTextEdit()
         self.inject_preview.setReadOnly(True)
-        self.inject_preview.setMaximumHeight(72)
+        self.inject_preview.setMaximumHeight(78)
         self.inject_preview.setFont(QFont("Consolas", 8))
-        self.inject_preview.setPlaceholderText("No emotion injected yet…")
+        self.inject_preview.setPlaceholderText("No emotion context injected yet.")
         ig.addWidget(self.inject_preview)
 
         layout.addWidget(inject_group)
         layout.addStretch()
         self.setWidget(container)
 
-        # Wire live telemetry updates
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
         self.event_bus.chat_complete.connect(lambda _: self._refresh_history())
 
-    # ── Chart builder ────────────────────────────────────────────────────
-
     def _build_chart(self):
-        """Build and return the QChart, series dict, and x-axis."""
         chart = QChart()
         chart.setTitle("")
         chart.setAnimationOptions(QChart.NoAnimation)
-        chart.legend().setVisible(False)  # we draw our own legend below
-
-        # Dark background to match the app theme
+        chart.legend().setVisible(False)
         chart.setBackgroundVisible(False)
         chart.setPlotAreaBackgroundVisible(True)
         chart.setPlotAreaBackgroundBrush(QColor("#1a1a2e"))
 
-        # One series per emotion
         series_map = {}
         for emotion, hex_color in _EMOTION_COLORS.items():
             series = QLineSeries()
@@ -228,11 +252,9 @@ class EmotionsTab(QScrollArea):
             pen = QPen(QColor(hex_color))
             pen.setWidth(2)
             series.setPen(pen)
-            # Start hidden; only the active emotion gets data
             chart.addSeries(series)
             series_map[emotion] = series
 
-        # X axis — turn index
         x_axis = QValueAxis()
         x_axis.setRange(0, _CHART_MAX_POINTS)
         x_axis.setLabelFormat("%d")
@@ -243,13 +265,12 @@ class EmotionsTab(QScrollArea):
         x_axis.setTickCount(6)
         chart.addAxis(x_axis, Qt.AlignBottom)
 
-        # Y axis — confidence 0→1
         y_axis = QValueAxis()
         y_axis.setRange(0.0, 1.0)
         y_axis.setLabelFormat("%.1f")
         y_axis.setLabelsColor(QColor("#64748b"))
         y_axis.setGridLineColor(QColor("#1e293b"))
-        y_axis.setTitleText("Confidence")
+        y_axis.setTitleText("Probability")
         y_axis.setTitleBrush(QColor("#64748b"))
         y_axis.setTickCount(6)
         chart.addAxis(y_axis, Qt.AlignLeft)
@@ -261,67 +282,142 @@ class EmotionsTab(QScrollArea):
         chart_view = QChartView(chart)
         chart_view.setRenderHint(QPainter.Antialiasing)
         chart_view.setStyleSheet("background: transparent; border: none;")
-
         return chart_view, series_map, x_axis
 
-    # ── Slots ────────────────────────────────────────────────────────────
-
-    def _on_telemetry(self, data: dict):
-        emo = data.get("emotion", {})
-        if not emo:
+    def _on_telemetry(self, data):
+        emo = data.get("emotion", {}) if isinstance(data, dict) else {}
+        if not isinstance(emo, dict) or not emo:
             return
         self._update_display(emo)
 
-    def _update_display(self, emo: dict):
-        label = emo.get("label", "Neutral")
-        conf  = emo.get("confidence", 0.0)
-        v     = emo.get("valence",   0.0)
-        a     = emo.get("arousal",   0.0)
-        d     = emo.get("dominance", 0.0)
+    def _update_display(self, emo):
+        label = str(emo.get("label", "Neutral"))
+        secondary = str(emo.get("secondary_label", "")).strip()
+        conf = self._as_float(emo.get("confidence", 0.0))
+        v = self._as_float(emo.get("valence", 0.0))
+        a = self._as_float(emo.get("arousal", 0.0))
+        d = self._as_float(emo.get("dominance", 0.0))
 
         color = _EMOTION_COLORS.get(label, "#94a3b8")
         self.emo_label.setText(label)
         self.emo_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        self.emo_confidence.setText(f"conf: {conf:.0%}")
+
+        if secondary and secondary != label:
+            self.emo_confidence.setText(f"conf: {conf:.0%} | next: {secondary}")
+        else:
+            self.emo_confidence.setText(f"conf: {conf:.0%}")
 
         self.valence_bar.setValue(int(v * 100))
         self.arousal_bar.setValue(int(a * 100))
         self.dominance_bar.setValue(int(d * 100))
 
-        # Add to live chart
-        if _CHARTS_AVAILABLE and self._emotion_series:
-            self._add_chart_point(label, conf)
+        probs = self._coerce_probabilities(emo.get("emotion_probs", {}))
+        ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+        if not ranked and label:
+            ranked = [(label, conf)]
+            probs = {label: conf}
 
-        # Preview injection text
+        self._update_probability_rows(ranked)
+        self._update_reasoning_views(emo)
+
+        if _CHARTS_AVAILABLE and self._emotion_series:
+            self._add_chart_point(label, conf, probs=probs)
+
         if self.inject_enabled.isChecked() and label not in ("Neutral", "Disabled", "---", ""):
-            hint = _INJECT_HINTS.get(label, "Adjust your tone to match their emotional state.")
+            top_text = ", ".join(f"{name}:{prob:.0%}" for name, prob in ranked[:3]) or f"{label}:{conf:.0%}"
+            hint = _INJECT_HINTS.get(label, "Adjust tone to match emotional context.")
             preview = (
-                f"[Emotional context: The user currently seems {label} "
-                f"(valence {v:+.2f}, confidence {conf:.0%}). {hint}]"
+                f"[Emotional context inference: top hypotheses {top_text}. "
+                f"Current best read: {label} (valence {v:+.2f}, confidence {conf:.0%}). "
+                f"{hint}]"
             )
         else:
-            preview = "(No emotion text injected — emotion is Neutral or injection is disabled)"
+            preview = "(No emotion text injected: neutral/disabled or injection off)"
         self.inject_preview.setPlainText(preview)
 
-    def _add_chart_point(self, label: str, confidence: float):
-        """Append a new reading to the chart, sliding window of _CHART_MAX_POINTS."""
+    @staticmethod
+    def _as_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_probabilities(self, probs):
+        if not isinstance(probs, dict):
+            return {}
+        out = {}
+        for key, value in probs.items():
+            p = self._as_float(value, 0.0)
+            if p <= 0.0:
+                continue
+            out[str(key)] = max(0.0, min(1.0, p))
+        return out
+
+    def _update_probability_rows(self, ranked):
+        for i, (lbl, bar) in enumerate(self._prob_rows):
+            if i < len(ranked):
+                name, prob = ranked[i]
+                color = _EMOTION_COLORS.get(name, "#94a3b8")
+                lbl.setText(name)
+                bar.setValue(int(prob * 100))
+                bar.setStyleSheet(
+                    f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+                )
+            else:
+                lbl.setText("-")
+                bar.setValue(0)
+                bar.setStyleSheet("")
+
+    def _update_reasoning_views(self, emo):
+        sig = emo.get("signals", {})
+        if isinstance(sig, dict) and sig:
+            lines = ["Signals"]
+            for k in (
+                "sentiment", "positive_tone", "negative_tone", "curiosity",
+                "frustration", "loneliness", "anxiety", "urgency",
+                "topic_sensitivity", "importance", "signal_strength",
+            ):
+                if k in sig:
+                    lines.append(f"{k:>16}: {self._as_float(sig[k], 0.0):.3f}")
+            self.signals_view.setPlainText("\n".join(lines))
+        else:
+            self.signals_view.setPlainText("Signals\n(no data)")
+
+        tmp = emo.get("temporal", {})
+        if isinstance(tmp, dict) and tmp:
+            lines = ["Temporal"]
+            for k in (
+                "assistant_streak", "unanswered_user_turns",
+                "since_last_user_s", "since_last_assistant_s",
+                "response_gap_norm", "user_wait_norm", "avg_gap_s", "user_ratio",
+            ):
+                if k in tmp:
+                    val = tmp.get(k)
+                    if isinstance(val, float):
+                        lines.append(f"{k:>20}: {val:.3f}")
+                    else:
+                        lines.append(f"{k:>20}: {val}")
+            self.temporal_view.setPlainText("\n".join(lines))
+        else:
+            self.temporal_view.setPlainText("Temporal\n(no data)")
+
+    def _add_chart_point(self, label, confidence, probs=None):
         self._chart_tick += 1
         tick = float(self._chart_tick)
+        probs = probs if isinstance(probs, dict) else {}
 
         for emo, series in self._emotion_series.items():
-            val = confidence if emo == label else 0.0
-            series.append(tick, val)
-            # Trim to window size
+            val = self._as_float(probs.get(emo, 0.0), 0.0)
+            if not probs:
+                val = confidence if emo == label else 0.0
+            series.append(tick, max(0.0, min(1.0, val)))
             if series.count() > _CHART_MAX_POINTS:
                 series.remove(0)
 
-        # Slide x-axis window
         x_min = max(0.0, tick - _CHART_MAX_POINTS)
-        x_max = x_min + _CHART_MAX_POINTS
-        self._x_axis.setRange(x_min, x_max)
+        self._x_axis.setRange(x_min, x_min + _CHART_MAX_POINTS)
 
     def _clear_chart(self):
-        """Reset all series and tick counter."""
         self._chart_tick = 0
         if _CHARTS_AVAILABLE and self._emotion_series:
             for series in self._emotion_series.values():
@@ -330,8 +426,7 @@ class EmotionsTab(QScrollArea):
         elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
             self._fallback_hist.clear()
 
-    def _toggle_injection(self, enabled: bool):
-        """Enable / disable EmotionNet via the server API."""
+    def _toggle_injection(self, enabled):
         action = "enable" if enabled else "disable"
         try:
             _req.post(
@@ -342,7 +437,6 @@ class EmotionsTab(QScrollArea):
             pass
 
     def _refresh_history(self):
-        """Load history from the API and replay it into the chart."""
         limit = self.hist_limit.value()
         try:
             r = _req.get(
@@ -357,22 +451,27 @@ class EmotionsTab(QScrollArea):
                 return
 
             if _CHARTS_AVAILABLE and self._emotion_series:
-                # Clear and replay from API history
                 for series in self._emotion_series.values():
                     series.clear()
                 self._chart_tick = 0
                 for entry in history:
-                    lbl  = entry.get("label", "Neutral")
-                    conf = entry.get("confidence", 0.0)
-                    self._add_chart_point(lbl, conf)
+                    lbl = str(entry.get("label", "Neutral"))
+                    conf = self._as_float(entry.get("confidence", 0.0), 0.0)
+                    probs = self._coerce_probabilities(entry.get("emotion_probs", {}))
+                    self._add_chart_point(lbl, conf, probs=probs)
             elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
                 lines = []
                 for entry in reversed(history):
-                    ts   = entry.get("timestamp", "")[:19]
-                    lbl  = entry.get("label", "?")
-                    val  = entry.get("valence",   0.0)
-                    conf = entry.get("confidence", 0.0)
-                    lines.append(f"[{ts}]  {lbl:<12}  V:{val:+.2f}  conf:{conf:.0%}")
+                    ts = str(entry.get("timestamp", ""))[:19]
+                    lbl = str(entry.get("label", "?"))
+                    sec = str(entry.get("secondary_label", "")).strip()
+                    conf = self._as_float(entry.get("confidence", 0.0), 0.0)
+                    val = self._as_float(entry.get("valence", 0.0), 0.0)
+                    if sec and sec != lbl:
+                        lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) alt:{sec:<11} V:{val:+.2f}")
+                    else:
+                        lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) V:{val:+.2f}")
                 self._fallback_hist.setPlainText("\n".join(lines))
         except Exception:
             pass
+

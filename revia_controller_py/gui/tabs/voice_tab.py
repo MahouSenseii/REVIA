@@ -78,6 +78,7 @@ class VoiceTab(QScrollArea):
         btn_row.addWidget(self.stop_tts_btn)
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(["Qwen3-TTS", "pyttsx3"])
+        self.engine_combo.setCurrentText("pyttsx3")
         self.engine_combo.currentTextChanged.connect(self._on_engine_changed)
         btn_row.addWidget(self.engine_combo)
         sv.addRow("", btn_row)
@@ -88,7 +89,7 @@ class VoiceTab(QScrollArea):
         self.tts_server_status.setWordWrap(True)
         sv.addRow("Server:", self.tts_server_status)
 
-        self.voice_mgr.backend.set_engine("qwen3-tts")
+        self.voice_mgr.backend.set_engine("pyttsx3")
         self.voice_mgr.backend.set_qwen_server("http://localhost:8000")
         self._tts_process = None
         self._tts_ready_timer = None

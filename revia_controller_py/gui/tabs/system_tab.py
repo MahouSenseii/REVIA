@@ -1,4 +1,4 @@
-import subprocess, sys, os, signal
+import subprocess, sys, os
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -17,6 +17,7 @@ class SystemTab(QScrollArea):
         self.client = client
         self.theme_mgr = theme_mgr
         self._core_process = None
+        self._auto_start_attempted = False
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -115,6 +116,41 @@ class SystemTab(QScrollArea):
         cg.addLayout(core_btn_row)
 
         layout.addWidget(core_group)
+
+        # Architecture monitor
+        arch_group = QGroupBox("Architecture Monitor")
+        arch_group.setObjectName("settingsGroup")
+        ag = QVBoxLayout(arch_group)
+
+        self.arch_overall = QLabel("Overall: Unknown")
+        self.arch_overall.setFont(QFont("Consolas", 9, QFont.Bold))
+        self.arch_overall.setObjectName("metricLabel")
+        ag.addWidget(self.arch_overall)
+
+        self.arch_labels = {}
+        module_rows = [
+            ("core_reasoning", "Core Reasoning Engine"),
+            ("emotion", "Emotion Simulation"),
+            ("voice", "Voice I/O"),
+            ("vision", "Vision Perception"),
+            ("tools", "Tools / Plugin Controller"),
+            ("memory", "Long-Term Memory (RAG)"),
+            ("personality", "Personality Layer"),
+            ("monitoring", "Real-Time Monitoring"),
+        ]
+        for key, title in module_rows:
+            row = QHBoxLayout()
+            title_lbl = QLabel(title)
+            title_lbl.setFont(QFont("Segoe UI", 9))
+            row.addWidget(title_lbl, stretch=1)
+            status_lbl = QLabel("Checking...")
+            status_lbl.setFont(QFont("Consolas", 8))
+            status_lbl.setObjectName("metricLabel")
+            row.addWidget(status_lbl)
+            self.arch_labels[key] = status_lbl
+            ag.addLayout(row)
+
+        layout.addWidget(arch_group)
 
         # Theme
         theme_group = QGroupBox("Appearance")
@@ -269,6 +305,13 @@ class SystemTab(QScrollArea):
 
     # --- Core server management ---
 
+    def auto_start_on_launch(self):
+        if self._auto_start_attempted:
+            return
+        self._auto_start_attempted = True
+        self.event_bus.log_entry.emit("[Core] Auto-starting core server on UI launch.")
+        QTimer.singleShot(150, self._start_core_server)
+
     def _find_core_script(self):
         candidates = [
             Path(__file__).resolve().parents[2] / ".." / "revia_core_py" / "core_server.py",
@@ -281,6 +324,17 @@ class SystemTab(QScrollArea):
         if home.exists():
             return str(home.resolve())
         return None
+
+    def _resolve_python_exe(self):
+        project_root = Path(__file__).resolve().parents[3]
+        candidates = [
+            project_root / ".venv" / "Scripts" / "python.exe",
+            project_root / ".venv" / "bin" / "python",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return sys.executable
 
     def _kill_port_holder(self, port):
         """Kill any process already listening on this port (Windows).
@@ -323,38 +377,56 @@ class SystemTab(QScrollArea):
             self.server_status.setStyleSheet("color: #cc3040;")
             return
 
+        host = self.core_host.text().strip() or "127.0.0.1"
         rest = self.rest_port.value()
         ws = self.ws_port.value()
 
         # Check if a core is already running on this port (from terminal etc.)
         already_running = False
+        running_version = ""
+        running_has_arch = False
         try:
             import requests
             r = requests.get(
-                f"http://127.0.0.1:{rest}/api/status", timeout=1
+                f"http://{host}:{rest}/api/status", timeout=1
             )
             if r.ok:
                 already_running = True
+                data = r.json() if "application/json" in (r.headers.get("content-type", "")) else {}
+                running_version = str(data.get("version", "")).strip()
+                running_has_arch = isinstance(data.get("architecture"), dict) and bool(data.get("architecture"))
         except Exception:
             pass
 
         if already_running:
+            # If the running core is legacy (no architecture telemetry),
+            # replace it so monitor + module status stay accurate.
+            if running_has_arch:
+                self.server_status.setText(
+                    "Server: Already running externally - connecting..."
+                )
+                self.server_status.setStyleSheet("color: #00aa40;")
+                self.event_bus.log_entry.emit(
+                    f"[Core] Found existing server on port {rest} (v{running_version or '?'}), connecting"
+                )
+                self._connect_core()
+                return
+
             self.server_status.setText(
-                "Server: Already running externally - connecting..."
+                "Server: Legacy core detected - upgrading..."
             )
-            self.server_status.setStyleSheet("color: #00aa40;")
+            self.server_status.setStyleSheet("color: #ccaa00;")
             self.event_bus.log_entry.emit(
-                f"[Core] Found existing server on port {rest}, connecting"
+                f"[Core] Existing server on port {rest} is legacy (v{running_version or '?'}). Replacing with current core."
             )
-            self._connect_core()
-            return
 
         # Kill anything already on these ports that isn't responding
         killed = self._kill_port_holder(rest)
         killed |= self._kill_port_holder(ws)
         if killed:
-            import time
-            time.sleep(1.5)
+            self.event_bus.log_entry.emit(
+                "[Core] Waiting for port cleanup (non-blocking)..."
+            )
 
         self._core_process = QProcess(self)
         self._core_process.setWorkingDirectory(str(Path(script).parent))
@@ -369,11 +441,12 @@ class SystemTab(QScrollArea):
         )
         self._core_process.finished.connect(self._on_server_finished)
         self._core_process.errorOccurred.connect(self._on_server_error)
+        python_exe = self._resolve_python_exe()
 
         self.event_bus.log_entry.emit(
-            f"[Core] Launching: {sys.executable} {script}"
+            f"[Core] Launching: {python_exe} {script}"
         )
-        self._core_process.start(sys.executable, [script])
+        self._core_process.start(python_exe, [script])
 
         if not self._core_process.waitForStarted(5000):
             err = self._core_process.errorString()
@@ -400,6 +473,8 @@ class SystemTab(QScrollArea):
 
     def _auto_connect_after_start(self):
         self._connect_attempts = getattr(self, '_connect_attempts', 0) + 1
+        host = self.core_host.text().strip() or "127.0.0.1"
+        rest = self.rest_port.value()
         # Check if process died
         if self._core_process and self._core_process.state() == QProcess.NotRunning:
             self.server_status.setText("Server: Failed to start (check Logs)")
@@ -414,7 +489,7 @@ class SystemTab(QScrollArea):
         try:
             import requests
             r = requests.get(
-                f"{self.client.BASE_URL}/api/status", timeout=2
+                f"http://{host}:{rest}/api/status", timeout=2
             )
             if r.ok:
                 data = r.json()
@@ -611,9 +686,22 @@ class SystemTab(QScrollArea):
             self.core_status.setStyleSheet("color: #00aa40;")
             self.core_disconnect_btn.setEnabled(True)
         else:
-            self.core_status.setText("Status: Disconnected")
-            self.core_status.setStyleSheet("color: #cc3040;")
-            self.core_disconnect_btn.setEnabled(False)
+            rest_ok = bool(self.client.get("/api/status", timeout=1))
+            if rest_ok:
+                self.core_status.setText("Status: REST online (WebSocket reconnecting)")
+                self.core_status.setStyleSheet("color: #ccaa00;")
+                self.core_disconnect_btn.setEnabled(False)
+                self.arch_overall.setText("Overall: Degraded (WS offline)")
+                self.arch_overall.setStyleSheet("color: #ccaa00;")
+            else:
+                self.core_status.setText("Status: Disconnected")
+                self.core_status.setStyleSheet("color: #cc3040;")
+                self.core_disconnect_btn.setEnabled(False)
+                self.arch_overall.setText("Overall: Offline")
+                self.arch_overall.setStyleSheet("color: #cc3040;")
+                for lbl in self.arch_labels.values():
+                    lbl.setText("OFFLINE")
+                    lbl.setStyleSheet("color: #cc3040;")
 
     def _change_theme(self, theme):
         self.theme_mgr.apply_theme(theme.lower())
@@ -682,8 +770,27 @@ class SystemTab(QScrollArea):
                     + ("" if ddg_ok else " (install duckduckgo-search for full results)")
                 )
                 self.websearch_info.setStyleSheet("color: #888888;")
+        status = self.client.get("/api/status", timeout=1) or {}
+        arch = status.get("architecture", {})
+        if arch:
+            self._update_architecture(arch)
+        elif status:
+            self.arch_overall.setText("Overall: Partial (legacy core status)")
+            self.arch_overall.setStyleSheet("color: #ccaa00;")
+            core_lbl = self.arch_labels.get("core_reasoning")
+            if core_lbl:
+                core_lbl.setText("ONLINE | Core status endpoint reachable")
+                core_lbl.setStyleSheet("color: #00aa40;")
+            for key, lbl in self.arch_labels.items():
+                if key == "core_reasoning":
+                    continue
+                lbl.setText("UNKNOWN | Upgrade core for module telemetry")
+                lbl.setStyleSheet("color: #808898;")
 
     def _on_telemetry(self, data):
+        state = str(data.get("state", "Unknown"))
+        llm = data.get("llm_connection", {}) or {}
+        readiness = data.get("conversation_readiness", {}) or {}
         emotion = data.get("emotion", {})
         router = data.get("router", {})
         self.emotion_info.setText(
@@ -694,3 +801,47 @@ class SystemTab(QScrollArea):
             f"Inference: {router.get('inference_ms', 0):.1f} ms "
             f"| Output: {router.get('mode', '---')}"
         )
+        llm_state = str(llm.get("state", "Disconnected"))
+        llm_detail = str(llm.get("detail", "")).strip()
+        ready_flag = "Ready" if readiness.get("ready", False) else "Waiting"
+        self.core_status.setText(
+            f"Status: {state} | LLM: {llm_state} | Conversation: {ready_flag}"
+            + (f" | {llm_detail}" if llm_detail else "")
+        )
+        if readiness.get("ready", False):
+            self.core_status.setStyleSheet("color: #00aa40;")
+        elif llm_state == "Error" or state == "Error":
+            self.core_status.setStyleSheet("color: #cc3040;")
+        else:
+            self.core_status.setStyleSheet("color: #ccaa00;")
+        arch = data.get("architecture", {})
+        if arch:
+            self._update_architecture(arch)
+
+    def _update_architecture(self, architecture):
+        modules = architecture.get("modules", {})
+        overall_ready = architecture.get("overall_ready")
+        if overall_ready is None:
+            self.arch_overall.setText("Overall: Unknown")
+            self.arch_overall.setStyleSheet("color: #808898;")
+        elif overall_ready:
+            self.arch_overall.setText("Overall: Ready")
+            self.arch_overall.setStyleSheet("color: #00aa40;")
+        else:
+            self.arch_overall.setText("Overall: Partial")
+            self.arch_overall.setStyleSheet("color: #ccaa00;")
+
+        for key, label in self.arch_labels.items():
+            if key not in modules:
+                label.setText("UNKNOWN")
+                label.setStyleSheet("color: #808898;")
+                continue
+            module = modules.get(key, {})
+            online = bool(module.get("online", False))
+            detail = str(module.get("detail", "")).strip()
+            if online:
+                label.setText("ONLINE" + (f" | {detail}" if detail else ""))
+                label.setStyleSheet("color: #00aa40;")
+            else:
+                label.setText("OFFLINE" + (f" | {detail}" if detail else ""))
+                label.setStyleSheet("color: #cc3040;")

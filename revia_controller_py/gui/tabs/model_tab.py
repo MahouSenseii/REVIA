@@ -1,11 +1,12 @@
 import sys
+import os
 import json
 import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QPushButton, QFileDialog, QStackedWidget,
+    QPushButton, QFileDialog, QStackedWidget, QCheckBox,
 )
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QProcess, QTimer
@@ -20,8 +21,9 @@ class ModelTab(QScrollArea):
         self.event_bus = event_bus
         self.client = client
         self._llm_process = None
-        self._loading = False  # guard: prevents saving while loading
+        self._loading = True  # guard: prevents saving while loading
         self._pending_source = None  # source to push once core connects
+        self._llm_server_kind = ""
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -156,6 +158,10 @@ class ModelTab(QScrollArea):
         btn_row.addWidget(self.stop_llm_btn)
         scl.addLayout(btn_row)
 
+        self.auto_start_llm = QCheckBox("Auto-start local LLM server on launch")
+        self.auto_start_llm.setChecked(True)
+        scl.addWidget(self.auto_start_llm)
+
         self.llm_server_status = QLabel("Server: Not running")
         self.llm_server_status.setFont(QFont("Segoe UI", 8))
         scl.addWidget(self.llm_server_status)
@@ -254,6 +260,10 @@ class ModelTab(QScrollArea):
         self.repeat_penalty.setSingleStep(0.05)
         gf.addRow("Repeat Penalty:", self.repeat_penalty)
 
+        self.fast_mode = QCheckBox("Fast response mode (lower latency)")
+        self.fast_mode.setChecked(True)
+        gf.addRow("", self.fast_mode)
+
         layout.addWidget(gen_group)
 
         # --- GPU settings (local only) ---
@@ -313,9 +323,54 @@ class ModelTab(QScrollArea):
         self.setWidget(container)
 
         self.event_bus.connection_changed.connect(self._on_core_connection)
+        self.event_bus.telemetry_updated.connect(self._on_runtime_status)
         self._on_source_changed(0)
         self._on_provider_changed(self.api_provider.currentText())
         self._load_settings()  # restore previous session settings
+        self._wire_settings_autosave()
+        self._loading = False
+        if self._pending_source is None:
+            self._pending_source = (
+                "online" if self.source_type.currentIndex() == 1 else "local"
+            )
+
+    def _connect_save_signal(self, signal):
+        signal.connect(lambda *_args: self._save_settings())
+
+    def _wire_settings_autosave(self):
+        # Local
+        self._connect_save_signal(self.local_path.textChanged)
+        self._connect_save_signal(self.local_server_url.textChanged)
+        self._connect_save_signal(self.local_format.currentTextChanged)
+        self._connect_save_signal(self.local_backend.currentTextChanged)
+        self._connect_save_signal(self.local_loader.currentTextChanged)
+        self._connect_save_signal(self.llm_exe_path.textChanged)
+        self._connect_save_signal(self.srv_gpu_layers.valueChanged)
+        self._connect_save_signal(self.srv_ctx.valueChanged)
+        self._connect_save_signal(self.srv_port.valueChanged)
+        self._connect_save_signal(self.auto_start_llm.toggled)
+
+        # Online
+        self._connect_save_signal(self.api_provider.currentTextChanged)
+        self._connect_save_signal(self.api_endpoint.textChanged)
+        self._connect_save_signal(self.api_key.textChanged)
+        self._connect_save_signal(self.api_model.currentTextChanged)
+        api_model_line_edit = self.api_model.lineEdit()
+        if api_model_line_edit:
+            self._connect_save_signal(api_model_line_edit.textChanged)
+        self._connect_save_signal(self.api_org.textChanged)
+
+        # Generation + GPU
+        self._connect_save_signal(self.ctx_length.valueChanged)
+        self._connect_save_signal(self.temperature.valueChanged)
+        self._connect_save_signal(self.top_p.valueChanged)
+        self._connect_save_signal(self.max_tokens.valueChanged)
+        self._connect_save_signal(self.repeat_penalty.valueChanged)
+        self._connect_save_signal(self.fast_mode.toggled)
+        self._connect_save_signal(self.gpu_layers.valueChanged)
+        self._connect_save_signal(self.batch_size.valueChanged)
+        self._connect_save_signal(self.threads.valueChanged)
+        self._connect_save_signal(self.quant.currentTextChanged)
 
     # --- Slots ---
 
@@ -353,48 +408,158 @@ class ModelTab(QScrollArea):
             self.llm_exe_path.setText(path)
             self._save_settings()
 
+    def _kill_port_listener(self, port):
+        if sys.platform != "win32":
+            return
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano"], text=True, timeout=5
+            )
+        except Exception:
+            return
+        for line in out.splitlines():
+            if f":{port} " not in line or "LISTEN" not in line.upper():
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            pid = parts[-1]
+            if pid.isdigit() and int(pid) != os.getpid():
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", pid],
+                        capture_output=True, timeout=5,
+                    )
+                    self.event_bus.log_entry.emit(
+                        f"[LLM] Killed stale process PID {pid} on port {port}"
+                    )
+                except Exception:
+                    pass
+
+    def _build_server_command(self, server, model_file, port, ctx, gpu_layers):
+        server_l = (server or "").strip().lower()
+        env_updates = {}
+
+        if server_l == "ollama":
+            env_updates["OLLAMA_HOST"] = f"127.0.0.1:{port}"
+            return ["serve"], env_updates, False, "ollama"
+
+        if server_l in {"llama.cpp", "custom"}:
+            args = [
+                "--port", str(port),
+                "-c", str(ctx),
+                "-m", model_file,
+                "-ngl", str(gpu_layers),
+            ]
+            return args, env_updates, True, "llama.cpp"
+
+        return None, None, None, None
+
+    def _read_models_from_response(self, response_json):
+        if not isinstance(response_json, dict):
+            return []
+        if isinstance(response_json.get("data"), list):
+            return [
+                str(item.get("id", "")).strip()
+                for item in response_json.get("data", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+        if isinstance(response_json.get("models"), list):
+            return [
+                str(item.get("name", "")).strip()
+                for item in response_json.get("models", [])
+                if isinstance(item, dict) and item.get("name")
+            ]
+        return []
+
+    def _probe_local_server(self, server_url):
+        base = (server_url or "").strip().rstrip("/")
+        if not base:
+            return False, []
+        candidates = []
+        if base.endswith("/v1"):
+            candidates.append(base + "/models")
+            base_root = base[:-3]
+            candidates.append(base_root + "/api/tags")
+            candidates.append(base_root + "/health")
+        else:
+            candidates.append(base + "/models")
+            candidates.append(base + "/v1/models")
+            candidates.append(base + "/api/tags")
+            candidates.append(base + "/health")
+
+        tried = set()
+        for url in candidates:
+            if url in tried:
+                continue
+            tried.add(url)
+            try:
+                import requests
+                r = requests.get(url, timeout=2)
+                if not r.ok:
+                    continue
+                try:
+                    payload = r.json()
+                except Exception:
+                    payload = {}
+                models = self._read_models_from_response(payload)
+                return True, models
+            except Exception:
+                continue
+        return False, []
+
     def _start_llm_server(self):
         if self._llm_process and self._llm_process.state() == QProcess.Running:
             self.llm_server_status.setText("Server: Already running")
             self.llm_server_status.setStyleSheet("color: #ccaa00;")
             return
 
+        server = self.local_server.currentText()
         exe = self.llm_exe_path.text().strip()
         if not exe:
             self.llm_server_status.setText("Server: Set executable path first")
             self.llm_server_status.setStyleSheet("color: #cc3040;")
             return
-
-        model_file = self.local_path.text().strip()
-        if not model_file:
-            self.llm_server_status.setText("Server: Set model file path first")
+        if not Path(exe).exists():
+            self.llm_server_status.setText("Server: Executable path not found")
             self.llm_server_status.setStyleSheet("color: #cc3040;")
             return
 
+        model_file = self.local_path.text().strip()
         port = self.srv_port.value()
         gpu_layers = self.srv_gpu_layers.value()
         ctx = self.srv_ctx.value()
 
-        # Kill anything already on this port
-        if sys.platform == "win32":
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/IM",
-                     Path(exe).name],
-                    capture_output=True, timeout=5,
-                )
-            except Exception:
-                pass
+        args, env_updates, requires_model, server_kind = self._build_server_command(
+            server, model_file, port, ctx, gpu_layers
+        )
+        if args is None:
+            self.llm_server_status.setText(
+                f"Server: Auto-launch unsupported for {server}. "
+                "Use Ollama/llama.cpp or start externally."
+            )
+            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            return
 
-        args = [
-            "--port", str(port),
-            "-c", str(ctx),
-            "-m", model_file,
-            "-ngl", str(gpu_layers),
-        ]
+        if requires_model and not model_file:
+            self.llm_server_status.setText("Server: Set model file path first")
+            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            return
+        if requires_model and not Path(model_file).exists():
+            self.llm_server_status.setText("Server: Model file path not found")
+            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            return
+
+        self._kill_port_listener(port)
 
         self._llm_process = QProcess(self)
         self._llm_process.setWorkingDirectory(str(Path(exe).parent))
+        if env_updates:
+            from PySide6.QtCore import QProcessEnvironment
+            env = QProcessEnvironment.systemEnvironment()
+            for key, value in env_updates.items():
+                env.insert(key, str(value))
+            self._llm_process.setProcessEnvironment(env)
         self._llm_process.readyReadStandardOutput.connect(
             self._on_llm_stdout
         )
@@ -408,11 +573,15 @@ class ModelTab(QScrollArea):
         self.llm_server_status.setStyleSheet("color: #ccaa00;")
         self.start_llm_btn.setEnabled(False)
         self.stop_llm_btn.setEnabled(True)
+        self._llm_server_kind = server_kind
 
         cmd_str = Path(exe).name + " " + " ".join(args)
         self.event_bus.log_entry.emit(f"[LLM] Starting: {cmd_str}")
         self._llm_ready_attempts = 0
-        QTimer.singleShot(4000, self._check_llm_ready)
+
+        # Keep URL aligned with server launch settings.
+        self.local_server_url.setText(f"http://127.0.0.1:{port}/v1")
+        QTimer.singleShot(3000, self._check_llm_ready)
 
     def _check_llm_ready(self):
         if not self._llm_process or self._llm_process.state() != QProcess.Running:
@@ -422,38 +591,25 @@ class ModelTab(QScrollArea):
             self.llm_server_status.setText("Server: Timeout waiting for ready")
             self.llm_server_status.setStyleSheet("color: #cc3040;")
             return
-        port = self.srv_port.value()
-        try:
-            import requests
-            r = requests.get(f"http://127.0.0.1:{port}/health", timeout=2)
-            if r.ok:
-                # Also check that a model is actually loaded
-                mr = requests.get(
-                    f"http://127.0.0.1:{port}/v1/models", timeout=2
+        ready, models = self._probe_local_server(self.local_server_url.text())
+        if ready:
+            if models:
+                shown = ", ".join(models[:2])
+                self.llm_server_status.setText(f"Server: Running ({shown})")
+                self.event_bus.log_entry.emit(
+                    f"[LLM] Server ready with model(s): {shown}"
                 )
-                models = mr.json().get("data", []) if mr.ok else []
-                if models:
-                    name = models[0].get("id", "model")
+            else:
+                if self._llm_server_kind == "ollama":
                     self.llm_server_status.setText(
-                        f"Server: Running ({name})"
-                    )
-                    self.llm_server_status.setStyleSheet("color: #00aa40;")
-                    self.event_bus.log_entry.emit(
-                        f"[LLM] Server ready with model: {name}"
+                        "Server: Running (Ollama ready)"
                     )
                 else:
                     self.llm_server_status.setText(
-                        "Server: Running (loading model...)"
+                        "Server: Running (waiting for model load)"
                     )
-                    self.llm_server_status.setStyleSheet("color: #ccaa00;")
-                    QTimer.singleShot(3000, self._check_llm_ready)
-                    return
-                self.local_server_url.setText(
-                    f"http://127.0.0.1:{port}/v1"
-                )
-                return
-        except Exception:
-            pass
+            self.llm_server_status.setStyleSheet("color: #00aa40;")
+            return
         self.llm_server_status.setText(
             f"Server: Starting ({self._llm_ready_attempts * 3}s...)"
         )
@@ -478,6 +634,7 @@ class ModelTab(QScrollArea):
         self.llm_server_status.setStyleSheet("")
         self.start_llm_btn.setEnabled(True)
         self.stop_llm_btn.setEnabled(False)
+        self._llm_server_kind = ""
         self.event_bus.log_entry.emit("[LLM] Server stopped")
 
     def _on_llm_stdout(self):
@@ -504,6 +661,7 @@ class ModelTab(QScrollArea):
         self.llm_server_status.setStyleSheet("color: #cc3040;")
         self.start_llm_btn.setEnabled(True)
         self.stop_llm_btn.setEnabled(False)
+        self._llm_server_kind = ""
         self._llm_process = None
 
     def _on_provider_changed(self, provider):
@@ -600,6 +758,7 @@ class ModelTab(QScrollArea):
             "srv_gpu_layers": self.srv_gpu_layers.value(),
             "srv_ctx": self.srv_ctx.value(),
             "srv_port": self.srv_port.value(),
+            "auto_start_llm": self.auto_start_llm.isChecked(),
             # Online API
             "api_provider": self.api_provider.currentText(),
             "api_endpoint": self.api_endpoint.text(),
@@ -612,6 +771,7 @@ class ModelTab(QScrollArea):
             "top_p": self.top_p.value(),
             "max_tokens": self.max_tokens.value(),
             "repeat_penalty": self.repeat_penalty.value(),
+            "fast_mode": self.fast_mode.isChecked(),
             # GPU / quant
             "gpu_layers": self.gpu_layers.value(),
             "batch_size": self.batch_size.value(),
@@ -678,6 +838,7 @@ class ModelTab(QScrollArea):
             self.srv_gpu_layers.setValue(int(data.get("srv_gpu_layers", -1)))
             self.srv_ctx.setValue(int(data.get("srv_ctx", 4096)))
             self.srv_port.setValue(int(data.get("srv_port", 8080)))
+            self.auto_start_llm.setChecked(bool(data.get("auto_start_llm", True)))
 
             # --- Online API ---
             provider = data.get("api_provider", "")
@@ -712,6 +873,7 @@ class ModelTab(QScrollArea):
             self.top_p.setValue(float(data.get("top_p", 0.9)))
             self.max_tokens.setValue(int(data.get("max_tokens", 512)))
             self.repeat_penalty.setValue(float(data.get("repeat_penalty", 1.1)))
+            self.fast_mode.setChecked(bool(data.get("fast_mode", True)))
 
             # --- GPU / quant ---
             self.gpu_layers.setValue(int(data.get("gpu_layers", 0)))
@@ -731,9 +893,35 @@ class ModelTab(QScrollArea):
         finally:
             self._loading = False
 
-        if data.get("local_path") or data.get("api_key"):
-            self.event_bus.log_entry.emit("[Model] Previous session settings restored.")
-            self._pending_source = "online" if int(data.get("source_index", 0)) == 1 else "local"
+        self.event_bus.log_entry.emit("[Model] Previous session settings restored.")
+        self._pending_source = (
+            "online" if int(data.get("source_index", 0)) == 1 else "local"
+        )
+
+    def auto_start_on_launch(self):
+        self._pending_source = (
+            "online" if self.source_type.currentIndex() == 1 else "local"
+        )
+        if self.source_type.currentIndex() != 0:
+            return
+        if not self.auto_start_llm.isChecked():
+            return
+        if self._llm_process and self._llm_process.state() == QProcess.Running:
+            return
+
+        reachable, _ = self._probe_local_server(self.local_server_url.text())
+        if reachable:
+            self.llm_server_status.setText("Server: Running externally")
+            self.llm_server_status.setStyleSheet("color: #00aa40;")
+            self.event_bus.log_entry.emit("[LLM] Found existing local LLM server.")
+            return
+
+        if not self.llm_exe_path.text().strip():
+            self.event_bus.log_entry.emit(
+                "[LLM] Auto-start skipped: set an executable path first."
+            )
+            return
+        self._start_llm_server()
 
     def _test_connection(self):
         self.conn_status.setText("Status: Connecting...")
@@ -752,7 +940,7 @@ class ModelTab(QScrollArea):
 
         self.connect_btn.setEnabled(True)
 
-    def _push_config_to_core(self, source):
+    def _push_config_to_core(self, source, verified=False):
         self._save_settings()
         import threading
         cfg = {
@@ -761,6 +949,8 @@ class ModelTab(QScrollArea):
             "max_tokens": self.max_tokens.value(),
             "top_p": self.top_p.value(),
             "ctx_length": self.ctx_length.value(),
+            "fast_mode": self.fast_mode.isChecked(),
+            "verified": bool(verified),
         }
         if source == "local":
             cfg["local_path"] = self.local_path.text().strip()
@@ -793,7 +983,6 @@ class ModelTab(QScrollArea):
         threading.Thread(target=_do, daemon=True).start()
 
     def _test_local(self):
-        import os
         server = self.local_server.currentText()
         server_url = self.local_server_url.text().strip()
         path = self.local_path.text().strip()
@@ -803,30 +992,13 @@ class ModelTab(QScrollArea):
             self.conn_status.setStyleSheet("color: #cc3040;")
             return
 
-        # Check if local server is reachable
-        llm_ok = False
-        llm_detail = ""
-        try:
-            import requests
-            test_url = server_url.rstrip("/") + "/models"
-            r = requests.get(test_url, timeout=3)
-            if r.ok:
-                llm_ok = True
-                models = r.json().get("data", [])
-                if models:
-                    names = [m.get("id", "?") for m in models[:3]]
-                    llm_detail = ", ".join(names)
-                else:
-                    llm_detail = "connected"
-            else:
-                llm_detail = f"HTTP {r.status_code}"
-        except requests.exceptions.ConnectionError:
+        llm_ok, models = self._probe_local_server(server_url)
+        llm_detail = ", ".join(models[:3]) if models else "connected"
+        if not llm_ok:
             llm_detail = "not running"
-        except Exception as e:
-            llm_detail = str(e)[:60]
 
         # Push config to REVIA core
-        self._push_config_to_core("local")
+        self._push_config_to_core("local", verified=llm_ok)
 
         # Check REVIA core
         core_ok = False
@@ -906,7 +1078,7 @@ class ModelTab(QScrollArea):
                 )
 
             if r.ok:
-                self._push_config_to_core("online")
+                self._push_config_to_core("online", verified=True)
                 self.conn_status.setText(
                     f"Status: Connected to {provider} | Model: {model}"
                 )
@@ -953,6 +1125,34 @@ class ModelTab(QScrollArea):
                 self._push_config_to_core(self._pending_source)
                 self._pending_source = None
         else:
-            self.conn_status.setText("Status: Core offline")
+            self.conn_status.setText("Status: Waiting for core status...")
+            self.conn_status.setStyleSheet("color: #ccaa00;")
+            self.disconnect_btn.setEnabled(False)
+
+    def _on_runtime_status(self, data):
+        if not isinstance(data, dict):
+            return
+        llm = data.get("llm_connection", {}) or {}
+        if not llm:
+            return
+        state = str(llm.get("state", "Disconnected"))
+        detail = str(llm.get("detail", "")).strip()
+        model = str(llm.get("model", "")).strip()
+        text = f"Status: {state}"
+        if detail:
+            text += f" | {detail}"
+        elif model and model != "None":
+            text += f" | Model: {model}"
+        self.conn_status.setText(text)
+        if state == "Ready":
+            self.conn_status.setStyleSheet("color: #00aa40;")
+            self.disconnect_btn.setEnabled(True)
+        elif state == "Connecting":
+            self.conn_status.setStyleSheet("color: #ccaa00;")
+            self.disconnect_btn.setEnabled(True)
+        elif state == "Error":
             self.conn_status.setStyleSheet("color: #cc3040;")
+            self.disconnect_btn.setEnabled(True)
+        else:
+            self.conn_status.setStyleSheet("color: #808898;")
             self.disconnect_btn.setEnabled(False)

@@ -23,7 +23,6 @@ class MemoryTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        # --- Docker / Redis Status ---
         docker_group = QGroupBox("Docker Memory Backend (Long-Term)")
         docker_group.setObjectName("settingsGroup")
         dg = QHBoxLayout(docker_group)
@@ -37,10 +36,8 @@ class MemoryTab(QScrollArea):
         docker_check_btn.setObjectName("secondaryBtn")
         docker_check_btn.clicked.connect(self._check_docker_status)
         dg.addWidget(docker_check_btn)
-
         layout.addWidget(docker_group)
 
-        # --- Memory Backend ---
         backend_group = QGroupBox("Memory Store")
         backend_group.setObjectName("settingsGroup")
         bg = QFormLayout(backend_group)
@@ -60,17 +57,15 @@ class MemoryTab(QScrollArea):
         self.auto_store = QCheckBox("Auto-store conversations")
         self.auto_store.setChecked(True)
         bg.addRow("", self.auto_store)
-
         layout.addWidget(backend_group)
 
-        # --- Short-term Memory (Conversation Window) ---
         st_group = QGroupBox("Short-Term Memory (Conversation)")
         st_group.setObjectName("settingsGroup")
         stl = QVBoxLayout(st_group)
 
         st_info = QLabel(
-            "Active conversation context. Recent exchanges are kept in "
-            "a sliding window. Older entries promote to long-term automatically."
+            "Active conversation context. Recent exchanges are kept in a sliding "
+            "window. Older entries are promoted to long-term automatically."
         )
         st_info.setFont(QFont("Segoe UI", 8))
         st_info.setWordWrap(True)
@@ -107,17 +102,15 @@ class MemoryTab(QScrollArea):
         st_clear.clicked.connect(self._clear_short_term)
         st_btn_row.addWidget(st_clear)
         stl.addLayout(st_btn_row)
-
         layout.addWidget(st_group)
 
-        # --- Long-term Memory (Persistent) ---
         lt_group = QGroupBox("Long-Term Memory (Persistent)")
         lt_group.setObjectName("settingsGroup")
         ltl = QVBoxLayout(lt_group)
 
         lt_info = QLabel(
-            "Persistent memory stored on disk. Includes promoted conversation "
-            "history, user notes, facts, and preferences. Survives restarts."
+            "Persistent memory stored on Redis (if available) or local JSONL fallback. "
+            "Includes promoted history, notes, facts, and people profiles."
         )
         lt_info.setFont(QFont("Segoe UI", 8))
         lt_info.setWordWrap(True)
@@ -127,6 +120,34 @@ class MemoryTab(QScrollArea):
         self.lt_count.setFont(QFont("Consolas", 9))
         self.lt_count.setObjectName("metricLabel")
         ltl.addWidget(self.lt_count)
+
+        recent_lbl = QLabel("Recent Saved Items")
+        recent_lbl.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        ltl.addWidget(recent_lbl)
+
+        self.lt_recent = QTextEdit()
+        self.lt_recent.setReadOnly(True)
+        self.lt_recent.setMaximumHeight(150)
+        self.lt_recent.setPlaceholderText("Recent long-term memories will appear here...")
+        ltl.addWidget(self.lt_recent)
+
+        recent_btn_row = QHBoxLayout()
+        show_recent_btn = QPushButton("Show Recent")
+        show_recent_btn.setObjectName("secondaryBtn")
+        show_recent_btn.clicked.connect(self._refresh_long_term_recent)
+        recent_btn_row.addWidget(show_recent_btn)
+        recent_btn_row.addStretch()
+        ltl.addLayout(recent_btn_row)
+
+        delete_row = QHBoxLayout()
+        self.lt_delete_select = QComboBox()
+        self.lt_delete_select.setMinimumWidth(200)
+        delete_row.addWidget(self.lt_delete_select, stretch=1)
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.setObjectName("secondaryBtn")
+        delete_btn.clicked.connect(self._delete_selected_long_term)
+        delete_row.addWidget(delete_btn)
+        ltl.addLayout(delete_row)
 
         search_row = QHBoxLayout()
         self.lt_search = QLineEdit()
@@ -145,7 +166,6 @@ class MemoryTab(QScrollArea):
         self.lt_results.setPlaceholderText("Search results will appear here...")
         ltl.addWidget(self.lt_results)
 
-        # Manual note
         note_row = QHBoxLayout()
         self.lt_note = QLineEdit()
         self.lt_note.setPlaceholderText("Save a note to long-term memory...")
@@ -173,21 +193,20 @@ class MemoryTab(QScrollArea):
         layout.addStretch()
         self.setWidget(container)
 
-        # Auto-refresh both views whenever a chat round-trip completes
         self.event_bus.chat_complete.connect(self._on_chat_complete)
-        # Check Docker status once on first connection
         self.event_bus.connection_changed.connect(self._on_connected)
 
     def _on_chat_complete(self, _text):
-        """Triggered after each assistant reply — refresh memory displays."""
         self._refresh_short_term()
         self._refresh_stats()
+        self._refresh_long_term_recent()
 
     def _on_connected(self, connected):
         if connected:
             self._check_docker_status()
-
-    # --- Actions ---
+            self._refresh_short_term()
+            self._refresh_stats()
+            self._refresh_long_term_recent()
 
     def _refresh_short_term(self):
         try:
@@ -205,7 +224,7 @@ class MemoryTab(QScrollArea):
                     role = e.get("role", "?")
                     ts = e.get("timestamp", "")[:19]
                     content = e.get("content", "")[:120]
-                    meta = e.get("metadata", {})
+                    meta = e.get("metadata", {}) or {}
                     emo = meta.get("emotion", "")
                     emo_str = f" [{emo}]" if emo else ""
                     lines.append(f"[{ts}] {role}{emo_str}: {content}")
@@ -244,6 +263,50 @@ class MemoryTab(QScrollArea):
         except Exception:
             pass
 
+    def _refresh_long_term_recent(self):
+        try:
+            import requests
+            r = requests.get(
+                f"{self.client.BASE_URL}/api/memory/long",
+                params={"limit": max(10, self.max_results.value() * 4)},
+                timeout=3,
+            )
+            if not r.ok:
+                return
+            entries = r.json()
+            if not entries:
+                self.lt_recent.setPlainText("No long-term entries saved yet.")
+                self.lt_delete_select.clear()
+                return
+            lines = []
+            self.lt_delete_select.clear()
+            for e in reversed(entries):
+                entry_id = str(e.get("id", "")).strip()
+                ts = e.get("timestamp", "")[:19]
+                cat = e.get("category", e.get("role", "?"))
+                content = e.get("content", "")[:220]
+                meta = e.get("metadata", {}) or {}
+                preview = content.replace("\n", " ")
+                if len(preview) > 74:
+                    preview = preview[:71] + "..."
+                if entry_id:
+                    self.lt_delete_select.addItem(
+                        f"[{ts}] ({cat}) {preview}",
+                        userData=entry_id,
+                    )
+                if cat == "person_profile":
+                    pname = meta.get("name", "")
+                    rel = meta.get("relation", "contact")
+                    imp = meta.get("importance", 0.0)
+                    lines.append(
+                        f"[{ts}] ({cat}) id={entry_id} {pname} / {rel} / importance={imp}\n{content}"
+                    )
+                else:
+                    lines.append(f"[{ts}] ({cat}) id={entry_id} {content}")
+            self.lt_recent.setPlainText("\n\n".join(lines))
+        except Exception as ex:
+            self.lt_recent.setPlainText(f"Error: {ex}")
+
     def _search_long_term(self):
         query = self.lt_search.text().strip()
         if not query:
@@ -262,10 +325,11 @@ class MemoryTab(QScrollArea):
                 else:
                     lines = []
                     for e in results:
+                        entry_id = str(e.get("id", "")).strip()
                         ts = e.get("timestamp", "")[:19]
                         cat = e.get("category", e.get("role", "?"))
-                        content = e.get("content", "")[:200]
-                        lines.append(f"[{ts}] ({cat}) {content}")
+                        content = e.get("content", "")[:220]
+                        lines.append(f"[{ts}] ({cat}) id={entry_id} {content}")
                     self.lt_results.setPlainText("\n\n".join(lines))
         except Exception as ex:
             self.lt_results.setPlainText(f"Error: {ex}")
@@ -283,6 +347,7 @@ class MemoryTab(QScrollArea):
             )
             self.lt_note.clear()
             self._refresh_stats()
+            self._refresh_long_term_recent()
         except Exception:
             pass
 
@@ -293,9 +358,27 @@ class MemoryTab(QScrollArea):
                 f"{self.client.BASE_URL}/api/memory/long/clear", timeout=3
             )
             self.lt_results.clear()
+            self.lt_recent.clear()
+            self.lt_delete_select.clear()
             self.lt_count.setText("Entries: 0")
         except Exception:
             pass
+
+    def _delete_selected_long_term(self):
+        entry_id = str(self.lt_delete_select.currentData() or "").strip()
+        if not entry_id:
+            return
+        try:
+            import requests
+            requests.post(
+                f"{self.client.BASE_URL}/api/memory/long/delete",
+                json={"id": entry_id},
+                timeout=3,
+            )
+            self._refresh_stats()
+            self._refresh_long_term_recent()
+        except Exception as ex:
+            self.lt_results.setPlainText(f"Delete error: {ex}")
 
     def _check_docker_status(self):
         try:
@@ -303,23 +386,30 @@ class MemoryTab(QScrollArea):
             r = requests.get(
                 f"{self.client.BASE_URL}/api/memory/docker/status", timeout=3
             )
-            if r.ok:
-                d = r.json()
-                if d.get("redis_available"):
-                    host = d.get("redis_host", "127.0.0.1")
-                    port = d.get("redis_port", 6379)
-                    count = d.get("long_term_count", 0)
-                    self.docker_status.setText(
-                        f"Redis (Docker): Connected  {host}:{port} — "
-                        f"{count} entries  [backend: redis]"
-                    )
-                    self.docker_status.setStyleSheet("color: #4ade80;")
-                else:
-                    self.docker_status.setText(
-                        "Redis (Docker): Offline — using local .jsonl files  "
-                        "(run: docker compose up -d)"
-                    )
-                    self.docker_status.setStyleSheet("color: #f59e0b;")
+            if not r.ok:
+                return
+            d = r.json()
+            count = d.get("long_term_count", 0)
+            profile = d.get("profile", "default")
+            if d.get("redis_available"):
+                host = d.get("redis_host", "127.0.0.1")
+                port = d.get("redis_port", 6379)
+                self.docker_status.setText(
+                    f"Redis (Docker): Connected {host}:{port} | entries={count} | profile={profile}"
+                )
+                self.docker_status.setStyleSheet("color: #4ade80;")
+            elif d.get("memory_online", False):
+                local_file = d.get("local_file", "")
+                self.docker_status.setText(
+                    "Memory backend: ONLINE (local file fallback). "
+                    f"entries={count} | profile={profile}\n{local_file}"
+                )
+                self.docker_status.setStyleSheet("color: #4ade80;")
+            else:
+                self.docker_status.setText(
+                    "Memory backend: Unavailable (Redis + local fallback both failed)."
+                )
+                self.docker_status.setStyleSheet("color: #f87171;")
         except Exception as ex:
             self.docker_status.setText(f"Docker check error: {ex}")
             self.docker_status.setStyleSheet("color: #f87171;")

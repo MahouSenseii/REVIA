@@ -51,6 +51,9 @@ class TopBar(QFrame):
 
     def _on_telemetry(self, data):
         sys_data = data.get("system", {})
+        llm_state = ((data.get("llm_connection", {}) or {}).get("state") or "").strip()
+        readiness = data.get("conversation_readiness", {}) or {}
+        runtime_state = (data.get("state") or "").strip()
         model = sys_data.get("model", "---")
         if model and model != "None":
             self.model_pill.setText(f"Model: {model}")
@@ -86,11 +89,27 @@ class TopBar(QFrame):
             f"GPU: {sys_data.get('gpu_percent', 0):.0f}%"
         )
 
+        if readiness.get("ready", False):
+            self.set_health("Ready")
+        elif llm_state == "Connecting" or runtime_state in ("Booting", "Initializing", "Cooldown", "Thinking"):
+            self.set_health("Connecting")
+        elif llm_state == "Error" or runtime_state == "Error":
+            self.set_health("Error")
+        elif llm_state == "Disconnected":
+            self.set_health("Offline")
+
     def set_health(self, status):
         self.health_pill.setText(f"Health: {status}")
-        if status == "Online":
+        if status in ("Online", "Ready"):
             self.health_pill.setObjectName("healthPillOnline")
+        elif status == "Error":
+            self.health_pill.setObjectName("healthPill")
+            self.health_pill.setStyleSheet("color: #cc3040;")
+        elif status == "Connecting":
+            self.health_pill.setObjectName("healthPill")
+            self.health_pill.setStyleSheet("color: #ccaa00;")
         else:
             self.health_pill.setObjectName("healthPill")
+            self.health_pill.setStyleSheet("")
         self.health_pill.style().unpolish(self.health_pill)
         self.health_pill.style().polish(self.health_pill)

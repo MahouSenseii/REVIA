@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QInputDialog, QMessageBox,
 )
 from PySide6.QtGui import QFont
+from PySide6.QtCore import QTimer
 
 PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
 
@@ -99,7 +100,7 @@ class ProfileTab(QScrollArea):
         bg.addRow("Fallback Msg:", self.fallback_msg)
 
         self.greeting = QLineEdit(
-            "Hello! I'm Revia, your neural assistant."
+            "Hey, I am Revia. I am online and ready."
         )
         bg.addRow("Greeting:", self.greeting)
 
@@ -176,6 +177,8 @@ class ProfileTab(QScrollArea):
 
         layout.addStretch()
         self.setWidget(container)
+        self.event_bus.connection_changed.connect(self._on_core_connection)
+        QTimer.singleShot(1200, lambda: self._on_core_connection(True))
 
     # --- Helpers ---
 
@@ -316,3 +319,18 @@ class ProfileTab(QScrollArea):
         )
         if path:
             self.voice_path.setText(path)
+
+    def _on_core_connection(self, connected):
+        if not connected:
+            return
+        self._load_from_core()
+
+    def _load_from_core(self):
+        data = self.client.get_profile() or {}
+        if not data:
+            return
+        self._apply(data)
+        name = data.get("character_name", "default").strip() or "default"
+        self.profile_name.setText(name)
+        self.profile_status.setText("Loaded profile from core.")
+        self.profile_status.setStyleSheet("color: #00aa40;")
