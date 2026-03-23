@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "REVIA Controller (GUI)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["revia_controller_py/main.py"],
+      "port": 8123
+    },
+    {
+      "name": "REVIA Core (Python Server)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["revia_core_py/core_server.py"],
+      "port": 8123
+    },
+    {
+      "name": "llama.cpp LLM Server",
+      "runtimeExecutable": "C:/Users/USER/Downloads/llama-b8089-bin-win-cuda-12.4-x64/llama-server.exe",
+      "runtimeArgs": [
+        "--model", "C:/Users/USER/Downloads/Qwen2.5-Omni-7B-Q5_K_S.gguf",
+        "--port", "8080",
+        "--ctx-size", "4096",
+        "--n-gpu-layers", "-1",
+        "--batch-size", "511"
+      ],
+      "port": 8080
+    }
+  ]
+}
