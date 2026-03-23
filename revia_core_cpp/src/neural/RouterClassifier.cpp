@@ -2,9 +2,12 @@
 #include <chrono>
 #include <algorithm>
 #include <thread>
-#include <cstdlib>
+#include <random>
 
 namespace revia {
+
+// Thread-local Mersenne Twister — avoids the data races inherent in std::rand().
+static thread_local std::mt19937 tl_rng{std::random_device{}()};
 
 RouterOutput RouterClassifier::classify(const std::string& text, const std::string&,
                                          const EmotionOutput&) {
@@ -35,7 +38,11 @@ RouterOutput RouterClassifier::classify(const std::string& text, const std::stri
         out = {"chat", 0.92f, "", false, 0.2f, 0.0};
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(3 + std::rand() % 8));
+    // Confidence threshold: fall back to chat if uncertain
+    if (out.confidence < 0.65f) {
+        out.mode = "chat";
+        out.suggested_tool = "";
+    }
 
     auto end = std::chrono::high_resolution_clock::now();
     out.inference_ms = std::chrono::duration<double, std::milli>(end - start).count();

@@ -86,7 +86,13 @@ class RuntimeStateSync(QObject):
         if self.assistant_status_manager is not None:
             return self.assistant_status_manager.build_runtime_config_snapshot()
 
-        telemetry = dict(self._last_telemetry or {})
+        try:
+            # Snapshot access must be thread-safe; Qt signal emissions from other threads
+            # may modify _last_telemetry concurrently. This try-except is a safety net.
+            telemetry = dict(self._last_telemetry or {})
+        except (RuntimeError, RecursionError) as exc:
+            # Catch Qt thread safety or recursion issues
+            telemetry = {}
         emotion = telemetry.get("emotion", {}) or {}
         state = str(telemetry.get("state", "Idle") or "Idle")
 
@@ -118,7 +124,8 @@ class RuntimeStateSync(QObject):
 
         active_profile = ""
         try:
-            active_profile = self.voice_tab.voice_mgr.active_profile.name
+            voice_mgr = getattr(self.voice_tab, "voice_mgr", None)
+            active_profile = getattr(getattr(voice_mgr, "active_profile", None), "name", "")
         except Exception:
             active_profile = ""
 
@@ -151,7 +158,12 @@ class RuntimeStateSync(QObject):
             ),
             "emotion_mode_enabled": self.system_tab.emotion_toggle.isChecked(),
             "current_emotion": str(emotion.get("label", "Neutral") or "Neutral"),
-            "tool_access_enabled": self.system_tab.websearch_toggle.isChecked(),
+            # tool_access_enabled reflects whether *any* tool is active, not
+            # just web-search, so the core can gate tool use correctly.
+            "tool_access_enabled": (
+                self.system_tab.websearch_toggle.isChecked()
+                or self.system_tab.router_toggle.isChecked()
+            ),
             "tool_modes": {
                 "web_search": self.system_tab.websearch_toggle.isChecked(),
                 "router": self.system_tab.router_toggle.isChecked(),

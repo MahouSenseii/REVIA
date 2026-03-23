@@ -3,6 +3,14 @@ from __future__ import annotations
 import threading
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """Safely convert a value to float with a default fallback."""
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 class RuntimeStatusManager:
     def __init__(
         self,
@@ -78,12 +86,22 @@ class RuntimeStatusManager:
             "tts_error": "",
         }
 
+    # Whitelist of allowed runtime config keys
+    _ALLOWED_CONFIG_KEYS = frozenset({
+        "online_enabled", "web_search_enabled", "safety_filter_enabled",
+        "tool_access_enabled", "voice_output_enabled", "memory_enabled",
+        "emotion_mode_enabled", "active_persona_profile_name", "ui_state",
+        "tts_engine", "stt_enabled", "vision_enabled", "continuous_audio_enabled",
+        "proactive_mode", "fast_mode", "debug_mode",
+    })
+
     def update_runtime_config(self, data: dict | None):
         if not isinstance(data, dict):
             return
         with self._lock:
             for key, value in data.items():
-                self._controller_state[key] = value
+                if key in self._ALLOWED_CONFIG_KEYS:
+                    self._controller_state[key] = value
         self._log(
             "Runtime config updated | "
             + ", ".join(
@@ -194,13 +212,13 @@ class RuntimeStatusManager:
             )
             lines.append(
                 f"- STT status: {status.get('stt_state', 'Disabled')}"
-                f" | listen={float(status.get('stt_last_listen_duration', 0.0) or 0.0):.2f}s"
-                f" | process={float(status.get('stt_last_processing_duration', 0.0) or 0.0):.2f}s"
+                f" | listen={_safe_float(status.get('stt_last_listen_duration', 0.0) or 0.0):.2f}s"
+                f" | process={_safe_float(status.get('stt_last_processing_duration', 0.0) or 0.0):.2f}s"
             )
             lines.append(
                 f"- TTS status: {status.get('tts_state', 'Disabled')}"
-                f" | generation={float(status.get('tts_last_generation_duration', 0.0) or 0.0):.2f}s"
-                f" | playback={float(status.get('tts_last_playback_duration', 0.0) or 0.0):.2f}s"
+                f" | generation={_safe_float(status.get('tts_last_generation_duration', 0.0) or 0.0):.2f}s"
+                f" | playback={_safe_float(status.get('tts_last_playback_duration', 0.0) or 0.0):.2f}s"
             )
 
         if include_full or wants_status or "memory" in low:
@@ -278,9 +296,9 @@ class RuntimeStatusManager:
             return (
                 f"STT is currently {status.get('stt_state', 'Disabled')}, "
                 f"with the last listen time at "
-                f"{float(status.get('stt_last_listen_duration', 0.0) or 0.0):.2f}s "
+                f"{_safe_float(status.get('stt_last_listen_duration', 0.0) or 0.0):.2f}s "
                 f"and processing time at "
-                f"{float(status.get('stt_last_processing_duration', 0.0) or 0.0):.2f}s."
+                f"{_safe_float(status.get('stt_last_processing_duration', 0.0) or 0.0):.2f}s."
             )
         if "memory" in low:
             return (

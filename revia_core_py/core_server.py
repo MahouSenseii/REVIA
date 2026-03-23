@@ -1,4 +1,4 @@
-﻿"""
+"""
 REVIA Core -- Pure-Python standalone server.
 Drop-in replacement for the C++ core. Same REST + WebSocket API.
 
@@ -14,6 +14,9 @@ from pathlib import Path
 
 # Make the integrations package importable when running from any CWD
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Sentence boundary detection for streaming TTS (compiled once at module level)
+_SENTENCE_ENDERS = re.compile(r'[.!?]+["\')\]]?\s|[\n]')
 
 try:
     import psutil as _psutil
@@ -60,11 +63,11 @@ except ImportError:
             def mount(self, *a, **kw): pass
             def post(self, url, json=None, stream=False, timeout=None, headers=None):
                 raise _RequestsShim.exceptions.ConnectionError(
-                    f"requests not installed â€” cannot POST to {url}"
+                    f"requests not installed -- cannot POST to {url}"
                 )
             def get(self, url, params=None, timeout=None):
                 raise _RequestsShim.exceptions.ConnectionError(
-                    f"requests not installed â€” cannot GET {url}"
+                    f"requests not installed -- cannot GET {url}"
                 )
         class adapters:
             class HTTPAdapter:
@@ -86,6 +89,7 @@ from conversation_runtime import (
     TriggerRequest,
     TriggerSource,
 )
+from profile_engine import ProfileEngine
 from prompt_assembly import CharacterProfileManager, PromptAssemblyManager
 from runtime_models import (
     AssistantResponse,
@@ -94,31 +98,41 @@ from runtime_models import (
     TurnManager,
 )
 from runtime_status import RuntimeStatusManager
+from vllm_backend import VLLMEnhancer, VLLMGenerateResult, classify_prompt_complexity
 
 # ---------------------------------------------------------------------------
 # Optional Redis client for Docker-backed long-term memory
 # ---------------------------------------------------------------------------
 
 _redis_client = None
+_redis_lock = threading.Lock()
 
 def _init_redis():
     global _redis_client
-    try:
-        import redis as _redis_mod
-        host = os.environ.get("REDIS_HOST", "127.0.0.1")
-        port = int(os.environ.get("REDIS_PORT", "6379"))
-        c = _redis_mod.Redis(
-            host=host, port=port,
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-        )
-        c.ping()
-        _redis_client = c
-        print(f"[REVIA Core] Redis connected at {host}:{port} â€” long-term memory backed by Docker.")
-    except Exception as e:
-        print(f"[REVIA Core] Redis unavailable ({e}). Using local .jsonl files for long-term memory.")
-        _redis_client = None
+    with _redis_lock:
+        if _redis_client is not None:
+            return  # Already initialized
+        try:
+            import redis as _redis_mod
+            host = os.environ.get("REDIS_HOST", "127.0.0.1")
+            port = int(os.environ.get("REDIS_PORT", "6379"))
+            c = _redis_mod.Redis(
+                host=host, port=port,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            c.ping()
+            _redis_client = c
+            print(f"[REVIA Core] Redis connected at {host}:{port} -- long-term memory backed by Docker.")
+        except Exception as e:
+            print(f"[REVIA Core] Redis unavailable ({e}). Using local .jsonl files for long-term memory.")
+            _redis_client = None
+
+def _get_redis():
+    """Thread-safe accessor for the Redis client."""
+    with _redis_lock:
+        return _redis_client
 
 _init_redis()
 
@@ -126,11 +140,12 @@ _init_redis()
 # Emotion history (in-memory ring buffer)
 # ---------------------------------------------------------------------------
 
-_emotion_history = []
+_emotion_history = deque(maxlen=100)  # Thread-safe bounded ring buffer
+_emotion_history_lock = threading.Lock()
 _EMOTION_HISTORY_MAX = 100
 
 def _record_emotion(emo):
-    """Append emotion reading to the ring buffer."""
+    """Append emotion reading to the ring buffer. Thread-safe."""
     probs = {}
     raw_probs = emo.get("emotion_probs", {})
     if isinstance(raw_probs, dict):
@@ -168,14 +183,15 @@ def _record_emotion(emo):
         "temporal": emo.get("temporal", {}),
         "model": emo.get("model", "affective_fusion_v2"),
     }
-    _emotion_history.append(entry)
-    if len(_emotion_history) > _EMOTION_HISTORY_MAX:
-        del _emotion_history[:-_EMOTION_HISTORY_MAX]
+    with _emotion_history_lock:
+        _emotion_history.append(entry)
+        # deque(maxlen=100) auto-evicts oldest -- no manual trimming needed
 
 
 _gpu_stats_cache = {"gpu_percent": 0.0, "vram_used_mb": 0.0, "vram_total_mb": 0.0}
 _gpu_stats_cache_ts = 0.0
 _gpu_stats_retry_after = 0.0
+_gpu_stats_lock = threading.Lock()
 _GPU_STATS_TTL_S = 4.0
 _GPU_STATS_FAIL_BACKOFF_S = 10.0
 
@@ -183,10 +199,11 @@ _GPU_STATS_FAIL_BACKOFF_S = 10.0
 def _get_gpu_stats():
     global _gpu_stats_cache_ts, _gpu_stats_cache, _gpu_stats_retry_after
     now = time.monotonic()
-    if now < _gpu_stats_retry_after:
-        return dict(_gpu_stats_cache)
-    if (now - _gpu_stats_cache_ts) < _GPU_STATS_TTL_S:
-        return dict(_gpu_stats_cache)
+    with _gpu_stats_lock:
+        if now < _gpu_stats_retry_after:
+            return dict(_gpu_stats_cache)
+        if (now - _gpu_stats_cache_ts) < _GPU_STATS_TTL_S:
+            return dict(_gpu_stats_cache)
     try:
         out = subprocess.check_output(
             ["nvidia-smi",
@@ -194,17 +211,19 @@ def _get_gpu_stats():
              "--format=csv,noheader,nounits"],
             timeout=3, stderr=subprocess.DEVNULL,
         ).decode().strip().split(",")
-        _gpu_stats_cache = {
-            "gpu_percent": float(out[0]),
-            "vram_used_mb": float(out[1]),
-            "vram_total_mb": float(out[2]),
-        }
-        _gpu_stats_cache_ts = now
-        _gpu_stats_retry_after = now + _GPU_STATS_TTL_S
-        return dict(_gpu_stats_cache)
+        with _gpu_stats_lock:
+            _gpu_stats_cache = {
+                "gpu_percent": float(out[0]),
+                "vram_used_mb": float(out[1]),
+                "vram_total_mb": float(out[2]),
+            }
+            _gpu_stats_cache_ts = now
+            _gpu_stats_retry_after = now + _GPU_STATS_TTL_S
+            return dict(_gpu_stats_cache)
     except Exception:
-        _gpu_stats_retry_after = now + _GPU_STATS_FAIL_BACKOFF_S
-        return dict(_gpu_stats_cache)
+        with _gpu_stats_lock:
+            _gpu_stats_retry_after = now + _GPU_STATS_FAIL_BACKOFF_S
+            return dict(_gpu_stats_cache)
 
 
 def _get_system_stats():
@@ -262,7 +281,10 @@ class TelemetryEngine:
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
         fname = log_dir / f"telemetry_{datetime.now():%Y%m%d}.jsonl"
-        self._log = open(fname, "a", encoding="utf-8")
+        try:
+            self._log = open(fname, "a", encoding="utf-8")
+        except Exception:
+            self._log = None
 
         self._stats_thread = threading.Thread(
             target=self._stats_loop, daemon=True
@@ -286,6 +308,19 @@ class TelemetryEngine:
             time.sleep(2)
             self._refresh_system_stats()
 
+    def close(self):
+        """Flush and close the telemetry log file."""
+        with self._lock:
+            if self._log and not self._log.closed:
+                try:
+                    self._log.flush()
+                    self._log.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
+        self.close()
+
     def begin_span(self, stage, device="CPU"):
         return {
             "stage": stage, "device": device,
@@ -298,10 +333,11 @@ class TelemetryEngine:
         span["duration_ms"] = now_ms - span["start_ms"]
         with self._lock:
             self.spans.append(span)  # deque auto-evicts oldest when full
-            self._log.write(_json_dumps_compact(span) + "\n")
-            self._flush_counter += 1
-            if self._flush_counter >= 10:
-                self._log.flush()
+            if self._log and not self._log.closed:
+                self._log.write(_json_dumps_compact(span) + "\n")
+                self._flush_counter += 1
+                if self._flush_counter >= 10:
+                    self._log.flush()
                 self._flush_counter = 0
 
     def snapshot(self):
@@ -340,6 +376,11 @@ prompt_assembly_manager = PromptAssemblyManager(
 turn_manager = TurnManager(log_fn=_revia_log)
 
 # ---------------------------------------------------------------------------
+# PRD §4 -- Profile Engine (canonical source for all behavioral parameters)
+# ---------------------------------------------------------------------------
+profile_engine = ProfileEngine(log_fn=_revia_log)
+
+# ---------------------------------------------------------------------------
 # LLM Backend -- routes to local (llama.cpp server) or online API
 # ---------------------------------------------------------------------------
 
@@ -357,7 +398,7 @@ class LLMBackend:
     def __init__(self):
         self._lock = threading.Lock()          # protects attribute mutation
         self._generate_lock = threading.Lock() # serializes all LLM generations
-        # Persistent HTTP session â€” reuses TCP connections for lower latency
+        # Persistent HTTP session -- reuses TCP connections for lower latency
         self._session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=4, pool_maxsize=8, max_retries=0
@@ -391,8 +432,20 @@ class LLMBackend:
         self._connection_error = ""
         self._connection_error_ts = 0.0
         self._last_ready_ts = 0.0
-        # Per-platform conversation isolation â€” Discord and Twitch get their own
+        # Per-platform conversation isolation -- Discord and Twitch get their own
         # history so their chat context never bleeds into each other or the GUI.
+        self._interrupted = False
+        # vLLM enhanced inference (PRD §18)
+        self._vllm = VLLMEnhancer(
+            session=self._session,
+            log_fn=_revia_log,
+            interrupt_check=self._is_interrupted,
+        )
+        self._vllm_enabled = True   # User can toggle via /api/model/config
+        self._vllm_logprobs = 5     # Collect top-5 logprobs for confidence scoring
+        self._vllm_best_of = 1      # best-of-N sampling (1 = disabled)
+        self._vllm_repetition_penalty = 1.05  # Slight penalty to reduce loops
+        self._vllm_min_tokens = 0    # Minimum tokens before stopping
         self._platform_conversations = {"discord": [], "twitch": []}
         # Platform-aware hints injected into the system prompt for each platform
         self._platform_hints = {
@@ -403,10 +456,25 @@ class LLMBackend:
             ),
             "twitch": (
                 "\n\n[Platform: Twitch live chat. You are part of a live stream. "
-                "Keep replies SHORT â€” ideally one sentence, two at most. "
+                "Keep replies SHORT -- ideally one sentence, two at most. "
                 "Be upbeat, engaging, and entertaining. No markdown.]"
             ),
         }
+
+    def request_interrupt(self):
+        """Signal the LLM to stop generating tokens immediately. Thread-safe."""
+        with self._lock:
+            self._interrupted = True
+
+    def clear_interrupt(self):
+        """Reset the interrupt flag before a new generation. Thread-safe."""
+        with self._lock:
+            self._interrupted = False
+
+    def _is_interrupted(self):
+        """Check if interrupt has been requested. Thread-safe."""
+        with self._lock:
+            return self._interrupted
 
     def configure(self, cfg):
         with self._lock:
@@ -437,6 +505,18 @@ class LLMBackend:
             if sp:
                 self.system_prompt = sp
             self._local_health_cache = {"ok": False, "ts": 0.0}
+
+            # vLLM enhanced inference options (PRD §18)
+            self._vllm_enabled = bool(cfg.get("vllm_enhanced", self._vllm_enabled))
+            self._vllm_logprobs = int(cfg.get("vllm_logprobs", self._vllm_logprobs))
+            self._vllm_best_of = int(cfg.get("vllm_best_of", self._vllm_best_of))
+            self._vllm_repetition_penalty = float(
+                cfg.get("vllm_repetition_penalty", self._vllm_repetition_penalty)
+            )
+            self._vllm_min_tokens = int(cfg.get("vllm_min_tokens", self._vllm_min_tokens))
+            # Invalidate vLLM probe cache when server URL changes
+            if "local_server_url" in cfg:
+                self._vllm.invalidate_cache()
 
             model_name = self.api_model or os.path.basename(self.local_path) or "None"
             telemetry.system["model"] = model_name
@@ -485,6 +565,12 @@ class LLMBackend:
                 "api_endpoint": self.api_endpoint,
                 "temperature": self.temperature, "max_tokens": self.max_tokens,
                 "fast_mode": self.fast_mode,
+                # vLLM enhanced options (PRD §18)
+                "vllm_enhanced": self._vllm_enabled,
+                "vllm_logprobs": self._vllm_logprobs,
+                "vllm_best_of": self._vllm_best_of,
+                "vllm_repetition_penalty": self._vllm_repetition_penalty,
+                "vllm_min_tokens": self._vllm_min_tokens,
             }
 
     def _set_connection_state(self, state, detail="", error=""):
@@ -582,11 +668,32 @@ class LLMBackend:
         return ok
 
     def _trim_conversation(self, conversation):
+        """Trim conversation history while preserving maximum context.
+
+        Neuro-Sama-class companions need 40-60+ turns of context for
+        personality consistency and long-term coherence. We keep as much
+        as the context window allows.
+        """
         convo = list(conversation or [])
-        if self.fast_mode and len(convo) > 20:
-            return convo[-14:]
-        if len(convo) > 40:
-            return convo[-30:]
+        # Estimate tokens roughly: avg ~30 tokens per message
+        est_tokens = sum(len(str(m.get("content", "")).split()) for m in convo)
+        ctx_budget = int(self.ctx_length * 0.65)  # Reserve 35% for system prompt + generation
+
+        # If within budget, keep everything
+        if est_tokens <= ctx_budget:
+            return convo
+
+        # Trim oldest messages until within budget, keeping at least last 60 messages
+        min_keep = 80 if not self.fast_mode else 50
+        while len(convo) > min_keep and est_tokens > ctx_budget:
+            removed = convo.pop(0)
+            est_tokens -= len(str(removed.get("content", "")).split())
+
+        # Hard limits as safety net
+        if self.fast_mode and len(convo) > 80:
+            return convo[-50:]
+        if len(convo) > 120:
+            return convo[-80:]
         return convo
 
     def commit_turn_to_history(self, user_text, assistant_text):
@@ -635,12 +742,31 @@ class LLMBackend:
             user_text=user_text,
             include_full=str(response_mode) == ResponseMode.SYSTEM_STATUS_RESPONSE.value,
         )
+        # Auto-inject vision context if camera/YOLO descriptions are available
+        vision_context = ""
+        if hasattr(self, '_vision_context') and self._vision_context:
+            vision_context = f"[Visual context: {self._vision_context}]"
+
+        # PRD §4 -- Pull behavioral parameters from ProfileEngine so the LLM
+        # gets verbosity, humor, sarcasm, emotion intensity, mood, etc.
+        _pe_profile = profile_engine.current()
+        behavior_params = {
+            **_pe_profile.get("behavior", {}),
+            **_pe_profile.get("emotion", {}),
+        }
+        # Inject personality data: mood baseline (quirks/freq handled by prompt_assembly)
+        mood_baseline = profile.get("mood_baseline", _pe_profile.get("mood_baseline", ""))
+        if mood_baseline:
+            behavior_params["mood_baseline"] = mood_baseline
+
         system_text = prompt_assembly_manager.build_full_prompt_context(
             profile=profile,
             runtime_context=runtime_context,
             memory_context=mem_ctx,
             emotion_context=emotion_context,
             response_mode=str(response_mode or ResponseMode.NORMAL_RESPONSE.value),
+            vision_context=vision_context,
+            behavior_params=behavior_params,
         )
         messages = [{"role": "system", "content": system_text}]
 
@@ -675,6 +801,8 @@ class LLMBackend:
         response_mode=ResponseMode.NORMAL_RESPONSE.value,
     ):
         with self._generate_lock:
+            # Reset interrupt flag from any previous request
+            self.clear_interrupt()
             with self._lock:
                 source = self.source
                 base_conversation = list(self.conversation)
@@ -723,7 +851,7 @@ class LLMBackend:
                 return self._call_anthropic(endpoint, messages, broadcast_fn)
             return self._call_openai_compat(endpoint, messages, broadcast_fn)
         except requests.exceptions.Timeout:
-            detail = "My online model did not respond in time, so I could not complete that answer."
+            detail = "Ugh, my brain just froze for a sec... what were we talking about?"
             self._note_connection_error(detail)
             return AssistantResponse(
                 text=detail,
@@ -786,6 +914,10 @@ class LLMBackend:
         with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                # Check for interrupt before processing each token
+                if self._is_interrupted():
+                    _revia_log("LLM generation interrupted by user")
+                    break
                 if not line or not line.startswith(b"data: "):
                     continue
                 payload = line[6:]
@@ -814,7 +946,7 @@ class LLMBackend:
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
         if not full_text.strip():
             return AssistantResponse(
-                text="My model returned an empty reply, so I could not complete that answer.",
+                text="Hmm, my response came out empty. That's weird.",
                 response_mode=ResponseMode.ERROR_RESPONSE.value,
                 success=False,
                 error_type="empty_response",
@@ -857,6 +989,10 @@ class LLMBackend:
         with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                # Check for interrupt before processing each token (thread-safe)
+                if self._is_interrupted():
+                    _revia_log("Anthropic generation interrupted by user")
+                    break
                 if not line or not line.startswith(b"data: "):
                     continue
                 try:
@@ -878,7 +1014,7 @@ class LLMBackend:
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
         if not full_text.strip():
             return AssistantResponse(
-                text="My model returned an empty reply, so I could not complete that answer.",
+                text="Hmm, my response came out empty. That's weird.",
                 response_mode=ResponseMode.ERROR_RESPONSE.value,
                 success=False,
                 error_type="empty_response",
@@ -938,6 +1074,74 @@ class LLMBackend:
                             )
                         break
 
+            # ── vLLM Enhanced Path (PRD §18) ─────────────────────────────
+            # vLLM is only engaged when ALL conditions are met:
+            #   1. vLLM enhanced mode is enabled
+            #   2. CUDA is the active backend (vLLM requires GPU)
+            #   3. The server actually IS vLLM
+            #   4. The prompt is complex, long-context, or needs heavier inference
+            _cuda_active = self.local_backend.upper() in ("CUDA", "GPU")
+            _vllm_candidate = (
+                self._vllm_enabled
+                and _cuda_active
+                and self._vllm.probe(base_url)
+            )
+            if _vllm_candidate:
+                classification = classify_prompt_complexity(
+                    messages,
+                    user_text=text,
+                    cuda_available=_cuda_active,
+                )
+                _revia_log(
+                    f"[vLLM] Routing decision: use_vllm={classification.should_use_vllm} | "
+                    f"score={classification.complexity_score:.2f} | "
+                    f"ctx_tokens={classification.estimated_context_tokens} | "
+                    f"{classification.reason}"
+                )
+            else:
+                classification = None
+
+            if _vllm_candidate and classification and classification.should_use_vllm:
+                vr = self._vllm.generate(
+                    base_url,
+                    messages,
+                    broadcast_fn,
+                    model=model_name or "default",
+                    temperature=self.temperature,
+                    max_tokens=int(self.max_tokens),
+                    top_p=self.top_p,
+                    fast_mode=self.fast_mode,
+                    logprobs=self._vllm_logprobs,
+                    best_of=self._vllm_best_of,
+                    repetition_penalty=self._vllm_repetition_penalty,
+                    min_tokens=self._vllm_min_tokens,
+                    lora_adapter=self._vllm.get_active_lora(base_url) or None,
+                )
+                if vr.success and vr.text:
+                    # Feed exact token counts into telemetry
+                    telemetry.llm["tokens_generated"] = vr.metrics.completion_tokens
+                    telemetry.llm["tokens_per_second"] = round(vr.metrics.tokens_per_second, 1)
+                    telemetry.llm["context_length"] = vr.metrics.total_tokens
+                    telemetry.llm["ttft_ms"] = round(vr.metrics.time_to_first_token_ms, 1)
+                    if model_name:
+                        telemetry.system["model"] = model_name
+                    self._note_connection_ready(f"vLLM ({model_name or 'default'}) OK")
+                    return AssistantResponse(text=vr.text)
+                elif vr.success and not vr.text:
+                    detail = f"vLLM returned empty ({vr.finish_reason})"
+                    self._note_connection_error(detail)
+                    return AssistantResponse(
+                        text="Hmm, my local model returned an empty reply.",
+                        response_mode=ResponseMode.ERROR_RESPONSE.value,
+                        success=False, error_type="empty_response",
+                        retryable=True, speakable=False,
+                        commit_to_history=False, commit_to_memory=False,
+                    )
+                else:
+                    # vLLM call failed -- fall through to standard path
+                    _revia_log(f"[vLLM] Enhanced path failed: {vr.error}; falling back to standard")
+
+            # ── Standard OpenAI-compat Path ──────────────────────────────
             body = {
                 "model": model_name or "default",
                 "messages": messages,
@@ -1008,6 +1212,10 @@ class LLMBackend:
 
             with resp:
                 for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                    # Check for interrupt before processing each token (thread-safe)
+                    if self._is_interrupted():
+                        _revia_log("Local LLM generation interrupted by user")
+                        break
                     if not line or not line.startswith(b"data: "):
                         continue
                     payload = line[6:]
@@ -1873,7 +2081,7 @@ router_cls = RouterClassifier()
 
 
 # ---------------------------------------------------------------------------
-# Web Search Engine (optional â€” DuckDuckGo, free, no API key)
+# Web Search Engine (optional -- DuckDuckGo, free, no API key)
 # ---------------------------------------------------------------------------
 
 class WebSearchEngine:
@@ -1892,7 +2100,7 @@ class WebSearchEngine:
             print("[REVIA Core] Web search: duckduckgo_search ready (full results).")
         except ImportError:
             print(
-                "[REVIA Core] Web search: duckduckgo_search not installed â€” "
+                "[REVIA Core] Web search: duckduckgo_search not installed -- "
                 "falling back to DDG Instant API. "
                 "For richer results: pip install duckduckgo-search"
             )
@@ -1924,13 +2132,13 @@ class WebSearchEngine:
                 title = r.get("title", "")
                 body = r.get("body", "")[:300].strip()
                 href = r.get("href", "")
-                lines.append(f"â€¢ {title}: {body}  [{href}]")
+                lines.append(f"-- {title}: {body}  [{href}]")
             return "\n".join(lines)
         except Exception as exc:
             return f"[Web search error: {exc}]"
 
     def _search_ddg_instant(self, query: str) -> str:
-        """Fallback: DuckDuckGo Instant Answers API â€” no library needed."""
+        """Fallback: DuckDuckGo Instant Answers API -- no library needed."""
         import urllib.request, urllib.parse
         try:
             params = urllib.parse.urlencode({
@@ -1944,11 +2152,11 @@ class WebSearchEngine:
             abstract = data.get("AbstractText", "").strip()
             if abstract:
                 source = data.get("AbstractSource", "")
-                parts.append(f"â€¢ {abstract}" + (f" (via {source})" if source else ""))
+                parts.append(f"-- {abstract}" + (f" (via {source})" if source else ""))
             for topic in data.get("RelatedTopics", [])[:3]:
                 text = topic.get("Text", "").strip()
                 if text and text not in "\n".join(parts):
-                    parts.append(f"â€¢ {text}")
+                    parts.append(f"-- {text}")
             if parts:
                 return "\n".join(parts)
             return (
@@ -1989,17 +2197,17 @@ def _build_situational_context() -> str:
 
 def _compute_situational_context() -> str:
     lines = [
-        "[Revia's Live System Status â€” you are actively aware of these:]"
+        "[Revia's Live System Status -- you are actively aware of these:]"
     ]
 
     # Web search
     if web_search_engine.enabled:
         lines.append(
-            "â€¢ Internet Search: ONLINE â€” you can look up real-time information"
+            "-- Internet Search: ONLINE -- you can look up real-time information"
         )
     else:
         lines.append(
-            "â€¢ Internet Search: OFFLINE â€” user has web access disabled"
+            "-- Internet Search: OFFLINE -- user has web access disabled"
         )
 
     # Neural modules
@@ -2007,14 +2215,14 @@ def _compute_situational_context() -> str:
     with telemetry._lock:
         emo_label = telemetry.emotion.get("label", "Neutral")
     if emotion_net.enabled:
-        lines.append(f"â€¢ EmotionNet: ON â€” current emotional read: {emo_label}")
+        lines.append(f"-- EmotionNet: ON -- current emotional read: {emo_label}")
     else:
-        lines.append("â€¢ EmotionNet: OFF")
+        lines.append("-- EmotionNet: OFF")
 
     if router_cls.enabled:
-        lines.append("â€¢ Intent Router: ON")
+        lines.append("-- Intent Router: ON")
     else:
-        lines.append("â€¢ Intent Router: OFF")
+        lines.append("-- Intent Router: OFF")
 
     # Platform integrations
     if integration_manager is not None:
@@ -2024,20 +2232,20 @@ def _compute_situational_context() -> str:
             t = status.get("twitch", {})
             if d.get("running"):
                 lines.append(
-                    f"â€¢ Discord: CONNECTED ({d.get('messages_processed', 0)} msgs)"
+                    f"-- Discord: CONNECTED ({d.get('messages_processed', 0)} msgs)"
                 )
             else:
-                lines.append("â€¢ Discord: OFFLINE")
+                lines.append("-- Discord: OFFLINE")
             if t.get("running"):
                 lines.append(
-                    f"â€¢ Twitch: CONNECTED ({t.get('messages_processed', 0)} msgs)"
+                    f"-- Twitch: CONNECTED ({t.get('messages_processed', 0)} msgs)"
                 )
             else:
-                lines.append("â€¢ Twitch: OFFLINE")
+                lines.append("-- Twitch: OFFLINE")
         except Exception:
             pass
     else:
-        lines.append("â€¢ Discord / Twitch: unavailable")
+        lines.append("-- Discord / Twitch: unavailable")
 
     # Runtime system load
     with telemetry._lock:
@@ -2053,10 +2261,10 @@ def _compute_situational_context() -> str:
     # Memory
     st = len(memory_store.short_term)
     lt = len(memory_store.long_term)
-    lines.append(f"â€¢ Memory: {st} recent exchanges | {lt} long-term facts stored")
+    lines.append(f"-- Memory: {st} recent exchanges | {lt} long-term facts stored")
 
     lines.append(
-        "Embody this awareness naturally â€” proactively offer to search the web "
+        "Embody this awareness naturally -- proactively offer to search the web "
         "when internet is ON and the user might benefit, acknowledge what's "
         "offline without dwelling on it, and reference memories when relevant. "
         "Never pretend a disabled module is working. If system load, active tools, "
@@ -2074,7 +2282,7 @@ class MemoryStore:
         self.short_term = []
         self.long_term = []
         self._profile_name = profile_name
-        self._redis_available_cache = _redis_client is not None
+        self._redis_available_cache = _get_redis() is not None
         self._redis_checked_ts = 0.0
         self._redis_status_ttl_s = 2.5
         self._lt_file = Path(f"data/memory_{profile_name}.jsonl")
@@ -2112,20 +2320,23 @@ class MemoryStore:
         if (now - self._redis_checked_ts) < self._redis_status_ttl_s:
             return self._redis_available_cache
         # If not connected yet, try to connect now (handles Docker starting after server)
-        if _redis_client is None:
+        client = _get_redis()
+        if client is None:
             _init_redis()
-        if _redis_client is None:
+            client = _get_redis()
+        if client is None:
             self._redis_available_cache = False
             self._redis_checked_ts = now
             return False
         try:
-            _redis_client.ping()
+            client.ping()
             self._redis_available_cache = True
             self._redis_checked_ts = now
             return True
         except Exception:
-            # Connection dropped â€” reset so next check retries
-            _redis_client = None
+            # Connection dropped -- reset so next check retries
+            with _redis_lock:
+                _redis_client = None
             self._redis_available_cache = False
             self._redis_checked_ts = now
             return False
@@ -2135,29 +2346,29 @@ class MemoryStore:
 
     def _redis_push(self, entry):
         """Push a single long-term entry to Redis (best-effort)."""
-        if _redis_client is None:
+        client = _get_redis()
+        if client is None:
             return
         try:
-            _redis_client.rpush(self._redis_key(), _json_dumps_compact(entry))
+            client.rpush(self._redis_key(), _json_dumps_compact(entry))
             self._redis_available_cache = True
             self._redis_checked_ts = time.monotonic()
         except Exception:
             self._redis_available_cache = False
             self._redis_checked_ts = time.monotonic()
-            pass
 
     def _redis_clear(self):
         """Delete the Redis list for the current profile."""
-        if _redis_client is None:
+        client = _get_redis()
+        if client is None:
             return
         try:
-            _redis_client.delete(self._redis_key())
+            client.delete(self._redis_key())
             self._redis_available_cache = True
             self._redis_checked_ts = time.monotonic()
         except Exception:
             self._redis_available_cache = False
             self._redis_checked_ts = time.monotonic()
-            pass
 
     # ------------------------------------------------------------------
     # Profile switching
@@ -2171,19 +2382,30 @@ class MemoryStore:
             self.long_term.clear()
             self._lt_file = Path(f"data/memory_{profile_name}.jsonl")
             self._lt_file.parent.mkdir(parents=True, exist_ok=True)
-            self._lt_handle.close()
-            self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
+            # Flush + close old handle safely before opening new one
+            try:
+                if self._lt_handle and not self._lt_handle.closed:
+                    # flush handled by _safe_write
+                    self._lt_handle.close()
+            except Exception as exc:
+                _revia_log(f"[MemoryStore] Error closing old handle: {exc}")
+            try:
+                self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
+            except Exception as exc:
+                _revia_log(f"[MemoryStore] Failed to open memory file: {exc}")
+                self._lt_handle = None
             self._load_long_term()
 
     # ------------------------------------------------------------------
-    # Load from Redis â†’ fallback to local file
+    # Load from Redis â†' fallback to local file
     # ------------------------------------------------------------------
 
     def _load_long_term(self):
-        # Try Redis first
-        if _redis_client is not None:
+        # Try Redis first (thread-safe accessor)
+        client = _get_redis()
+        if client is not None:
             try:
-                raw_entries = _redis_client.lrange(self._redis_key(), 0, -1)
+                raw_entries = client.lrange(self._redis_key(), 0, -1)
                 for raw in raw_entries:
                     try:
                         parsed = self._normalize_entry(_json_loads_fast(raw))
@@ -2309,8 +2531,7 @@ class MemoryStore:
             return
         self.long_term.append(item)
         self._redis_push(item)
-        self._lt_handle.write(_json_dumps_compact(item) + "\n")
-        self._lt_handle.flush()
+        self._safe_write(_json_dumps_compact(item) + "\n")
 
     def save_to_long_term(self, content, category="user_note", metadata=None):
         with self._lock:
@@ -2323,8 +2544,7 @@ class MemoryStore:
                 return
             self.long_term.append(entry)
             self._redis_push(entry)
-            self._lt_handle.write(_json_dumps_compact(entry) + "\n")
-            self._lt_handle.flush()
+            self._safe_write(_json_dumps_compact(entry) + "\n")
 
     def save_person_memory(self, name, relation="", importance=0.6, source_text=""):
         clean_name = str(name or "").strip()
@@ -2371,8 +2591,7 @@ class MemoryStore:
                 return False
             self.long_term.append(entry)
             self._redis_push(entry)
-            self._lt_handle.write(_json_dumps_compact(entry) + "\n")
-            self._lt_handle.flush()
+            self._safe_write(_json_dumps_compact(entry) + "\n")
             return True
 
     def get_revia_preference(self, key):
@@ -2434,8 +2653,7 @@ class MemoryStore:
                 return False
             self.long_term.append(entry)
             self._redis_push(entry)
-            self._lt_handle.write(_json_dumps_compact(entry) + "\n")
-            self._lt_handle.flush()
+            self._safe_write(_json_dumps_compact(entry) + "\n")
             return True
 
     # ------------------------------------------------------------------
@@ -2487,20 +2705,40 @@ class MemoryStore:
         with self._lock:
             self.long_term.clear()
             self._redis_clear()
-            self._lt_handle.close()
+            self._safe_reopen_handle()
+
+    def _safe_write(self, data: str):
+        """Write to the long-term file handle. Silently no-ops if handle is None/closed."""
+        if self._lt_handle and not self._lt_handle.closed:
+            try:
+                self._safe_write(data)
+            except Exception as exc:
+                _revia_log(f"[MemoryStore] Write error: {exc}")
+
+    def _safe_reopen_handle(self):
+        """Close, truncate, and reopen the long-term memory file. Must hold self._lock."""
+        try:
+            if self._lt_handle and not self._lt_handle.closed:
+                # flush handled by _safe_write
+                self._lt_handle.close()
+        except Exception:
+            pass
+        try:
             self._lt_file.write_text("", encoding="utf-8")
             self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
+        except Exception as exc:
+            _revia_log(f"[MemoryStore] Failed to reopen memory file: {exc}")
+            self._lt_handle = None
 
     def _rewrite_long_term_storage(self):
+        """Rewrite all long-term entries to disk + Redis. Must hold self._lock."""
         self._redis_clear()
         for entry in self.long_term:
             self._redis_push(entry)
-        self._lt_handle.close()
-        self._lt_file.write_text("", encoding="utf-8")
-        self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
-        for entry in self.long_term:
-            self._lt_handle.write(_json_dumps_compact(entry) + "\n")
-        self._lt_handle.flush()
+        self._safe_reopen_handle()
+        if self._lt_handle:
+            for entry in self.long_term:
+                self._safe_write(_json_dumps_compact(entry) + "\n")
 
     def delete_long_term_entry(self, entry_id):
         target = str(entry_id or "").strip()
@@ -2572,6 +2810,8 @@ def _load_profile_from_disk():
         data = _json_loads_fast(_PROFILE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             profile.update(data)
+            # Feed the full profile into ProfileEngine so behavioral params resolve
+            profile_engine.load(profile)
             print(f"[REVIA Core] Loaded profile settings from {_PROFILE_FILE.name}")
     except Exception as exc:
         print(f"[REVIA Core] Could not load {_PROFILE_FILE.name}: {exc}")
@@ -2613,10 +2853,12 @@ telemetry.state = conversation_manager.current_state
 # ---------------------------------------------------------------------------
 
 ws_clients = set()
+ws_clients_lock = threading.Lock()
 ws_loop = None
 
 async def ws_handler(websocket):
-    ws_clients.add(websocket)
+    with ws_clients_lock:
+        ws_clients.add(websocket)
     try:
         try:
             await websocket.send(_json_dumps_compact({
@@ -2638,23 +2880,31 @@ async def ws_handler(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        ws_clients.discard(websocket)
+        with ws_clients_lock:
+            ws_clients.discard(websocket)
 
 
 def broadcast_json(data):
-    if not ws_clients or ws_loop is None:
+    if ws_loop is None:
         return
+    with ws_clients_lock:
+        if not ws_clients:
+            return
     text = _json_dumps_compact(data)
     asyncio.run_coroutine_threadsafe(_broadcast(text), ws_loop)
 
 async def _broadcast(text):
+    with ws_clients_lock:
+        snapshot = set(ws_clients)
     dead = set()
-    for ws in ws_clients:
+    for ws in snapshot:
         try:
             await ws.send(text)
         except Exception:
             dead.add(ws)
-    ws_clients.difference_update(dead)
+    if dead:
+        with ws_clients_lock:
+            ws_clients.difference_update(dead)
 
 
 _EMOTION_DISCLAIMER_PATTERNS = (
@@ -2989,6 +3239,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         _device = telemetry.system.get("device", "CPU")
 
     token_started = False
+    _sentence_buffer = []  # Accumulates tokens for sentence-level TTS chunking
 
     def _pipeline_broadcast(payload):
         nonlocal token_started
@@ -3009,6 +3260,20 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     "first token emitted",
                 )
                 _set_runtime_state(ReviaState.SPEAKING, f"{trigger.source}: first token", broadcast=True)
+            # Buffer tokens and emit sentence-level events for TTS streaming
+            tok = out.get("token", "")
+            _sentence_buffer.append(tok)
+            buffered = "".join(_sentence_buffer)
+            if _SENTENCE_ENDERS.search(buffered):
+                sentence = buffered.strip()
+                if sentence:
+                    broadcast_json({
+                        "type": "chat_sentence",
+                        "sentence": sentence,
+                        "request_id": turn.request_id,
+                        "turn_id": turn.turn_id,
+                    })
+                _sentence_buffer.clear()
         broadcast_json(out)
 
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
@@ -3145,7 +3410,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     except Exception as e:
         _revia_log(f"Unhandled pipeline error | request_id={turn.request_id} | error={e}")
         response = AssistantResponse(
-            text=f"I hit an internal pipeline error before I could finish that answer: {e}",
+            text="Something went wrong in my head. Not the first time, won't be the last.",
             response_mode=ResponseMode.ERROR_RESPONSE.value,
             success=False,
             error_type="pipeline_error",
@@ -3155,9 +3420,23 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
             commit_to_memory=False,
         )
 
+    # Check staleness BEFORE flushing sentence buffer -- don't broadcast stale data
     if not turn_manager.is_current(turn.request_id):
         _revia_log(f"Stale response discarded before completion | request_id={turn.request_id}")
+        _sentence_buffer.clear()
         return ""
+
+    # Flush any remaining sentence buffer for TTS (last sentence may not end with punctuation)
+    if _sentence_buffer:
+        remaining = "".join(_sentence_buffer).strip()
+        if remaining:
+            broadcast_json({
+                "type": "chat_sentence",
+                "sentence": remaining,
+                "request_id": turn.request_id,
+                "turn_id": turn.turn_id,
+            })
+        _sentence_buffer.clear()
 
     if _is_feelings_prompt(text) and _looks_like_emotion_disclaimer(response.text):
         response.text = (response.text or "").rstrip() + "\n\n" + _build_emotion_self_report(emo)
@@ -3228,9 +3507,9 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
 
 
 def process_pipeline_integration(text: str) -> str:
-    """Lightweight pipeline for Discord/Twitch â€” no WebSocket broadcasts.
+    """Lightweight pipeline for Discord/Twitch -- no WebSocket broadcasts.
 
-    Skips EmotionNet (saves ~5â€“50 ms) and broadcasts nothing to the GUI so
+    Skips EmotionNet (saves ~5-- ms) and broadcasts nothing to the GUI so
     platform chat traffic does not flood the controller UI.  Uses per-platform
     conversation isolation so Discord and Twitch never share context.
     """
@@ -3532,6 +3811,14 @@ def api_runtime_config_post():
     _broadcast_runtime_status()
     return jsonify({"ok": True, "runtime_status": payload.get("runtime_status", {})})
 
+@app.route("/api/interrupt", methods=["POST"])
+def api_interrupt():
+    """Signal the LLM to stop generating tokens and cancel queued TTS."""
+    llm_backend.request_interrupt()
+    broadcast_json({"type": "interrupt_ack", "interrupted": True})
+    _revia_log("LLM generation interrupted via /api/interrupt")
+    return jsonify({"ok": True, "interrupted": True})
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(silent=True) or {}
@@ -3599,6 +3886,46 @@ def api_model_config_set():
     _broadcast_runtime_status()
     return jsonify({"ok": True, "config": llm_backend.get_config()})
 
+# ---------------------------------------------------------------------------
+# vLLM enhanced inference endpoints (PRD §18)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/vllm/status", methods=["GET"])
+def api_vllm_status():
+    base_url = llm_backend.local_server_url.rstrip("/")
+    is_vllm = llm_backend._vllm.probe(base_url)
+    cuda_active = llm_backend.local_backend.upper() in ("CUDA", "GPU")
+    result = {
+        "enabled": llm_backend._vllm_enabled,
+        "is_vllm_server": is_vllm,
+        "cuda_active": cuda_active,
+        "routing_mode": "smart",
+        "routing_note": (
+            "vLLM only activates for complex/long-context prompts when CUDA is available"
+            if llm_backend._vllm_enabled else "vLLM enhanced mode disabled"
+        ),
+        "capabilities": llm_backend._vllm.get_capabilities(base_url) if is_vllm else {},
+        "last_metrics": llm_backend._vllm.get_metrics_dict(),
+    }
+    if is_vllm:
+        result["health"] = llm_backend._vllm.health_check(base_url)
+        result["active_lora"] = llm_backend._vllm.get_active_lora(base_url)
+    return jsonify(result)
+
+@app.route("/api/vllm/lora", methods=["POST"])
+def api_vllm_lora():
+    data = request.get_json(silent=True) or {}
+    adapter = data.get("adapter", "")
+    base_url = llm_backend.local_server_url.rstrip("/")
+    ok = llm_backend._vllm.set_lora_adapter(base_url, adapter)
+    return jsonify({"ok": ok, "active_lora": llm_backend._vllm.get_active_lora(base_url)})
+
+@app.route("/api/vllm/invalidate", methods=["POST"])
+def api_vllm_invalidate():
+    llm_backend._vllm.invalidate_cache()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/plugins", methods=["GET"])
 def api_plugins():
     return jsonify(PLUGINS)
@@ -3658,6 +3985,8 @@ def api_profile_get():
 def api_profile_save():
     data = request.get_json(silent=True) or {}
     profile.update(data)
+    # Keep ProfileEngine in sync so behavioral params update immediately
+    profile_engine.load(profile)
     _save_profile_to_disk()
 
     # Build full system prompt from profile fields
@@ -3756,7 +4085,8 @@ def api_memory_docker_status():
 def api_emotions_history():
     """Return the recent emotion history ring buffer."""
     limit = request.args.get("limit", 50, type=int)
-    return jsonify(_emotion_history[-limit:])
+    with _emotion_history_lock:
+        return jsonify(_emotion_history[-limit:])
 
 @app.route("/api/emotions/current", methods=["GET"])
 def api_emotions_current():
@@ -3775,10 +4105,10 @@ _PROACTIVE_PROMPTS = [
     "You can share a curious fact, ask an engaging question, make a warm observation, "
     "or simply check in. Keep it brief (1-2 sentences) and fully in character.",
 
-    "Initiate a conversation naturally. Think of something genuinely interesting to say â€” "
+    "Initiate a conversation naturally. Think of something genuinely interesting to say -- "
     "a question, a thought, or just a friendly hello. Be brief and spontaneous.",
 
-    "Begin a conversation. Say something warm, curious, or playful â€” whatever feels "
+    "Begin a conversation. Say something warm, curious, or playful -- whatever feels "
     "right in the moment. One or two sentences maximum.",
 
     "Conversation has been quiet. Make a spontaneous in-character comment about what "
@@ -3808,6 +4138,7 @@ def _run_proactive_pipeline(trigger):
         f"Trigger received | request_id={turn.request_id} | turn_id={turn.turn_id} "
         f"| source={trigger.source} | reason={trigger.reason}"
     )
+    lock_acquired = False
     if not llm_backend._generate_lock.acquire(blocking=False):
         _revia_log("Blocked: LLM generation already in progress")
         turn_manager.finish_turn(
@@ -3816,6 +4147,7 @@ def _run_proactive_pipeline(trigger):
             reason="generation_lock_busy",
         )
         return
+    lock_acquired = True
 
     prompt = _random.choice(_PROACTIVE_PROMPTS)
     token_started = False
@@ -3874,7 +4206,8 @@ def _run_proactive_pipeline(trigger):
                 f"| mode={response.response_mode}"
             )
     finally:
-        llm_backend._generate_lock.release()
+        if lock_acquired:
+            llm_backend._generate_lock.release()
 
     if turn_manager.should_block_duplicate_output("", response.text, response.response_mode):
         response = _build_duplicate_block_response(response)

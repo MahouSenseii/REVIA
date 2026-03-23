@@ -106,6 +106,38 @@ class PromptAssemblyManager:
         self._log = log_fn
         self._profile_manager = profile_manager
 
+    def _personality_error(self, profile_name, error_type):
+        """Generate in-character error response instead of generic system message."""
+        responses = {
+            "timeout": [
+                "Ugh, my brain just froze for a sec... what were we talking about?",
+                "Hold on, something glitched. Give me a moment...",
+                "Well that's embarrassing, I lost my train of thought.",
+            ],
+            "generation_failed": [
+                "I had something really good to say but it just... vanished.",
+                "Okay wow, total brain fart. Try me again?",
+                "Something went wrong in my head. Not the first time, won't be the last.",
+            ],
+            "empty_response": [
+                "Hmm, my response came out empty. That's weird.",
+                "I tried to respond but nothing came out. Let me try again?",
+                "Blank page in my head right now. Give me another shot?",
+            ],
+            "connection_error": [
+                "I lost my connection for a second. Can you try that again?",
+                "Oops, signal dropped. Let's try once more?",
+                "Something went wonky with my connection. One more time?",
+            ],
+            "default": [
+                "Hmm, something's off. Let me try that again.",
+                "I'm having a moment, bear with me.",
+            ]
+        }
+        import random
+        options = responses.get(error_type, responses["default"])
+        return random.choice(options)
+
     def build_full_prompt_context(
         self,
         *,
@@ -114,16 +146,24 @@ class PromptAssemblyManager:
         memory_context: str,
         emotion_context: str,
         response_mode: str,
+        # PRD §13 — HFL prosody / behavioral hints (optional)
+        hfl_prosody_hints: dict | None = None,
+        # PRD §4 — profile behavioral parameters (optional; sourced from ProfileEngine)
+        behavior_params: dict | None = None,
+        # Vision context from camera/YOLO pipeline (optional)
+        vision_context: str = "",
     ) -> str:
         include_greeting = str(response_mode) in (
             ResponseMode.GREETING_RESPONSE.value,
             ResponseMode.STARTUP_RESPONSE.value,
         )
+        # Resolve the profile once here and reuse it below to avoid a
+        # second get_active_profile() call (and deepcopy) on line 126.
+        prof = self._profile_manager.get_active_profile(profile)
         character_context = self._profile_manager.build_character_context(
-            profile,
+            prof,
             include_greeting_instruction=include_greeting,
         )
-        prof = self._profile_manager.get_active_profile(profile)
         self._log(
             f"Prompt assembly | profile_injected=True | profile_name={prof.get('character_name', 'Revia')} "
             f"| mode={response_mode}"
@@ -138,22 +178,161 @@ class PromptAssemblyManager:
         ]
         if emotion_context:
             parts.append(emotion_context)
+        if vision_context:
+            parts.append(vision_context)
         if memory_context:
             parts.append("--- Memory Context ---\n" + memory_context)
+
+        # PRD §4 / §13 — inject behavioral parameters so the LLM respects profile settings
+        behavioral_section = self._build_behavioral_context(
+            prof, behavior_params, hfl_prosody_hints
+        )
+        if behavioral_section:
+            parts.append(behavioral_section)
+
         system_text = "\n\n".join(part.strip() for part in parts if str(part).strip())
         self.validate_prompt_context(system_text, prof)
         return system_text
 
-    def validate_prompt_context(self, system_text: str, profile: dict | None):
-        prof = self._profile_manager.get_active_profile(profile)
+    def validate_prompt_context(self, system_text: str, profile: dict | None) -> bool:
+        """Validate the assembled system prompt. Returns True if valid.
+
+        Logs a warning on failure instead of raising so that a missing profile
+        name does not crash the Flask request handler with an unhandled exception.
+
+        If *profile* is already a resolved dict (from the caller), we use it
+        directly to avoid a redundant get_active_profile() + deepcopy.
+        """
+        prof = profile if isinstance(profile, dict) and profile else self._profile_manager.get_active_profile(profile)
         name = str(prof.get("character_name", "Revia")).strip()
         if name.lower() not in str(system_text or "").lower():
-            raise ValueError(
-                f"Prompt assembly failed validation: active profile name '{name}' missing from system context."
+            self._log(
+                f"Prompt assembly validation warning: active profile name '{name}' "
+                "is missing from system context. Proceeding with current prompt."
             )
+            return False
         if "generic assistant" in str(system_text or "").lower():
             self._log("Prompt validation warning: generic assistant wording detected in prompt context")
         return True
+
+    def _build_behavioral_context(
+        self,
+        prof: dict,
+        behavior_params: dict | None,
+        hfl_prosody_hints: dict | None,
+    ) -> str:
+        """
+        PRD §4 / §13 — inject profile behavioral context and HFL prosody hints
+        into the system prompt so the LLM can tailor its output accordingly.
+
+        All values come from ProfileEngine (passed in as behavior_params) or
+        from the flat profile dict as a fallback.
+        """
+        lines: list[str] = []
+
+        # ── Behavioral parameters (PRD §4) ────────────────────────────────
+        bp = behavior_params or {}
+
+        verbosity_raw = bp.get(
+            "verbosity",
+            prof.get("verbosity", prof.get("verbosity_label", "Normal")),
+        )
+        # Convert numeric verbosity (0-1) to a descriptive label
+        try:
+            verbosity_float = float(verbosity_raw) if not isinstance(verbosity_raw, float) else verbosity_raw
+            if verbosity_float < 0.30:
+                verbosity_label = "very concise — keep replies under 40 words"
+            elif verbosity_float < 0.50:
+                verbosity_label = "concise — aim for 40–80 words"
+            elif verbosity_float < 0.70:
+                verbosity_label = "moderate — aim for 80–140 words"
+            else:
+                verbosity_label = "expansive — aim for 140–220 words with detail"
+        except (ValueError, TypeError):
+            verbosity_label = str(verbosity_raw)
+
+        lines.append(f"Verbosity guideline: {verbosity_label}.")
+
+        emotion_intensity = bp.get("emotion_intensity", None)
+        if emotion_intensity is not None:
+            if float(emotion_intensity) < 0.35:
+                lines.append("Emotional tone: keep affect subdued and professional.")
+            elif float(emotion_intensity) > 0.70:
+                lines.append("Emotional tone: express warmth and emotion openly.")
+            else:
+                lines.append("Emotional tone: balanced — natural warmth without exaggeration.")
+
+        self_correction_rate = bp.get("self_correction_rate", None)
+        if self_correction_rate is not None and float(self_correction_rate) > 0.20:
+            lines.append(
+                "Self-correction style: occasionally rephrase mid-sentence to show "
+                "genuine thinking (e.g. '— actually, let me put it this way…')."
+            )
+
+        question_propensity = bp.get("question_propensity", None)
+        if question_propensity is not None:
+            if float(question_propensity) < 0.15:
+                lines.append("Follow-up questions: avoid asking follow-up questions unless essential.")
+            elif float(question_propensity) > 0.40:
+                lines.append("Follow-up questions: invite the user to elaborate when relevant.")
+
+        # Mood baseline - sets default emotional state
+        mood_baseline = bp.get("mood_baseline", None)
+        if mood_baseline and str(mood_baseline).lower() not in ("neutral", "none", ""):
+            lines.append(f"Baseline mood: you naturally lean toward a {mood_baseline} disposition.")
+
+        # Humor tendency
+        humor = bp.get("humor_tendency", None)
+        if humor is not None and float(humor) > 0.25:
+            lines.append("Humor style: be witty and playful where appropriate. Don't force it.")
+
+        # Empathy weight
+        empathy = bp.get("empathy_weight", None)
+        if empathy is not None and float(empathy) > 0.50:
+            lines.append("Emotional engagement: prioritize understanding and validating feelings.")
+
+        # Sarcasm ceiling
+        sarcasm = bp.get("sarcasm_ceiling", None)
+        if sarcasm is not None and float(sarcasm) > 0.15:
+            lines.append("Sarcasm is okay in moderation when context calls for it.")
+
+        # ── Speech quirks and catchphrases ──────────────────────────────
+        quirks = prof.get("speech_quirks", [])
+        if quirks:
+            quirk_list = ", ".join(f'"{q}"' for q in quirks[:8])
+            freq = prof.get("quirk_frequency", 0.15)
+            freq_label = "occasionally" if freq < 0.2 else "regularly" if freq < 0.4 else "frequently"
+            lines.append(
+                f"Speech quirks: {quirk_list}. Weave these {freq_label} into your responses "
+                f"as natural filler or emphasis. They are part of your voice — use them "
+                f"organically, not mechanically."
+            )
+
+        # ── Reply type tendencies ────────────────────────────────────────
+        reply_weights = prof.get("reply_type_weights", {})
+        if reply_weights:
+            dominant = sorted(reply_weights.items(), key=lambda x: x[1], reverse=True)[:3]
+            style_hints = ", ".join(f"{k} ({v:.0%})" for k, v in dominant)
+            lines.append(f"Response style mix: lean toward {style_hints}.")
+
+        # ── HFL prosody hints (PRD §13) ───────────────────────────────────
+        if hfl_prosody_hints:
+            affect_mode = hfl_prosody_hints.get("affect_mode", "natural")
+            rate        = hfl_prosody_hints.get("rate_multiplier", 1.0)
+
+            if affect_mode == "suppressed":
+                lines.append("Delivery hint: be measured, calm, and restrained in tone.")
+            elif affect_mode == "amplified":
+                lines.append("Delivery hint: be expressive, energetic, and emotionally present.")
+
+            if float(rate) < 0.90:
+                lines.append("Pacing hint: speak at a slower, more deliberate pace in this reply.")
+            elif float(rate) > 1.10:
+                lines.append("Pacing hint: keep the reply brisk and energetic.")
+
+        if not lines:
+            return ""
+        return "--- Behavioral Profile ---\n" + "\n".join(lines)
 
     def _build_routing_instructions(self, response_mode: str) -> str:
         mode = str(response_mode or ResponseMode.NORMAL_RESPONSE.value)

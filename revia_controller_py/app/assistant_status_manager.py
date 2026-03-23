@@ -880,5 +880,12 @@ class AssistantStatusManager(QObject):
             )
         return "|".join(parts)
 
+    def cleanup(self):
+        """Stop all timers and clean up resources."""
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+
     def _log(self, message: str):
         self.event_bus.log_entry.emit(f"[Status] {message}")

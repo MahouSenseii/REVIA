@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
+#include <iostream>
+#include <future>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -20,6 +22,11 @@ void Pipeline::set_llm_config(const std::string& server_url, const std::string& 
     if (!model.empty()) llm_model_ = model;
 }
 
+void Pipeline::set_system_prompt(const std::string& prompt) {
+    std::lock_guard<std::mutex> lk(llm_cfg_mtx_);
+    if (!prompt.empty()) system_prompt_ = prompt;
+}
+
 void Pipeline::process(const PipelineRequest& req) {
     if (req.on_status) req.on_status("Processing");
     telemetry_.set_state("Processing");
@@ -27,8 +34,38 @@ void Pipeline::process(const PipelineRequest& req) {
     stage_input_capture(req);
     stage_stt_batch(req);
 
-    if (router_enabled) stage_router_classify(req.user_text);
-    if (emotion_enabled) stage_emotion_infer(req.user_text);
+    // Parallelize emotion and router classification for better performance
+    std::future<void> router_fut;
+    std::future<void> emotion_fut;
+    if (router_enabled) {
+        router_fut = std::async(std::launch::async, [this, text = req.user_text]() {
+            stage_router_classify(text);
+        });
+    }
+    if (emotion_enabled) {
+        emotion_fut = std::async(std::launch::async, [this, text = req.user_text]() {
+            stage_emotion_infer(text);
+        });
+    }
+    // Wait for both to complete, with error recovery
+    if (router_fut.valid()) {
+        try { router_fut.get(); }
+        catch (const std::exception& e) {
+            std::cerr << "[Pipeline] Router classification failed: " << e.what() << "\n";
+            auto span = telemetry_.begin_span("router_error");
+            span.extra["error"] = e.what();
+            telemetry_.end_span(span);
+        }
+    }
+    if (emotion_fut.valid()) {
+        try { emotion_fut.get(); }
+        catch (const std::exception& e) {
+            std::cerr << "[Pipeline] Emotion inference failed: " << e.what() << "\n";
+            auto span = telemetry_.begin_span("emotion_error");
+            span.extra["error"] = e.what();
+            telemetry_.end_span(span);
+        }
+    }
 
     auto rout = telemetry_.get_router();
     if (rout.rag_enable) stage_rag_retrieve(req.user_text);
@@ -46,7 +83,7 @@ void Pipeline::process(const PipelineRequest& req) {
 
 void Pipeline::stage_input_capture(const PipelineRequest&) {
     auto span = telemetry_.begin_span("input_capture");
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 }
 
@@ -54,11 +91,11 @@ void Pipeline::stage_stt_batch(const PipelineRequest&) {
     auto span = telemetry_.begin_span("stt_batch_collect");
     span.extra["batch_window_ms"] = 200;
     span.extra["partial_transcript_len"] = 0;
-    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 
     auto span2 = telemetry_.begin_span("stt_decode_partial");
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // REMOVED: artificial latency
     telemetry_.end_span(span2);
 }
 
@@ -78,13 +115,13 @@ void Pipeline::stage_emotion_infer(const std::string& text) {
 
 void Pipeline::stage_rag_retrieve(const std::string&) {
     auto span = telemetry_.begin_span("rag_retrieve");
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 }
 
 void Pipeline::stage_prompt_assemble(const std::string&) {
     auto span = telemetry_.begin_span("prompt_assemble");
-    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 }
 
@@ -93,33 +130,58 @@ void Pipeline::stage_llm_generate(const PipelineRequest& req, const std::string&
     telemetry_.set_state("Generating");
     if (req.on_status) req.on_status("Generating");
 
-    std::string url, model;
-    {
-        std::lock_guard<std::mutex> lk(llm_cfg_mtx_);
-        url = llm_url_;
-        model = llm_model_;
-    }
-
-    // Parse host and port from url (e.g. "http://127.0.0.1:8080")
+    std::string url, model, sys_prompt;
     std::string host = "127.0.0.1";
     int port = 8080;
     {
-        std::string rest = url;
-        auto scheme_end = rest.find("://");
-        if (scheme_end != std::string::npos) rest = rest.substr(scheme_end + 3);
-        auto colon = rest.rfind(':');
-        if (colon != std::string::npos) {
-            host = rest.substr(0, colon);
-            try { port = std::stoi(rest.substr(colon + 1)); } catch (...) {}
+        // Single lock scope for config + URL cache (both guarded by llm_cfg_mtx_)
+        std::lock_guard<std::mutex> lk(llm_cfg_mtx_);
+        url = llm_url_;
+        model = llm_model_;
+        sys_prompt = system_prompt_;
+
+        // Cache parsed URL components to avoid re-parsing on every request
+        if (cached_host_.empty() || cached_url_ != url) {
+            std::string rest = url;
+            auto scheme_end = rest.find("://");
+            if (scheme_end != std::string::npos) rest = rest.substr(scheme_end + 3);
+
+            // Remove path if present (everything after /)
+            auto path_end = rest.find('/');
+            if (path_end != std::string::npos) rest = rest.substr(0, path_end);
+
+            auto colon = rest.rfind(':');
+            if (colon != std::string::npos) {
+                host = rest.substr(0, colon);
+                try {
+                    std::string port_str = rest.substr(colon + 1);
+                    int parsed_port = std::stoi(port_str);
+                    if (parsed_port > 0 && parsed_port <= 65535) {
+                        port = parsed_port;
+                    } else {
+                        std::cerr << "[Pipeline] Invalid port number: " << parsed_port << ", using default 8080\n";
+                    }
+                } catch (const std::invalid_argument& e) {
+                    std::cerr << "[Pipeline] Failed to parse port: " << e.what() << ", using default 8080\n";
+                } catch (const std::out_of_range& e) {
+                    std::cerr << "[Pipeline] Port number out of range: " << e.what() << ", using default 8080\n";
+                }
+            } else {
+                host = rest;
+            }
+            cached_host_ = host;
+            cached_port_ = port;
+            cached_url_ = url;
         } else {
-            host = rest;
+            host = cached_host_;
+            port = cached_port_;
         }
     }
 
     nlohmann::json body = {
         {"model", model},
         {"messages", nlohmann::json::array({
-            {{"role", "system"}, {"content", "You are REVIA, a helpful AI assistant."}},
+            {{"role", "system"}, {"content", sys_prompt}},
             {{"role", "user"}, {"content", req.user_text}}
         })},
         {"temperature", 0.7},
@@ -165,7 +227,9 @@ void Pipeline::stage_llm_generate(const PipelineRequest& req, const std::string&
                         m.tokens_per_second = elapsed > 0 ? token_count / elapsed : 0;
                         telemetry_.set_llm_metrics(m);
                     }
-                } catch (...) {}
+                } catch (const std::exception& e) {
+                    std::cerr << "[Pipeline] Exception parsing LLM response: " << e.what() << "\n";
+                }
             }
             return true;
         }
@@ -186,13 +250,13 @@ void Pipeline::stage_llm_generate(const PipelineRequest& req, const std::string&
 void Pipeline::stage_tts_synthesize(const std::string&) {
     auto span = telemetry_.begin_span("tts_synthesize");
     telemetry_.set_state("Answering (TTS)");
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 }
 
 void Pipeline::stage_memory_write(const std::string&, const std::string&) {
     auto span = telemetry_.begin_span("memory_write");
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // REMOVED: artificial latency
     telemetry_.end_span(span);
 }
 

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <nlohmann/json.hpp>
 
 namespace revia {
 
@@ -39,8 +40,30 @@ void WsServer::stop() {
 }
 
 void WsServer::broadcast(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(clients_mtx_);
     for (auto& client : server_.getClients()) {
         client->send(msg);
+    }
+}
+
+void WsServer::broadcast_async(const std::string& msg) {
+    // Add message batching - instead of sending immediately, queue for next flush
+    std::lock_guard<std::mutex> lk(broadcast_queue_mtx_);
+    broadcast_queue_.push_back(msg);
+}
+
+void WsServer::flush_broadcasts() {
+    std::vector<std::string> messages;
+    {
+        std::lock_guard<std::mutex> lk(broadcast_queue_mtx_);
+        messages.swap(broadcast_queue_);
+    }
+    if (messages.empty()) return;
+    std::lock_guard<std::mutex> lk(clients_mtx_);
+    for (auto& client : server_.getClients()) {
+        for (auto& msg : messages) {
+            client->send(msg);
+        }
     }
 }
 

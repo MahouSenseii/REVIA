@@ -2,9 +2,13 @@
 #include <chrono>
 #include <algorithm>
 #include <thread>
-#include <cstdlib>
+#include <random>
 
 namespace revia {
+
+// Thread-local Mersenne Twister — each thread gets its own seeded instance,
+// avoiding data races that arise from the shared mutable state of std::rand().
+static thread_local std::mt19937 tl_rng{std::random_device{}()};
 
 EmotionOutput EmotionNet::infer(const std::string& text) {
     auto start = std::chrono::high_resolution_clock::now();
@@ -13,7 +17,13 @@ EmotionOutput EmotionNet::infer(const std::string& text) {
     if (!enabled) { out.label = "Disabled"; return out; }
 
     std::string lower = text;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    // Use ASCII-safe tolower that only affects A-Z characters
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    });
+
+    // TODO: Replace keyword matching with ONNX Runtime model for proper emotion classification
+    // Model: fine-tuned DistilBERT or similar, targeting <5ms inference with TensorRT
 
     if (lower.find("happy") != std::string::npos || lower.find("great") != std::string::npos
         || lower.find("awesome") != std::string::npos || lower.find("love") != std::string::npos) {
@@ -33,8 +43,6 @@ EmotionOutput EmotionNet::infer(const std::string& text) {
     } else {
         out = {0.0f, 0.2f, 0.4f, "Neutral", 0.90f, 0.0};
     }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(5 + std::rand() % 10));
 
     auto end = std::chrono::high_resolution_clock::now();
     out.inference_ms = std::chrono::duration<double, std::milli>(end - start).count();

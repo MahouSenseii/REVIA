@@ -38,12 +38,21 @@ int main() {
     revia::RestServer rest_server(REVIA_REST_PORT, telemetry, pipeline,
                                   plugins, emotion_net, router, ws_server);
 
-    std::thread ws_thread([&] { ws_server.run(g_running); });
-    std::thread rest_thread([&] { rest_server.run(g_running); });
-    std::thread telem_thread([&] {
+    // Store threads instead of detaching - managed thread lifetime
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] { ws_server.run(g_running); });
+    threads.emplace_back([&] { rest_server.run(g_running); });
+    threads.emplace_back([&] {
         while (g_running) {
             ws_server.broadcast_telemetry();
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+    // Flush queued broadcast messages every 20ms for low-latency token delivery
+    threads.emplace_back([&] {
+        while (g_running) {
+            ws_server.flush_broadcasts();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     });
 
@@ -58,9 +67,10 @@ int main() {
     std::cout << "\n[REVIA CORE] Shutting down...\n";
     rest_server.stop();
     ws_server.stop();
-    if (rest_thread.joinable()) rest_thread.join();
-    if (ws_thread.joinable()) ws_thread.join();
-    if (telem_thread.joinable()) telem_thread.join();
+    // Join all stored threads
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
 
     return 0;
 }

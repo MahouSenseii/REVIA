@@ -3,6 +3,7 @@ import sys
 import re
 import shutil
 import threading
+import logging
 import importlib.util
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -17,6 +18,8 @@ from PySide6.QtGui import QFont
 from app.voice_profile import VoiceProfile, VoiceMode
 from app.voice_manager import VoiceManager
 from app.tts_backend import QWEN_SPEAKERS, QWEN_LANGUAGES, QWEN_MODEL_SIZES
+
+logger = logging.getLogger(__name__)
 
 QWEN_MODELS = {
     "Base 0.6B (Clone)": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
@@ -793,8 +796,8 @@ class VoiceTab(QScrollArea):
             for i, d in enumerate(sd.query_devices()):
                 if d["max_input_channels"] > 0:
                     self.input_device.addItem(f"{d['name']} (#{i})", userData=i)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error populating input devices: {e}")
 
     def _toggle_mic_test(self, active):
         if not self.audio_service:
@@ -809,8 +812,8 @@ class VoiceTab(QScrollArea):
             self.audio_service._stop_volume_monitor()
             try:
                 self.audio_service.volume_level.disconnect(self._on_volume)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error disconnecting volume signal: {e}")
             self.vol_bar.setValue(0)
             self.mic_level_label.setText("Level: --")
             self.mic_test_btn.setText("Test Microphone")
@@ -1028,8 +1031,8 @@ class VoiceTab(QScrollArea):
                 return "cpu", False   # CUDA compiled but no GPU attached
             except (AssertionError, RuntimeError):
                 return "cpu", True    # CUDA not compiled into this torch
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error detecting CUDA: {e}")
         return "cpu", False
 
     def _qwen_cli_supports_flag(self, qwen_module: str, flag: str) -> bool:
@@ -1043,7 +1046,8 @@ class VoiceTab(QScrollArea):
                 timeout=8,
             )
             return flag in ((result.stdout or "") + (result.stderr or ""))
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error checking Qwen CLI support: {e}")
             return False
 
     def _poll_tts_ready(self):
@@ -1058,8 +1062,8 @@ class VoiceTab(QScrollArea):
                 self.tts_server_status.setStyleSheet("color: #00aa40;")
                 self._tts_ready_timer.stop()
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"TTS server not ready: {e}")
         # Update status with progress dots
         dots = "." * (self._tts_poll_count % 4)
         model_key = self.qwen_model_combo.currentText()
@@ -1166,5 +1170,5 @@ class VoiceTab(QScrollArea):
                             ["taskkill", "/F", "/PID", pid],
                             capture_output=True,
                         )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error killing port listener: {e}")

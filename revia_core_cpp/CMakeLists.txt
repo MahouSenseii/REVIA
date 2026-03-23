@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Set Release build as default and add optimization flags
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
+
 include(FetchContent)
 
 FetchContent_Declare(httplib
@@ -41,6 +48,17 @@ target_link_libraries(revia_core PRIVATE
     nlohmann_json::nlohmann_json
     ixwebsocket
 )
+
+# Add precompiled headers if supported
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.16")
+    target_precompile_headers(revia_core PRIVATE
+        <string>
+        <vector>
+        <mutex>
+        <thread>
+        <functional>
+    )
+endif()
 
 if(WIN32)
     target_link_libraries(revia_core PRIVATE ws2_32 shlwapi)

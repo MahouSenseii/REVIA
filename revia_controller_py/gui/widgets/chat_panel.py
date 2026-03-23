@@ -1,4 +1,5 @@
 import base64
+import logging
 import queue
 import re
 import threading
@@ -9,6 +10,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QTimer, Signal
 from PySide6.QtGui import QFont, QPixmap
 
+logger = logging.getLogger(__name__)
+
 
 class ChatPanel(QFrame):
     tts_session_started = Signal()
@@ -16,11 +19,12 @@ class ChatPanel(QFrame):
     assistant_output_interrupted = Signal()
     vision_mode_changed = Signal(bool)
 
-    def __init__(self, event_bus, client, audio_service=None, parent=None):
+    def __init__(self, event_bus, client, audio_service=None, continuous_audio=None, parent=None):
         super().__init__(parent)
         self.event_bus = event_bus
         self.client = client
         self.audio_service = audio_service
+        self.continuous_audio = continuous_audio  # ContinuousAudioPipeline (PRD §6)
         self.camera_service = None
         self.voice_manager = None
         self.setObjectName("chatPanel")
@@ -30,7 +34,7 @@ class ChatPanel(QFrame):
         self._current_emotion = "neutral"
         # Sentence-level streaming TTS
         self._tts_sentence_buf = ""
-        self._tts_queue = queue.Queue()
+        self._tts_queue = queue.Queue(maxsize=20)
         self._tts_worker_active = False
         self._tts_worker_lock = threading.Lock()
         self._awaiting_reply = False
@@ -40,8 +44,10 @@ class ChatPanel(QFrame):
         self._current_request_id = ""
         self._last_completed_text = ""
         self._tts_session_interrupted = False
+        self._server_sentence_streaming = False  # Set True when chat_sentence events arrive
         # Each item: (text, image_b64, vision_context, stack_index, stack_total, source)
         self._outbound_queue = []
+        self._OUTBOUND_QUEUE_MAX = 50  # Prevent unbounded memory growth
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -103,11 +109,22 @@ class ChatPanel(QFrame):
         self.event_bus.chat_complete_payload.connect(self._on_complete_payload)
         self.event_bus.proactive_start.connect(self._on_proactive_start)
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
+        self.event_bus.chat_sentence.connect(self._on_chat_sentence)
+        self.event_bus.interrupt_ack.connect(self._on_interrupt_ack)
 
         # Wire up audio service
         if self.audio_service:
             self.audio_service.speech_recognized.connect(
                 self._on_speech_recognized
+            )
+
+        # Wire up ContinuousAudioPipeline (PRD §6) for barge-in detection
+        if self.continuous_audio:
+            self.continuous_audio.interruption_detected.connect(
+                self._on_barge_in_detected
+            )
+            self.continuous_audio.speech_onset.connect(
+                self._on_continuous_speech_onset
             )
 
         self._conversation_starter = None
@@ -131,6 +148,28 @@ class ChatPanel(QFrame):
                 self.tts_combo.setCurrentText("Qwen3-TTS (Quality)")
             elif eng == "pyttsx3":
                 self.tts_combo.setCurrentText("pyttsx3 (Fast)")
+
+    def _on_barge_in_detected(self, fragment):
+        """User spoke while TTS was playing — interrupt output."""
+        logger.info("[ChatPanel] Barge-in detected: %s", fragment[:50])
+        if self._assistant_audio_active:
+            self._interrupt_output()
+            self.chat_display.append(
+                '<span style="color:#f59e0b;font-size:9px;">'
+                f'[Barge-in: "{fragment[:30]}..."]</span>'
+            )
+
+    def _on_continuous_speech_onset(self):
+        """ContinuousAudio detected user starting to speak."""
+        logger.debug("[ChatPanel] Continuous VAD: speech onset")
+
+    def _notify_continuous_audio_tts_state(self, is_speaking: bool):
+        """Tell ContinuousAudioPipeline whether TTS is actively playing."""
+        if self.continuous_audio:
+            try:
+                self.continuous_audio.notify_revia_speaking(is_speaking)
+            except Exception:
+                pass
 
     def _on_tts_engine_changed(self, text):
         if text == "Off":
@@ -163,6 +202,57 @@ class ChatPanel(QFrame):
         if self.audio_service and not self.audio_service._always_listening:
             self.mic_btn.setChecked(False)
 
+    def _on_chat_sentence(self, sentence, request_id):
+        """Server emitted a complete sentence — queue it for TTS immediately.
+
+        This enables sentence-level streaming: TTS starts speaking the first
+        sentence while the LLM is still generating the rest.
+        """
+        # Mark that server provides sentence events — disables old local extraction
+        self._server_sentence_streaming = True
+        if not self.voice_manager or not sentence.strip():
+            return
+        tts_mode = self.tts_combo.currentText()
+        if tts_mode == "Off":
+            return
+        # Only queue if this sentence belongs to the current request
+        if request_id and self._current_request_id and request_id != self._current_request_id:
+            return
+        try:
+            self._tts_queue.put_nowait((sentence, self._current_emotion))
+            self._ensure_tts_worker()
+        except queue.Full:
+            logger.warning("[ChatPanel] TTS queue full, dropping sentence")
+
+    def _interrupt_output(self):
+        """Stop TTS playback and clear the sentence queue."""
+        # Set interrupted flag first so the TTS worker stops picking up new items
+        with self._tts_worker_lock:
+            self._tts_session_interrupted = True
+            self._assistant_audio_active = False
+        # Drain the queue — get_nowait() is atomic; safety cap prevents infinite loop
+        drained = 0
+        for _ in range(200):  # Safety cap: queue maxsize is 20, 200 is generous
+            try:
+                self._tts_queue.get_nowait()
+                self._tts_queue.task_done()
+                drained += 1
+            except queue.Empty:
+                break
+        # Stop any active playback
+        if self.voice_manager and hasattr(self.voice_manager, 'backend'):
+            try:
+                self.voice_manager.backend.stop_output()
+            except Exception:
+                pass
+        self._notify_continuous_audio_tts_state(False)
+        self.assistant_output_interrupted.emit()
+        logger.info("[ChatPanel] Output interrupted, TTS queue cleared")
+
+    def _on_interrupt_ack(self):
+        """Server acknowledged interrupt — clear TTS queue."""
+        self._interrupt_output()
+
     def _on_proactive_start(self):
         """Revia is about to speak unprompted — show a subtle indicator."""
         self.chat_display.append(
@@ -172,7 +262,7 @@ class ChatPanel(QFrame):
 
     def _send(self):
         text = self.input_field.text().strip()
-        if not text:
+        if not text or len(text) > 10000:
             return
         source = self._pending_input_source or "UserMessage"
         reason = "voice input response" if source == "VoiceInput" else "manual user message"
@@ -229,6 +319,9 @@ class ChatPanel(QFrame):
         self.input_field.clear()
         if self._awaiting_reply:
             for idx, q in enumerate(stacked_questions, start=1):
+                if len(self._outbound_queue) >= self._OUTBOUND_QUEUE_MAX:
+                    logger.warning("[ChatPanel] Outbound queue full (%d), dropping remaining", self._OUTBOUND_QUEUE_MAX)
+                    break
                 self._outbound_queue.append(
                     (q, image_b64, vision_context, idx, stack_total, source)
                 )
@@ -249,6 +342,9 @@ class ChatPanel(QFrame):
         )
         if stack_total > 1:
             for idx, q in enumerate(stacked_questions[1:], start=2):
+                if len(self._outbound_queue) >= self._OUTBOUND_QUEUE_MAX:
+                    logger.warning("[ChatPanel] Outbound queue full (%d), dropping remaining", self._OUTBOUND_QUEUE_MAX)
+                    break
                 self._outbound_queue.append(
                     (q, image_b64, vision_context, idx, stack_total, source)
                 )
@@ -292,8 +388,9 @@ class ChatPanel(QFrame):
         self._current_response = ""
         self._full_response = ""
         self._tts_sentence_buf = ""
-        # Drain any leftover TTS queue from previous response
-        while not self._tts_queue.empty():
+        self._server_sentence_streaming = False  # Reset for each new request
+        # Drain any leftover TTS queue from previous response (fix TOCTOU race)
+        while True:
             try:
                 self._tts_queue.get_nowait()
             except queue.Empty:
@@ -342,14 +439,19 @@ class ChatPanel(QFrame):
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
-        # Sentence-streaming TTS: queue completed sentences immediately
-        tts_mode = self.tts_combo.currentText()
-        if tts_mode.startswith("pyttsx3") and self.voice_manager:
-            self._tts_sentence_buf += token
-            self._flush_tts_sentences(end_of_response=False)
+        # NOTE: Sentence-level TTS is now handled by server-side chat_sentence
+        # events via _on_chat_sentence(). The old local sentence extraction below
+        # is kept ONLY as a fallback for pyttsx3 when server doesn't send
+        # chat_sentence events (e.g., older server versions).
+        # To avoid double-playback, we track whether chat_sentence events arrived.
+        if not self._server_sentence_streaming:
+            tts_mode = self.tts_combo.currentText()
+            if tts_mode.startswith("pyttsx3") and self.voice_manager:
+                self._tts_sentence_buf += token
+                self._flush_tts_sentences(end_of_response=False)
 
     def _flush_tts_sentences(self, end_of_response=False):
-        """Split buffer on sentence boundaries and queue each complete sentence."""
+        """Split buffer on sentence boundaries and queue each complete sentence with emotion."""
         buf = self._tts_sentence_buf
         while buf:
             # Find earliest sentence terminator followed by whitespace (or end if flushing)
@@ -370,7 +472,8 @@ class ChatPanel(QFrame):
             sentence = buf[:best].strip()
             buf = buf[best:].lstrip()
             if len(sentence) > 2 and not sentence.startswith('['):
-                self._tts_queue.put(sentence)
+                # Queue (text, emotion) tuple
+                self._tts_queue.put((sentence, self._current_emotion))
                 self._ensure_tts_worker()
         self._tts_sentence_buf = buf
 
@@ -387,11 +490,21 @@ class ChatPanel(QFrame):
         """Background thread: consumes sentence queue and speaks each one in order."""
         while True:
             try:
-                sentence = self._tts_queue.get(timeout=1.0)
-                self._assistant_audio_active = True
+                item = self._tts_queue.get(timeout=1.0)
+                # Unpack (text, emotion) tuple
+                if isinstance(item, tuple) and len(item) == 2:
+                    sentence, emotion = item
+                else:
+                    # Legacy: handle plain text items
+                    sentence = item
+                    emotion = self._current_emotion
+                with self._tts_worker_lock:
+                    self._assistant_audio_active = True
+                # Notify ContinuousAudio that TTS is playing (enables barge-in detection)
+                self._notify_continuous_audio_tts_state(True)
                 self.event_bus.log_entry.emit("[Revia] TTS start")
                 self.voice_manager.speak_sync(
-                    sentence, emotion=self._current_emotion
+                    sentence, emotion=emotion
                 )
                 self.event_bus.log_entry.emit("[Revia] TTS end")
                 self._tts_queue.task_done()
@@ -402,10 +515,13 @@ class ChatPanel(QFrame):
                         self._assistant_audio_active = False
                         self._tts_worker_active = False
                         self._tts_session_interrupted = False
+                        # Notify ContinuousAudio that TTS stopped
+                        self._notify_continuous_audio_tts_state(False)
                         if not was_interrupted:
                             self.tts_session_finished.emit(False)
                         return
             except Exception as exc:
+                logger.error(f"TTS worker error: {exc}")
                 self.event_bus.log_entry.emit(f"[Revia] TTS worker error: {exc}")
                 with self._tts_worker_lock:
                     was_interrupted = self._tts_session_interrupted
@@ -416,8 +532,9 @@ class ChatPanel(QFrame):
                     self.tts_session_finished.emit(False)
                 return
             finally:
-                if self._tts_queue.empty():
-                    self._assistant_audio_active = False
+                with self._tts_worker_lock:
+                    if self._tts_queue.empty():
+                        self._assistant_audio_active = False
 
     def _on_telemetry(self, data):
         emotion = data.get("emotion", {}) if isinstance(data, dict) else {}
@@ -456,14 +573,11 @@ class ChatPanel(QFrame):
             self._current_request_id = ""
             if self._outbound_queue:
                 nxt_text, nxt_img, nxt_ctx, _nxt_i, _nxt_n, nxt_source = self._outbound_queue.pop(0)
+                # Bind variables via default args to avoid closure capture bugs
                 QTimer.singleShot(
                     250,
-                    lambda: self._start_request(
-                        nxt_text,
-                        image_b64=nxt_img,
-                        vision_context=nxt_ctx,
-                        source=nxt_source,
-                        reason="queued user message",
+                    lambda _t=nxt_text, _i=nxt_img, _c=nxt_ctx, _s=nxt_source: self._start_request(
+                        _t, image_b64=_i, vision_context=_c, source=_s, reason="queued user message",
                     ),
                 )
             return
@@ -487,14 +601,16 @@ class ChatPanel(QFrame):
                     remaining = self._tts_sentence_buf.strip()
                     self._tts_sentence_buf = ""
                     if remaining and not remaining.startswith('['):
-                        self._tts_queue.put(remaining)
+                        # Queue (text, emotion) tuple
+                        self._tts_queue.put((remaining, self._current_emotion))
                         self._ensure_tts_worker()
                 else:
                     # For Qwen quality mode, synthesize once per completed reply
                     clean = (text or "").strip()
                     self._tts_sentence_buf = ""
                     if clean and not clean.startswith('['):
-                        self._tts_queue.put(clean)
+                        # Queue (text, emotion) tuple
+                        self._tts_queue.put((clean, self._current_emotion))
                         self._ensure_tts_worker()
             elif self.audio_service:
                 clean = (text or "").strip()
@@ -513,20 +629,17 @@ class ChatPanel(QFrame):
                     '<span style="color:#9ca3af;font-size:9px;">'
                     f'[Continuing stacked question {nxt_i}/{nxt_n}]</span>'
                 )
+            # Bind variables via default args to avoid closure capture bugs
             QTimer.singleShot(
                 900,
-                lambda: self._start_request(
-                    nxt_text,
-                    image_b64=nxt_img,
-                    vision_context=nxt_ctx,
-                    source=nxt_source,
-                    reason="queued user message",
+                lambda _t=nxt_text, _i=nxt_img, _c=nxt_ctx, _s=nxt_source: self._start_request(
+                    _t, image_b64=_i, vision_context=_c, source=_s, reason="queued user message",
                 ),
             )
 
     def interrupt_assistant_output(self):
         self._tts_sentence_buf = ""
-        while not self._tts_queue.empty():
+        while True:
             try:
                 self._tts_queue.get_nowait()
             except queue.Empty:
@@ -540,8 +653,8 @@ class ChatPanel(QFrame):
         if self.voice_manager:
             try:
                 self.voice_manager.stop_output()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error stopping voice output: {e}")
         self.assistant_output_interrupted.emit()
 
     def _on_vision_toggled(self, active):

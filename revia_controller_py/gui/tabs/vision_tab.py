@@ -39,6 +39,7 @@ class VisionTab(QScrollArea):
         self.resolution = QComboBox()
         self.resolution.addItems(["640x480", "1280x720", "1920x1080"])
         g.addRow("Resolution:", self.resolution)
+        self.resolution.setVisible(False)  # Internal: auto-detected
 
         self.auto_capture = QCheckBox("Auto-capture on vision queries")
         self.auto_capture.setChecked(True)

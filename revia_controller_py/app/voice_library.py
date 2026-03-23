@@ -46,11 +46,16 @@ class VoiceLibrary:
         return self._make_fallback()
 
     def set_default(self, name):
+        if name is None or name not in self._profiles:
+            return False
         for n, p in self._profiles.items():
+            if p is None:
+                continue
             p.is_default = (n == name)
             p.save(self.base_dir / self._safe_name(n))
         self._default_name = name
         self._save_manifest()
+        return True
 
     def save_profile(self, profile):
         """Save or overwrite a voice profile."""
@@ -123,7 +128,12 @@ class VoiceLibrary:
             subprocess.Popen(["explorer", str(self.base_dir)])
 
     def _safe_name(self, name):
-        return "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()
+        # Ensure the resolved path is within base_dir (path traversal protection)
+        resolved = (self.base_dir / safe).resolve()
+        if not str(resolved).startswith(str(self.base_dir.resolve())):
+            raise ValueError(f"Path traversal attempt detected: {name}")
+        return safe
 
     def _make_fallback(self):
         p = VoiceProfile("Fallback", VoiceMode.CUSTOM)

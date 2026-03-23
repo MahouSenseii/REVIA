@@ -29,6 +29,10 @@ except Exception:
     _DEPTHAI_IMPORT_ERROR = str(sys.exc_info()[1])
 
 
+# Module-level lock for synchronizing access to global state
+_GLOBAL_STATE_LOCK = threading.Lock()
+
+
 class CameraService(QObject):
     frame_ready = Signal(QPixmap)
     camera_list_updated = Signal(list)
@@ -469,48 +473,49 @@ class CameraService(QObject):
                 return
 
         self._latest_frame = frame
-        self._frame_count += 1
+        self._frame_count = (self._frame_count + 1) % (2**31)
 
         annotated = frame
         if self._detector_enabled and "None" not in self._detector_engine:
-            if self._detector_future is not None and self._detector_future.done():
-                try:
-                    detections, err = self._detector_future.result()
-                except Exception as exc:
-                    detections, err = [], f"Detector worker failed: {exc}"
-                self._detector_future = None
-                if err:
-                    self._detector_last_results = []
-                    if err != self._detector_last_error:
-                        self._detector_last_error = err
+            with self._detector_lock:
+                if self._detector_future is not None and self._detector_future.done():
+                    try:
+                        detections, err = self._detector_future.result()
+                    except Exception as exc:
+                        detections, err = [], f"Detector worker failed: {exc}"
+                    self._detector_future = None
+                    if err:
+                        self._detector_last_results = []
+                        if err != self._detector_last_error:
+                            self._detector_last_error = err
+                            self.detection_updated.emit({
+                                "engine": self._detector_engine,
+                                "detections": [],
+                                "latency_ms": 0.0,
+                                "error": err,
+                                "realtime": self._detector_enabled,
+                            })
+                    else:
+                        self._detector_last_error = ""
+                        self._detector_last_results = detections
                         self.detection_updated.emit({
                             "engine": self._detector_engine,
-                            "detections": [],
-                            "latency_ms": 0.0,
-                            "error": err,
+                            "detections": detections,
+                            "latency_ms": round(self._detector_latency_ms, 2),
+                            "error": "",
                             "realtime": self._detector_enabled,
                         })
-                else:
-                    self._detector_last_error = ""
-                    self._detector_last_results = detections
-                    self.detection_updated.emit({
-                        "engine": self._detector_engine,
-                        "detections": detections,
-                        "latency_ms": round(self._detector_latency_ms, 2),
-                        "error": "",
-                        "realtime": self._detector_enabled,
-                    })
 
-            should_run = (
-                (self._frame_count % self._detector_frame_stride == 0)
-                or not self._detector_last_results
-            )
-            if should_run and self._detector_future is None:
-                self._detector_future = self._detector_pool.submit(
-                    self._run_detector,
-                    frame.copy(),
-                    False,
+                should_run = (
+                    (self._frame_count % self._detector_frame_stride == 0)
+                    or not self._detector_last_results
                 )
+                if should_run and self._detector_future is None:
+                    self._detector_future = self._detector_pool.submit(
+                        self._run_detector,
+                        frame.copy(),
+                        False,
+                    )
 
             if self._detector_last_results:
                 annotated = self._draw_detections(frame.copy(), self._detector_last_results)
@@ -607,16 +612,17 @@ class CameraService(QObject):
 
     def _ensure_depthai(self):
         global _DEPTHAI_AVAILABLE, _DEPTHAI, _DEPTHAI_IMPORT_ERROR
-        if _DEPTHAI_AVAILABLE:
-            return True, ""
-        try:
-            import depthai as _DEPTHAI_DYNAMIC
-            _DEPTHAI = _DEPTHAI_DYNAMIC
-            _DEPTHAI_AVAILABLE = True
-            _DEPTHAI_IMPORT_ERROR = ""
-            return True, ""
-        except Exception as exc:
-            _DEPTHAI_IMPORT_ERROR = str(exc)
+        with _GLOBAL_STATE_LOCK:
+            if _DEPTHAI_AVAILABLE:
+                return True, ""
+            try:
+                import depthai as _DEPTHAI_DYNAMIC
+                _DEPTHAI = _DEPTHAI_DYNAMIC
+                _DEPTHAI_AVAILABLE = True
+                _DEPTHAI_IMPORT_ERROR = ""
+                return True, ""
+            except Exception as exc:
+                _DEPTHAI_IMPORT_ERROR = str(exc)
 
         project_root = Path(__file__).resolve().parents[2]
         site_candidates = [project_root / ".venv" / "Lib" / "site-packages"]
@@ -654,58 +660,59 @@ class CameraService(QObject):
 
     def _ensure_yolo_model(self):
         global _YOLO_AVAILABLE, _YOLO, _YOLO_IMPORT_ERROR
-        if not _YOLO_AVAILABLE:
-            now = time.monotonic()
-            if (
-                self._yolo_import_last_msg
-                and (now - self._yolo_import_last_try) < self._yolo_import_retry_s
-            ):
-                return False, self._yolo_import_last_msg
-            self._yolo_import_last_try = now
-            # Retry import at runtime so users can install ultralytics
-            # without needing to fully rebuild anything.
-            try:
-                from ultralytics import YOLO as _YOLO_DYNAMIC
-                _YOLO = _YOLO_DYNAMIC
-                _YOLO_AVAILABLE = True
-                _YOLO_IMPORT_ERROR = ""
-                self._yolo_import_last_msg = ""
-            except Exception as exc:
-                _YOLO_IMPORT_ERROR = str(exc)
-                # Fallback: try importing from project's local .venv even if
-                # the controller was launched under a different interpreter.
-                project_root = Path(__file__).resolve().parents[2]
-                site_candidates = [
-                    project_root / ".venv" / "Lib" / "site-packages",
-                ]
-                site_candidates.extend(
-                    Path(p) for p in glob.glob(
-                        str(project_root / ".venv" / "lib" / "python*" / "site-packages")
+        with _GLOBAL_STATE_LOCK:
+            if not _YOLO_AVAILABLE:
+                now = time.monotonic()
+                if (
+                    self._yolo_import_last_msg
+                    and (now - self._yolo_import_last_try) < self._yolo_import_retry_s
+                ):
+                    return False, self._yolo_import_last_msg
+                self._yolo_import_last_try = now
+                # Retry import at runtime so users can install ultralytics
+                # without needing to fully rebuild anything.
+                try:
+                    from ultralytics import YOLO as _YOLO_DYNAMIC
+                    _YOLO = _YOLO_DYNAMIC
+                    _YOLO_AVAILABLE = True
+                    _YOLO_IMPORT_ERROR = ""
+                    self._yolo_import_last_msg = ""
+                except Exception as exc:
+                    _YOLO_IMPORT_ERROR = str(exc)
+                    # Fallback: try importing from project's local .venv even if
+                    # the controller was launched under a different interpreter.
+                    project_root = Path(__file__).resolve().parents[2]
+                    site_candidates = [
+                        project_root / ".venv" / "Lib" / "site-packages",
+                    ]
+                    site_candidates.extend(
+                        Path(p) for p in glob.glob(
+                            str(project_root / ".venv" / "lib" / "python*" / "site-packages")
+                        )
                     )
-                )
-                for sp in site_candidates:
-                    if not sp.is_dir():
-                        continue
-                    sp_str = str(sp.resolve())
-                    if sp_str not in sys.path:
-                        sys.path.insert(0, sp_str)
-                    try:
-                        from ultralytics import YOLO as _YOLO_DYNAMIC
-                        _YOLO = _YOLO_DYNAMIC
-                        _YOLO_AVAILABLE = True
-                        _YOLO_IMPORT_ERROR = ""
-                        self._yolo_import_last_msg = ""
-                        break
-                    except Exception:
-                        continue
-                if not _YOLO_AVAILABLE:
-                    msg = (
-                        "YOLO unavailable in this interpreter. "
-                        f"python={sys.executable} | error={_YOLO_IMPORT_ERROR}. "
-                        "Install into that same environment: python -m pip install ultralytics"
-                    )
-                    self._yolo_import_last_msg = msg
-                    return False, msg
+                    for sp in site_candidates:
+                        if not sp.is_dir():
+                            continue
+                        sp_str = str(sp.resolve())
+                        if sp_str not in sys.path:
+                            sys.path.insert(0, sp_str)
+                        try:
+                            from ultralytics import YOLO as _YOLO_DYNAMIC
+                            _YOLO = _YOLO_DYNAMIC
+                            _YOLO_AVAILABLE = True
+                            _YOLO_IMPORT_ERROR = ""
+                            self._yolo_import_last_msg = ""
+                            break
+                        except Exception:
+                            continue
+                    if not _YOLO_AVAILABLE:
+                        msg = (
+                            "YOLO unavailable in this interpreter. "
+                            f"python={sys.executable} | error={_YOLO_IMPORT_ERROR}. "
+                            "Install into that same environment: python -m pip install ultralytics"
+                        )
+                        self._yolo_import_last_msg = msg
+                        return False, msg
 
         model_id = "yolov8n.pt"
         if "YOLO-World" in self._detector_engine:
@@ -724,9 +731,30 @@ class CameraService(QObject):
             self._yolo_model_id = ""
             return False, f"Failed to load YOLO model '{model_id}': {exc}"
 
-    def __del__(self):
+    def close(self):
+        """Explicitly release the camera and shut down the detector thread pool.
+
+        Call this when the owning component is destroyed rather than relying on
+        ``__del__``, which is not guaranteed to run when circular references exist.
+        """
+        self.disconnect_camera()
         try:
             self._detector_pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # cancel_futures keyword was added in Python 3.9
+            self._detector_pool.shutdown(wait=False)
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Best-effort cleanup — always prefer calling close() explicitly.
+        try:
+            self._detector_pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                self._detector_pool.shutdown(wait=False)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -769,5 +797,5 @@ class CameraService(QObject):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-            return QPixmap.fromImage(img)
+            return QPixmap.fromImage(img.copy())
         return QPixmap()

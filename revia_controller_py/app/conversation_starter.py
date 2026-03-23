@@ -35,6 +35,13 @@ class ConversationStarter(QObject):
         self._enabled = False
         self._timer.stop()
 
+    def cleanup(self):
+        """Stop the timer and clean up resources."""
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+
     @property
     def is_enabled(self):
         return self._enabled
@@ -97,4 +104,8 @@ class ConversationStarter(QObject):
         self._last_activity = time.monotonic()
         if startup:
             self._startup_sent = True
+            # Also clear the "pending" flag so that a future reconnect cycle
+            # (e.g. after losing and regaining the LLM connection) can re-arm
+            # a startup greeting if _startup_sent is reset externally.
+            self._startup_scheduled = False
         self._client.send_proactive(force=force, source=source, reason=reason)

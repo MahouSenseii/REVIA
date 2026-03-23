@@ -52,7 +52,7 @@ def main():
     client.start()
 
     ret = app.exec()
-    client.stop()
+    client.shutdown()   # stop() + executor.shutdown(); ensures clean thread teardown
     sys.exit(ret)
 
 

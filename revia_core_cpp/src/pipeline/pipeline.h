@@ -26,6 +26,7 @@ public:
 
     void process(const PipelineRequest& req);
     void set_llm_config(const std::string& server_url, const std::string& model);
+    void set_system_prompt(const std::string& prompt);
 
     std::atomic<bool> emotion_enabled{true};
     std::atomic<bool> router_enabled{true};
@@ -39,6 +40,15 @@ private:
     std::mutex llm_cfg_mtx_;
     std::string llm_url_{"http://127.0.0.1:8080"};
     std::string llm_model_{"default"};
+    // System prompt injected into every LLM request.  Updated via the REST
+    // API from the active character profile so the C++ core can match the
+    // Python core's personality layer.
+    std::string system_prompt_{"You are REVIA, a helpful AI assistant."};
+
+    // Cache parsed URL components to avoid re-parsing on every request
+    std::string cached_url_;
+    std::string cached_host_;
+    int cached_port_{8080};
 
     void stage_input_capture(const PipelineRequest& req);
     void stage_stt_batch(const PipelineRequest& req);

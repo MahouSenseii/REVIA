@@ -35,6 +35,7 @@ class REVIADiscordBot:
         self.status = "stopped"
         self.last_error = None
         self.messages_processed = 0
+        self._counter_lock = threading.Lock()
         # Pre-convert ID lists to sets of strings for O(1) per-message lookup
         self._allowed_guilds: set[str] = {str(g) for g in config.get("guild_ids", [])}
         self._allowed_channels: set[str] = {str(c) for c in config.get("channel_ids", [])}
@@ -65,6 +66,10 @@ class REVIADiscordBot:
                 return
 
             cfg = bot_ref.config
+
+            # Ignore DMs — guild is None for direct messages
+            if message.guild is None:
+                return
 
             # Guild filter (sets pre-built at init for O(1) lookup)
             if bot_ref._allowed_guilds and str(message.guild.id) not in bot_ref._allowed_guilds:
@@ -100,8 +105,8 @@ class REVIADiscordBot:
             username = message.author.display_name
             platform_context = f"[Discord user {username}]: {content}"
 
-            # Natural typing delay — makes responses feel less instant/robotic
-            delay_range = cfg.get("typing_delay_ms", [600, 1800])
+            # Natural typing delay — makes responses feel less instant/robotic (configurable, reduced default)
+            delay_range = cfg.get("typing_delay_ms", [100, 400])  # Reduced from [600, 1800]
             if isinstance(delay_range, list) and len(delay_range) == 2:
                 delay_s = random.uniform(delay_range[0], delay_range[1]) / 1000
             else:
@@ -111,20 +116,44 @@ class REVIADiscordBot:
                 if delay_s > 0:
                     await asyncio.sleep(delay_s)
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     response = await loop.run_in_executor(
                         bot_ref._executor, bot_ref.pipeline_fn, platform_context
                     )
-                    bot_ref.messages_processed += 1
+                    with bot_ref._counter_lock:
+                        bot_ref.messages_processed += 1
                     if response:
-                        for chunk in _split_message(response, 1900):
-                            await message.channel.send(chunk)
+                        try:
+                            chunks = _split_message(response, 1900)
+                            if not isinstance(chunks, list) or not all(isinstance(c, str) for c in chunks):
+                                raise ValueError("Invalid response format from _split_message")
+                            for chunk in chunks:
+                                await message.channel.send(chunk)
+                        except Exception as exc:
+                            logger.error(f"[Discord] Message splitting error: {exc}")
+                            bot_ref.last_error = str(exc)
                 except Exception as exc:
                     logger.error(f"[Discord] Pipeline error: {exc}")
                     bot_ref.last_error = str(exc)
 
         return client
+
+    # ------------------------------------------------------------------
+    # Voice channel support (placeholder)
+    # ------------------------------------------------------------------
+
+    async def join_voice_channel(self, channel_id: int):
+        """Join a voice channel for audio interaction.
+
+        TODO: Implement full voice support with:
+        - discord.VoiceClient connection
+        - Audio sink for STT (pipe to continuous_audio)
+        - Audio source for TTS (pipe from tts_backend)
+        - Speaker identification for multi-user conversation
+        """
+        logger.info("Voice channel support not yet implemented (channel: %d)", channel_id)
+        return None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -158,6 +187,8 @@ class REVIADiscordBot:
                 self.running = False
                 if self.status != "error":
                     self.status = "stopped"
+                if self._loop and not self._loop.is_closed():
+                    self._loop.close()
 
         self._thread = threading.Thread(target=_run, daemon=True, name="revia-discord")
         self._thread.start()
@@ -177,11 +208,13 @@ class REVIADiscordBot:
         self.status = "stopped"
 
     def get_status(self) -> dict:
+        with self._counter_lock:
+            count = self.messages_processed
         return {
             "running": self.running,
             "status": self.status,
             "last_error": self.last_error,
-            "messages_processed": self.messages_processed,
+            "messages_processed": count,
             "available": DISCORD_AVAILABLE,
         }
 

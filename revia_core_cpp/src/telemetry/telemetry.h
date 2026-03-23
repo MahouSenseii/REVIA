@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <chrono>
 #include <fstream>
@@ -94,7 +95,7 @@ public:
 private:
     TelemetryEngine();
     mutable std::mutex mtx_;
-    std::vector<TelemetrySpan> spans_;
+    std::deque<TelemetrySpan> spans_;  // Use deque for efficient front removal
     LLMMetrics llm_;
     EmotionOutput emotion_;
     RouterOutput router_;
@@ -102,6 +103,7 @@ private:
     std::string state_ = "Idle";
     Clock::time_point epoch_;
     std::ofstream log_file_;
+    ~TelemetryEngine();  // Destructor to flush and close log file
 };
 
 } // namespace revia

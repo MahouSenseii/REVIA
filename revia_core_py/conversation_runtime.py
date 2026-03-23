@@ -24,6 +24,9 @@ class ReviaState(str, Enum):
     SPEAKING = "Speaking"
     COOLDOWN = "Cooldown"
     ERROR = "Error"
+    # PRD §8 — IHS states
+    INTERRUPTED = "Interrupted"   # user barged in while Revia was speaking
+    RECOVERING  = "Recovering"    # pipeline is rebuilding after interruption
 
 
 class TriggerKind(str, Enum):
@@ -153,6 +156,7 @@ class ConversationStateMachine:
             ReviaState.COOLDOWN,
             ReviaState.IDLE,
             ReviaState.ERROR,
+            ReviaState.INTERRUPTED,   # PRD §8 — barge-in while speaking
         },
         ReviaState.COOLDOWN: {
             ReviaState.IDLE,
@@ -162,6 +166,18 @@ class ConversationStateMachine:
             ReviaState.INITIALIZING,
             ReviaState.IDLE,
         },
+        # PRD §8 — IHS recovery transitions
+        ReviaState.INTERRUPTED: {
+            ReviaState.RECOVERING,
+            ReviaState.LISTENING,
+            ReviaState.IDLE,
+            ReviaState.ERROR,
+        },
+        ReviaState.RECOVERING: {
+            ReviaState.THINKING,
+            ReviaState.IDLE,
+            ReviaState.ERROR,
+        },
     }
 
     def __init__(self, log_fn):
@@ -170,10 +186,57 @@ class ConversationStateMachine:
         self._state = ReviaState.BOOTING
         self._updated_at = time.monotonic()
 
+        # ── PRD §8 — IHS extended state fields ───────────────────────────
+        self.interruption_type: str   = ""     # last InterruptionType value
+        self.partial_response_spoken: str = "" # text Revia had delivered before barge-in
+        self.topic_shift_confidence: float = 0.0
+
+        # ── PRD §10/§12 — AVS / ALE extended state fields ────────────────
+        self.answer_confidence_last: float = 0.0  # last AVS composite score
+        self.regen_count: int    = 0   # regens on the current turn
+        self.loop_risk_score: float = 0.0  # last ALE loop_risk_score
+
     @property
     def state(self) -> str:
         with self._lock:
             return self._state.value
+
+    # ── PRD §8 IHS helpers ────────────────────────────────────────────────
+
+    def record_interruption(
+        self,
+        interruption_type: str,
+        partial_spoken: str = "",
+        topic_shift_confidence: float = 0.0,
+    ) -> None:
+        """Persist IHS classification results into the FSM for downstream use."""
+        with self._lock:
+            self.interruption_type        = interruption_type
+            self.partial_response_spoken  = partial_spoken
+            self.topic_shift_confidence   = topic_shift_confidence
+
+    def record_avs_result(self, composite: float, regen_count: int = 0) -> None:
+        """Persist the latest AVS composite score and regen counter."""
+        with self._lock:
+            self.answer_confidence_last = composite
+            self.regen_count            = regen_count
+
+    def record_ale_result(self, loop_risk_score: float) -> None:
+        """Persist the latest ALE loop_risk_score."""
+        with self._lock:
+            self.loop_risk_score = loop_risk_score
+
+    def get_extended_state(self) -> dict:
+        """Return a snapshot of all PRD extended state fields."""
+        with self._lock:
+            return {
+                "interruption_type":       self.interruption_type,
+                "partial_response_spoken": self.partial_response_spoken[:80],
+                "topic_shift_confidence":  round(self.topic_shift_confidence, 4),
+                "answer_confidence_last":  round(self.answer_confidence_last, 4),
+                "regen_count":             self.regen_count,
+                "loop_risk_score":         round(self.loop_risk_score, 4),
+            }
 
     def transition(self, new_state: ReviaState | str, reason: str = "", force: bool = False) -> bool:
         if not isinstance(new_state, ReviaState):
@@ -279,7 +342,13 @@ class BehaviorController:
         self._log(f"Cooldown started: {name} ({duration:.1f}s)")
 
     def remaining_cooldown(self, name: str) -> float:
-        return self.active_cooldowns().get(name, 0.0)
+        """Get remaining cooldown time without re-acquiring lock. Call within lock context if available."""
+        now = time.monotonic()
+        with self._lock:
+            expires_at = self._cooldowns.get(name, 0.0)
+            if expires_at <= now:
+                return 0.0
+            return round(max(0.0, expires_at - now), 3)
 
     def evaluate(
         self,

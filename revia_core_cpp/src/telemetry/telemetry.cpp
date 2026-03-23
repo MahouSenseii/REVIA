@@ -28,6 +28,13 @@ TelemetryEngine::TelemetryEngine() : epoch_(Clock::now()) {
     log_file_.open(fname.str(), std::ios::app);
 }
 
+TelemetryEngine::~TelemetryEngine() {
+    if (log_file_.is_open()) {
+        log_file_.flush();
+        log_file_.close();
+    }
+}
+
 TelemetrySpan TelemetryEngine::begin_span(const std::string& stage, const std::string& device) {
     TelemetrySpan s;
     s.stage = stage;
@@ -47,11 +54,16 @@ void TelemetryEngine::end_span(TelemetrySpan& s) {
 
     std::lock_guard<std::mutex> lk(mtx_);
     spans_.push_back(s);
-    if (spans_.size() > 500)
-        spans_.erase(spans_.begin(), spans_.begin() + 100);
+    // Use deque's efficient pop_front instead of vector erase
+    if (spans_.size() > 500) {
+        // Remove oldest 100 spans efficiently
+        for (int i = 0; i < 100 && !spans_.empty(); ++i) {
+            spans_.pop_front();
+        }
+    }
     if (log_file_.is_open()) {
+        // Let OS buffer writes - remove explicit flush for async I/O performance
         log_file_ << s.to_json().dump() << "\n";
-        log_file_.flush();
     }
 }
 
@@ -73,7 +85,7 @@ std::string TelemetryEngine::get_state() const { std::lock_guard lk(mtx_); retur
 std::vector<TelemetrySpan> TelemetryEngine::get_recent_spans(int n) const {
     std::lock_guard lk(mtx_);
     int start = std::max(0, static_cast<int>(spans_.size()) - n);
-    return {spans_.begin() + start, spans_.end()};
+    return std::vector<TelemetrySpan>(spans_.begin() + start, spans_.end());
 }
 
 json TelemetryEngine::get_snapshot() const {

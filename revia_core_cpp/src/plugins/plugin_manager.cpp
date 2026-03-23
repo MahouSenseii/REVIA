@@ -79,12 +79,12 @@ bool PluginManager::disable(const std::string& name) {
     return false;
 }
 
-PluginInfo* PluginManager::find(const std::string& name) {
+std::optional<PluginInfo> PluginManager::find(const std::string& name) const {
     std::lock_guard lk(mtx_);
-    for (auto& p : plugins_) {
-        if (p.name == name) return &p;
+    for (const auto& p : plugins_) {
+        if (p.name == name) return p;  // Return copy by value
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 json PluginManager::to_json() const {

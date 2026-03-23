@@ -15,6 +15,13 @@ services:
     volumes:
       - revia_redis_data:/data
     command: redis-server --appendonly yes --save 60 1 --save 300 10
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    cap_drop:
+      - ALL
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -38,6 +45,13 @@ services:
     depends_on:
       revia-redis:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+    cap_drop:
+      - ALL
     volumes:
       - revia_core_data:/app/data
       - revia_core_logs:/app/logs

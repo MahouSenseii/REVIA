@@ -93,7 +93,7 @@ class AudioService(QObject):
         recognizer = sr.Recognizer()
         recognizer.energy_threshold = 300
         recognizer.dynamic_energy_threshold = True
-        recognizer.pause_threshold = 1.5
+        recognizer.pause_threshold = 1.5  # Reduced from ~5 for faster STT detection
 
         mic_kwargs = {}
         if self._input_device_index is not None:
@@ -108,56 +108,57 @@ class AudioService(QObject):
             self._listening = False
             return
 
-        with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            self.status_changed.emit("Listening... speak now")
+        try:
+            with mic as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                self.status_changed.emit("Listening... speak now")
 
-            while self._listening and not self._stop_event.is_set():
-                if self._stt_phase != "listening":
-                    self._stt_phase = "listening"
-                    self.stt_listening_started.emit()
-                try:
-                    audio = recognizer.listen(
-                        source, timeout=5, phrase_time_limit=15
-                    )
-                except sr.WaitTimeoutError:
-                    if self._always_listening:
-                        continue
-                    else:
-                        continue
-                except Exception:
-                    continue
-
-                # Transcribe in background
-                try:
-                    if self._stt_phase == "listening":
-                        self.stt_listening_stopped.emit()
-                    self._stt_phase = "processing"
-                    self.stt_processing_started.emit()
-                    text = recognizer.recognize_google(audio)
-                    if text.strip():
-                        self.speech_recognized.emit(text.strip())
-                        self.stt_processing_finished.emit(True, "")
-                        if not self._always_listening:
-                            self._listening = False
-                            self._stt_phase = "idle"
-                            self.status_changed.emit("Got speech")
-                            break
+                while self._listening and not self._stop_event.is_set():
+                    if self._stt_phase != "listening":
                         self._stt_phase = "listening"
-                except sr.UnknownValueError:
-                    self.stt_processing_finished.emit(False, "")
-                    self._stt_phase = "listening" if self._listening else "idle"
-                except sr.RequestError as e:
-                    self._stt_phase = "error"
-                    self.stt_error.emit(f"STT API error: {e}")
-                    self.stt_processing_finished.emit(False, f"STT API error: {e}")
-                    self.status_changed.emit(f"STT API error: {e}")
+                        self.stt_listening_started.emit()
+                    try:
+                        audio = recognizer.listen(
+                            source, timeout=5, phrase_time_limit=15
+                        )
+                    except sr.WaitTimeoutError:
+                        if self._always_listening:
+                            continue
+                        else:
+                            continue
+                    except Exception:
+                        continue
 
-        if not self._always_listening:
-            self._listening = False
-        if self._stt_phase == "listening":
-            self.stt_listening_stopped.emit()
-        self._stt_phase = "idle"
+                    # Transcribe in background
+                    try:
+                        if self._stt_phase == "listening":
+                            self.stt_listening_stopped.emit()
+                        self._stt_phase = "processing"
+                        self.stt_processing_started.emit()
+                        text = recognizer.recognize_google(audio)
+                        if text.strip():
+                            self.speech_recognized.emit(text.strip())
+                            self.stt_processing_finished.emit(True, "")
+                            if not self._always_listening:
+                                self._listening = False
+                                self._stt_phase = "idle"
+                                self.status_changed.emit("Got speech")
+                                break
+                            self._stt_phase = "listening"
+                    except sr.UnknownValueError:
+                        self.stt_processing_finished.emit(False, "")
+                        self._stt_phase = "listening" if self._listening else "idle"
+                    except sr.RequestError as e:
+                        self._stt_phase = "error"
+                        self.stt_error.emit(f"STT API error: {e}")
+                        self.stt_processing_finished.emit(False, f"STT API error: {e}")
+                        self.status_changed.emit(f"STT API error: {e}")
+        finally:
+            if not self._always_listening:
+                self._listening = False
+            if self._stt_phase == "listening":
+                self.stt_listening_stopped.emit()
+            self._stt_phase = "idle"
 
     # ---- TTS ----
 

@@ -5,6 +5,15 @@ from dataclasses import dataclass
 
 @dataclass
 class BehaviorDecision:
+    """Controller-side behaviour gate result.
+
+    Note: the core server has a richer ``BehaviorDecision`` in
+    ``revia_core_py.conversation_runtime`` that additionally carries
+    ``trigger_kind``, ``trigger_source``, ``cooldown_name``, and
+    ``cooldown_remaining_s``.  Keep the two definitions in sync when adding
+    fields that are relevant to both layers.
+    """
+
     allowed: bool
     reason: str
 

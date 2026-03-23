@@ -43,11 +43,17 @@ class VoiceManager(QObject):
     def speak(self, text, emotion=None):
         """Speak text using the active voice profile (async, returns immediately)."""
         emo = emotion or self._current_emotion
+        # Update internal emotion state if explicitly provided
+        if emotion:
+            self._current_emotion = emotion
         self.backend.speak_from_profile(text, self._active_profile, emo)
 
     def speak_sync(self, text, emotion=None):
         """Speak text synchronously — blocks until synthesis and playback are done."""
         emo = emotion or self._current_emotion
+        # Update internal emotion state if explicitly provided
+        if emotion:
+            self._current_emotion = emotion
         self.backend.speak_from_profile_sync(text, self._active_profile, emo)
 
     def apply_emotion_modifiers(self, emotion_state):

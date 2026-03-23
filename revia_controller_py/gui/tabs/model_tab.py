@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import logging
 import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -10,6 +11,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QProcess, QTimer
+
+logger = logging.getLogger(__name__)
 
 # Persisted model settings live alongside the top-level config.json
 _SETTINGS_FILE = Path(__file__).resolve().parents[3] / "model_settings.json"
@@ -280,11 +283,13 @@ class ModelTab(QScrollArea):
         self.batch_size.setRange(1, 2048)
         self.batch_size.setValue(512)
         gg.addRow("Batch Size:", self.batch_size)
+        self.batch_size.setVisible(False)  # Internal: auto-configured
 
         self.threads = QSpinBox()
         self.threads.setRange(1, 128)
         self.threads.setValue(4)
         gg.addRow("Threads:", self.threads)
+        self.threads.setVisible(False)  # Internal: auto-configured
 
         self.quant = QComboBox()
         self.quant.addItems([
@@ -292,6 +297,7 @@ class ModelTab(QScrollArea):
             "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
         ])
         gg.addRow("Quantization:", self.quant)
+        self.quant.setVisible(False)  # Internal: auto-configured
 
         layout.addWidget(self.gpu_group)
 
@@ -415,7 +421,8 @@ class ModelTab(QScrollArea):
             out = subprocess.check_output(
                 ["netstat", "-ano"], text=True, timeout=5
             )
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error listing port listeners: {e}")
             return
         for line in out.splitlines():
             if f":{port} " not in line or "LISTEN" not in line.upper():
@@ -433,8 +440,8 @@ class ModelTab(QScrollArea):
                     self.event_bus.log_entry.emit(
                         f"[LLM] Killed stale process PID {pid} on port {port}"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error killing process {pid}: {e}")
 
     def _build_server_command(self, server, model_file, port, ctx, gpu_layers):
         server_l = (server or "").strip().lower()
@@ -500,11 +507,13 @@ class ModelTab(QScrollArea):
                     continue
                 try:
                     payload = r.json()
-                except Exception:
+                except Exception as je:
+                    logger.debug(f"Error parsing JSON from {url}: {je}")
                     payload = {}
                 models = self._read_models_from_response(payload)
                 return True, models
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error fetching models from {url}: {e}")
                 continue
         return False, []
 
@@ -624,7 +633,8 @@ class ModelTab(QScrollArea):
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=5,
                     )
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"taskkill failed, using kill(): {e}")
                     self._llm_process.kill()
             else:
                 self._llm_process.kill()
@@ -789,7 +799,8 @@ class ModelTab(QScrollArea):
             return
         try:
             data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error loading model settings: {e}")
             return
 
         self._loading = True
@@ -1008,8 +1019,8 @@ class ModelTab(QScrollArea):
                 f"{self.client.BASE_URL}/api/status", timeout=2
             )
             core_ok = r.ok
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error checking core status: {e}")
 
         if llm_ok:
             file_info = ""

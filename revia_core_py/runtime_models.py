@@ -167,6 +167,12 @@ class TurnManager:
     def snapshot(self) -> dict:
         with self._lock:
             active = self._active_turn
+            if active is None:
+                return {
+                    "active_request_id": self._current_request_id,
+                    "active_turn": None,
+                    "last_response_mode": self._last_committed_mode,
+                }
             return {
                 "active_request_id": self._current_request_id,
                 "active_turn": {
@@ -176,7 +182,7 @@ class TurnManager:
                     "response_mode": active.response_mode,
                     "lifecycle_state": active.lifecycle_state,
                     "started_at_monotonic": round(active.started_at, 3),
-                } if active else None,
+                },
                 "last_response_mode": self._last_committed_mode,
             }
 

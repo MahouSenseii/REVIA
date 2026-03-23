@@ -4,6 +4,7 @@ Manages Discord and Twitch bot lifecycle and configuration.
 """
 import json
 import logging
+import os
 from pathlib import Path
 
 from .discord_bot import REVIADiscordBot
@@ -11,7 +12,7 @@ from .twitch_bot import REVIATwitchBot
 
 logger = logging.getLogger("revia.integrations")
 
-_CONFIG_PATH = Path(__file__).parent.parent.parent / "integrations_config.json"
+_CONFIG_PATH = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, "integrations_config.json")))
 
 _DEFAULT_BOT_STATUS: dict = {
     "running": False, "status": "stopped",
@@ -140,8 +141,10 @@ def _load_config() -> dict:
             for k in ("discord", "twitch"):
                 cfg[k] = {**_DEFAULT_CONFIG[k], **data.get(k, {})}
             return cfg
-        except Exception as exc:
-            logger.warning(f"[Integrations] Could not load config: {exc}; using defaults")
+        except json.JSONDecodeError as exc:
+            logger.warning(f"[Integrations] Invalid JSON in config: {exc}; using defaults")
+        except IOError as exc:
+            logger.warning(f"[Integrations] Failed to read config file: {exc}; using defaults")
     return {k: dict(v) for k, v in _DEFAULT_CONFIG.items()}
 
 
@@ -150,5 +153,7 @@ def _save_config(cfg: dict):
         _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_CONFIG_PATH, "w") as f:
             json.dump(cfg, f, indent=2)
-    except Exception as exc:
-        logger.error(f"[Integrations] Failed to save config: {exc}")
+    except PermissionError as exc:
+        logger.error(f"[Integrations] Permission denied saving config: {exc}")
+    except OSError as exc:
+        logger.error(f"[Integrations] OS error saving config: {exc}")

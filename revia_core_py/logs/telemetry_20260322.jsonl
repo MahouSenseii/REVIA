@@ -1,0 +1,10 @@
+{"stage":"emotion_analysis","device":"CPU","start_ms":319734.78699999396,"end_ms":319736.30639999465,"duration_ms":1.51940000068862}
+{"stage":"router_classify","device":"CPU","start_ms":319736.5202999936,"end_ms":319736.57130000356,"duration_ms":0.051000009989365935}
+{"stage":"output_deliver","device":"CPU","start_ms":319744.07919999794,"end_ms":319744.2555000016,"duration_ms":0.17630000365898013}
+{"stage":"emotion_analysis","device":"CPU","start_ms":405462.8137999971,"end_ms":405463.0347999919,"duration_ms":0.2209999947808683}
+{"stage":"router_classify","device":"CPU","start_ms":405463.04239999154,"end_ms":405463.0541999941,"duration_ms":0.011800002539530396}
+{"stage":"llm_decode","device":"CUDA","start_ms":405464.0924999985,"end_ms":444569.6409999946,"duration_ms":39105.548499996075}
+{"stage":"output_deliver","device":"CPU","start_ms":444570.515799991,"end_ms":444570.67390000157,"duration_ms":0.15810001059435308}
+{"stage":"emotion_analysis","device":"CPU","start_ms":510808.4237000003,"end_ms":510808.6011999985,"duration_ms":0.17749999824445695}
+{"stage":"router_classify","device":"CPU","start_ms":510808.6082999944,"end_ms":510808.6207000015,"duration_ms":0.012400007108226418}
+{"stage":"llm_decode","device":"CUDA","start_ms":510810.22659999144,"end_ms":574160.1900999958,"duration_ms":63349.96350000438}

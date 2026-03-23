@@ -1,4 +1,5 @@
 import subprocess, sys, os
+import logging
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -6,8 +7,19 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QSpinBox, QComboBox, QGroupBox, QCheckBox,
     QPushButton, QTableWidget, QTableWidgetItem, QListWidget,
 )
-from PySide6.QtCore import QTimer, QProcess
+from PySide6.QtCore import QObject, QTimer, QProcess, Signal
 from PySide6.QtGui import QFont
+
+logger = logging.getLogger(__name__)
+
+
+class _BgBridge(QObject):
+    """Marshals callables from a background thread to the Qt main-thread event loop."""
+    _call = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._call.connect(lambda fn: fn())
 
 
 class SystemTab(QScrollArea):
@@ -18,6 +30,7 @@ class SystemTab(QScrollArea):
         self.theme_mgr = theme_mgr
         self._core_process = None
         self._auto_start_attempted = False
+        self._bg = _BgBridge(self)
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -359,8 +372,8 @@ class SystemTab(QScrollArea):
                             f"[Core] Killed stale process PID {pid} on port {port}"
                         )
                         killed = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error killing port listener: {e}")
         return killed
 
     def _start_core_server(self):
@@ -371,9 +384,7 @@ class SystemTab(QScrollArea):
 
         script = self._find_core_script()
         if not script:
-            self.server_status.setText(
-                "Server: core_server.py not found!"
-            )
+            self.server_status.setText("Server: core_server.py not found!")
             self.server_status.setStyleSheet("color: #cc3040;")
             return
 
@@ -381,23 +392,47 @@ class SystemTab(QScrollArea):
         rest = self.rest_port.value()
         ws = self.ws_port.value()
 
-        # Check if a core is already running on this port (from terminal etc.)
-        already_running = False
-        running_version = ""
-        running_has_arch = False
-        try:
-            import requests
-            r = requests.get(
-                f"http://{host}:{rest}/api/status", timeout=1
-            )
-            if r.ok:
-                already_running = True
-                data = r.json() if "application/json" in (r.headers.get("content-type", "")) else {}
-                running_version = str(data.get("version", "")).strip()
-                running_has_arch = isinstance(data.get("architecture"), dict) and bool(data.get("architecture"))
-        except Exception:
-            pass
+        # Disable button immediately to prevent double-clicks; show checking state.
+        self.start_server_btn.setEnabled(False)
+        self.server_status.setText("Server: Checking...")
+        self.server_status.setStyleSheet("color: #ccaa00;")
 
+        # Offload the pre-flight "already running?" HTTP check to the background.
+        def _check():
+            already_running = False
+            running_version = ""
+            running_has_arch = False
+            try:
+                r = self.client._session_get(
+                    f"http://{host}:{rest}/api/status", timeout=1
+                )
+                if r.ok:
+                    already_running = True
+                    data = (
+                        r.json()
+                        if "application/json" in r.headers.get("content-type", "")
+                        else {}
+                    )
+                    running_version = str(data.get("version", "")).strip()
+                    running_has_arch = isinstance(
+                        data.get("architecture"), dict
+                    ) and bool(data.get("architecture"))
+            except Exception as e:
+                logger.debug(f"Error checking running core version: {e}")
+            self._bg._call.emit(
+                lambda: self._launch_core_or_connect(
+                    script, host, rest, ws,
+                    already_running, running_version, running_has_arch,
+                )
+            )
+
+        self.client._executor.submit(_check)
+
+    def _launch_core_or_connect(
+        self, script, host, rest, ws,
+        already_running, running_version, running_has_arch,
+    ):
+        """Continue _start_core_server on the main thread after the pre-flight check."""
         if already_running:
             # If the running core is legacy (no architecture telemetry),
             # replace it so monitor + module status stay accurate.
@@ -407,20 +442,21 @@ class SystemTab(QScrollArea):
                 )
                 self.server_status.setStyleSheet("color: #00aa40;")
                 self.event_bus.log_entry.emit(
-                    f"[Core] Found existing server on port {rest} (v{running_version or '?'}), connecting"
+                    f"[Core] Found existing server on port {rest} "
+                    f"(v{running_version or '?'}), connecting"
                 )
+                self.start_server_btn.setEnabled(True)
                 self._connect_core()
                 return
 
-            self.server_status.setText(
-                "Server: Legacy core detected - upgrading..."
-            )
+            self.server_status.setText("Server: Legacy core detected - upgrading...")
             self.server_status.setStyleSheet("color: #ccaa00;")
             self.event_bus.log_entry.emit(
-                f"[Core] Existing server on port {rest} is legacy (v{running_version or '?'}). Replacing with current core."
+                f"[Core] Existing server on port {rest} is legacy "
+                f"(v{running_version or '?'}). Replacing with current core."
             )
 
-        # Kill anything already on these ports that isn't responding
+        # Kill anything already on these ports that isn't responding.
         killed = self._kill_port_holder(rest)
         killed |= self._kill_port_holder(ws)
         if killed:
@@ -430,22 +466,14 @@ class SystemTab(QScrollArea):
 
         self._core_process = QProcess(self)
         self._core_process.setWorkingDirectory(str(Path(script).parent))
-        self._core_process.setProcessEnvironment(
-            self._build_env(rest, ws)
-        )
-        self._core_process.readyReadStandardOutput.connect(
-            self._on_server_stdout
-        )
-        self._core_process.readyReadStandardError.connect(
-            self._on_server_stderr
-        )
+        self._core_process.setProcessEnvironment(self._build_env(rest, ws))
+        self._core_process.readyReadStandardOutput.connect(self._on_server_stdout)
+        self._core_process.readyReadStandardError.connect(self._on_server_stderr)
         self._core_process.finished.connect(self._on_server_finished)
         self._core_process.errorOccurred.connect(self._on_server_error)
         python_exe = self._resolve_python_exe()
 
-        self.event_bus.log_entry.emit(
-            f"[Core] Launching: {python_exe} {script}"
-        )
+        self.event_bus.log_entry.emit(f"[Core] Launching: {python_exe} {script}")
         self._core_process.start(python_exe, [script])
 
         if not self._core_process.waitForStarted(5000):
@@ -472,10 +500,10 @@ class SystemTab(QScrollArea):
         return env
 
     def _auto_connect_after_start(self):
-        self._connect_attempts = getattr(self, '_connect_attempts', 0) + 1
+        self._connect_attempts = getattr(self, "_connect_attempts", 0) + 1
         host = self.core_host.text().strip() or "127.0.0.1"
         rest = self.rest_port.value()
-        # Check if process died
+        # Check if process died before spending time on an HTTP probe.
         if self._core_process and self._core_process.state() == QProcess.NotRunning:
             self.server_status.setText("Server: Failed to start (check Logs)")
             self.server_status.setStyleSheet("color: #cc3040;")
@@ -486,27 +514,35 @@ class SystemTab(QScrollArea):
             self.server_status.setText("Server: Timeout waiting for REST")
             self.server_status.setStyleSheet("color: #cc3040;")
             return
-        try:
-            import requests
-            r = requests.get(
-                f"http://{host}:{rest}/api/status", timeout=2
-            )
-            if r.ok:
-                data = r.json()
-                ver = data.get("version", "?")
-                self.server_status.setText(
-                    f"Server: Running (v{ver})"
+
+        attempts = self._connect_attempts  # snapshot for the closure
+
+        def _check():
+            ok = False
+            ver = "?"
+            try:
+                r = self.client._session_get(
+                    f"http://{host}:{rest}/api/status", timeout=2
                 )
-                self.server_status.setStyleSheet("color: #00aa40;")
-                self._connect_core()
-                return
-        except Exception:
-            pass
-        self.server_status.setText(
-            f"Server: Starting ({self._connect_attempts * 2}s...)"
-        )
-        self.server_status.setStyleSheet("color: #ccaa00;")
-        QTimer.singleShot(2000, self._auto_connect_after_start)
+                if r.ok:
+                    ok = True
+                    ver = r.json().get("version", "?")
+            except Exception as e:
+                logger.debug(f"Error checking core status: {e}")
+
+            def _apply(ok=ok, ver=ver, a=attempts):
+                if ok:
+                    self.server_status.setText(f"Server: Running (v{ver})")
+                    self.server_status.setStyleSheet("color: #00aa40;")
+                    self._connect_core()
+                else:
+                    self.server_status.setText(f"Server: Starting ({a * 2}s...)")
+                    self.server_status.setStyleSheet("color: #ccaa00;")
+                    QTimer.singleShot(2000, self._auto_connect_after_start)
+
+            self._bg._call.emit(_apply)
+
+        self.client._executor.submit(_check)
 
     def _on_server_stdout(self):
         if self._core_process:
@@ -584,7 +620,8 @@ class SystemTab(QScrollArea):
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=5,
                     )
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"taskkill failed for {pid}, using kill(): {e}")
                     self._core_process.kill()
             else:
                 self._core_process.kill()
@@ -622,29 +659,42 @@ class SystemTab(QScrollArea):
         QTimer.singleShot(300, self._check_core_rest)
 
     def _check_core_rest(self):
-        try:
-            import requests
-            r = requests.get(
-                f"{self.client.BASE_URL}/api/status", timeout=3
-            )
-            if r.ok:
-                data = r.json()
-                ver = data.get("version", "?")
-                state = data.get("state", "Unknown")
-                self.core_status.setText(
-                    f"Status: Connected | v{ver} | State: {state}"
+        def _check():
+            try:
+                r = self.client._session_get(
+                    f"{self.client.BASE_URL}/api/status", timeout=3
                 )
-                self.core_status.setStyleSheet("color: #00aa40;")
-                self.core_disconnect_btn.setEnabled(True)
-            else:
-                self.core_status.setText(
-                    f"Status: REST error ({r.status_code})"
-                )
-                self.core_status.setStyleSheet("color: #cc3040;")
-        except Exception as e:
-            self.core_status.setText(f"Status: Unreachable — {e}")
-            self.core_status.setStyleSheet("color: #cc3040;")
-        self.core_connect_btn.setEnabled(True)
+                if r.ok:
+                    ver = r.json().get("version", "?")
+                    state = r.json().get("state", "Unknown")
+
+                    def _apply(v=ver, s=state):
+                        self.core_status.setText(
+                            f"Status: Connected | v{v} | State: {s}"
+                        )
+                        self.core_status.setStyleSheet("color: #00aa40;")
+                        self.core_disconnect_btn.setEnabled(True)
+                        self.core_connect_btn.setEnabled(True)
+                else:
+                    sc = r.status_code
+
+                    def _apply(c=sc):
+                        self.core_status.setText(f"Status: REST error ({c})")
+                        self.core_status.setStyleSheet("color: #cc3040;")
+                        self.core_connect_btn.setEnabled(True)
+
+                self._bg._call.emit(_apply)
+            except Exception as ex:
+                err = str(ex)
+
+                def _apply_err(e=err):
+                    self.core_status.setText(f"Status: Unreachable — {e}")
+                    self.core_status.setStyleSheet("color: #cc3040;")
+                    self.core_connect_btn.setEnabled(True)
+
+                self._bg._call.emit(_apply_err)
+
+        self.client._executor.submit(_check)
 
     def _disconnect_core(self):
         self.client.ws.close()
@@ -661,24 +711,36 @@ class SystemTab(QScrollArea):
 
     def _do_ping(self):
         import time
-        try:
-            import requests
-            t0 = time.perf_counter()
-            r = requests.get(
-                f"{self.client.BASE_URL}/api/status", timeout=3
-            )
-            latency = (time.perf_counter() - t0) * 1000
-            if r.ok:
-                self.core_status.setText(
-                    f"Status: Online | Ping: {latency:.0f} ms"
+        t0 = time.perf_counter()
+
+        def _check():
+            try:
+                r = self.client._session_get(
+                    f"{self.client.BASE_URL}/api/status", timeout=3
                 )
-                self.core_status.setStyleSheet("color: #00aa40;")
-            else:
-                self.core_status.setText(f"Status: Error ({r.status_code})")
-                self.core_status.setStyleSheet("color: #cc3040;")
-        except Exception:
-            self.core_status.setText("Status: Unreachable")
-            self.core_status.setStyleSheet("color: #cc3040;")
+                latency = (time.perf_counter() - t0) * 1000
+                if r.ok:
+                    def _apply(lat=latency):
+                        self.core_status.setText(
+                            f"Status: Online | Ping: {lat:.0f} ms"
+                        )
+                        self.core_status.setStyleSheet("color: #00aa40;")
+                else:
+                    sc = r.status_code
+
+                    def _apply(c=sc):
+                        self.core_status.setText(f"Status: Error ({c})")
+                        self.core_status.setStyleSheet("color: #cc3040;")
+
+                self._bg._call.emit(_apply)
+            except Exception as e:
+                logger.debug(f"Error checking core status: {e}")
+                self._bg._call.emit(lambda: (
+                    self.core_status.setText("Status: Unreachable"),
+                    self.core_status.setStyleSheet("color: #cc3040;"),
+                ))
+
+        self.client._executor.submit(_check)
 
     def _on_core_connection(self, connected):
         if connected:
@@ -686,22 +748,40 @@ class SystemTab(QScrollArea):
             self.core_status.setStyleSheet("color: #00aa40;")
             self.core_disconnect_btn.setEnabled(True)
         else:
-            rest_ok = bool(self.client.get("/api/status", timeout=1))
-            if rest_ok:
-                self.core_status.setText("Status: REST online (WebSocket reconnecting)")
-                self.core_status.setStyleSheet("color: #ccaa00;")
-                self.core_disconnect_btn.setEnabled(False)
-                self.arch_overall.setText("Overall: Degraded (WS offline)")
-                self.arch_overall.setStyleSheet("color: #ccaa00;")
-            else:
-                self.core_status.setText("Status: Disconnected")
-                self.core_status.setStyleSheet("color: #cc3040;")
-                self.core_disconnect_btn.setEnabled(False)
-                self.arch_overall.setText("Overall: Offline")
-                self.arch_overall.setStyleSheet("color: #cc3040;")
-                for lbl in self.arch_labels.values():
-                    lbl.setText("OFFLINE")
-                    lbl.setStyleSheet("color: #cc3040;")
+            # Probe REST in the background — avoids blocking the main thread
+            # on what could be a 1-second timeout during a WS disconnect event.
+            def _check():
+                rest_ok = False
+                try:
+                    r = self.client._session_get(
+                        f"{self.client.BASE_URL}/api/status", timeout=1
+                    )
+                    rest_ok = r.ok
+                except Exception as e:
+                    logger.debug(f"Error checking REST status: {e}")
+
+                def _apply(ok=rest_ok):
+                    if ok:
+                        self.core_status.setText(
+                            "Status: REST online (WebSocket reconnecting)"
+                        )
+                        self.core_status.setStyleSheet("color: #ccaa00;")
+                        self.core_disconnect_btn.setEnabled(False)
+                        self.arch_overall.setText("Overall: Degraded (WS offline)")
+                        self.arch_overall.setStyleSheet("color: #ccaa00;")
+                    else:
+                        self.core_status.setText("Status: Disconnected")
+                        self.core_status.setStyleSheet("color: #cc3040;")
+                        self.core_disconnect_btn.setEnabled(False)
+                        self.arch_overall.setText("Overall: Offline")
+                        self.arch_overall.setStyleSheet("color: #cc3040;")
+                        for lbl in self.arch_labels.values():
+                            lbl.setText("OFFLINE")
+                            lbl.setStyleSheet("color: #cc3040;")
+
+                self._bg._call.emit(_apply)
+
+            self.client._executor.submit(_check)
 
     def _change_theme(self, theme):
         self.theme_mgr.apply_theme(theme.lower())

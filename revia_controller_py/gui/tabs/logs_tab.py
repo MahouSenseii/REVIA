@@ -20,16 +20,31 @@ class LogsTab(QWidget):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
+        # Advanced logs toggle (hidden by default)
+        toggle_row = QHBoxLayout()
+        toggle_lbl = QLabel("Show Advanced")
+        toggle_lbl.setFont(QFont("Segoe UI", 9))
+        toggle_row.addWidget(toggle_lbl)
+        from PySide6.QtWidgets import QCheckBox
+        self.show_logs_toggle = QCheckBox("Enable Log View")
+        self.show_logs_toggle.setChecked(False)
+        self.show_logs_toggle.toggled.connect(self._toggle_logs)
+        toggle_row.addWidget(self.show_logs_toggle)
+        toggle_row.addStretch()
+        layout.addLayout(toggle_row)
+
         filter_row = QHBoxLayout()
         self.level_filter = QComboBox()
         self.level_filter.addItems(
             ["All", "Info", "Warning", "Error", "Telemetry"]
         )
+        self.level_filter.setVisible(False)  # Hidden by default
         filter_row.addWidget(QLabel("Level:"))
         filter_row.addWidget(self.level_filter)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search logs...")
+        self.search.setVisible(False)  # Hidden by default
         filter_row.addWidget(self.search)
 
         clear_btn = QPushButton("Clear")
@@ -43,6 +58,7 @@ class LogsTab(QWidget):
         self.log_view.setReadOnly(True)
         self.log_view.setObjectName("logView")
         self.log_view.setFont(QFont("Consolas", 9))
+        self.log_view.setVisible(False)  # Hidden by default
         layout.addWidget(self.log_view)
 
         timing_group = QGroupBox("Pipeline Timing (Last Run)")
@@ -58,13 +74,22 @@ class LogsTab(QWidget):
         self.timing_list.setMaximumHeight(200)
         t.addWidget(self.timing_list)
 
+        self.timing_list.setVisible(False)  # Hidden by default
         layout.addWidget(timing_group)
 
         self.event_bus.log_entry.connect(self._add_log)
         self.event_bus.telemetry_updated.connect(self._update_timing)
 
+    def _toggle_logs(self, enabled):
+        """Toggle visibility of log view and timing data."""
+        self.log_view.setVisible(enabled)
+        self.timing_list.setVisible(enabled)
+        self.level_filter.setVisible(enabled)
+        self.search.setVisible(enabled)
+
     def _add_log(self, text):
-        self.log_view.append(text)
+        if self.log_view.isVisible():
+            self.log_view.append(text)
 
     def _update_timing(self, data):
         spans = data.get("recent_spans", [])

@@ -1,12 +1,23 @@
-import requests as _req
-
+from collections import deque
+import logging
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QGroupBox, QProgressBar, QPushButton,
     QTextEdit, QCheckBox, QSpinBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QColor, QPen
+
+logger = logging.getLogger(__name__)
+
+
+class _BgBridge(QObject):
+    """Marshals callables from a background thread to the Qt main-thread event loop."""
+    _call = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._call.connect(lambda fn: fn())
 
 try:
     from PySide6.QtCharts import (
@@ -54,10 +65,12 @@ class EmotionsTab(QScrollArea):
         super().__init__(parent)
         self.event_bus = event_bus
         self.client = client
+        self._bg = _BgBridge(self)
         self.setWidgetResizable(True)
 
         self._chart_tick = 0
         self._prob_rows = []
+        self._emotion_history = deque(maxlen=1000)
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -427,51 +440,63 @@ class EmotionsTab(QScrollArea):
             self._fallback_hist.clear()
 
     def _toggle_injection(self, enabled):
+        # Fire-and-forget in background — no need to update UI from the response.
         action = "enable" if enabled else "disable"
-        try:
-            _req.post(
-                f"{self.client.BASE_URL}/api/neural/emotion_net/{action}",
-                timeout=2,
-            )
-        except Exception:
-            pass
+        url = f"{self.client.BASE_URL}/api/neural/emotion_net/{action}"
+
+        def _work():
+            try:
+                self.client._session_post(url, timeout=2)
+            except Exception as e:
+                logger.warning(f"Error toggling emotion injection: {e}")
+
+        self.client._executor.submit(_work)
 
     def _refresh_history(self):
         limit = self.hist_limit.value()
-        try:
-            r = _req.get(
-                f"{self.client.BASE_URL}/api/emotions/history",
-                params={"limit": limit},
-                timeout=3,
-            )
-            if not r.ok:
-                return
-            history = r.json()
-            if not history:
-                return
 
-            if _CHARTS_AVAILABLE and self._emotion_series:
-                for series in self._emotion_series.values():
-                    series.clear()
-                self._chart_tick = 0
-                for entry in history:
-                    lbl = str(entry.get("label", "Neutral"))
-                    conf = self._as_float(entry.get("confidence", 0.0), 0.0)
-                    probs = self._coerce_probabilities(entry.get("emotion_probs", {}))
-                    self._add_chart_point(lbl, conf, probs=probs)
-            elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
-                lines = []
-                for entry in reversed(history):
-                    ts = str(entry.get("timestamp", ""))[:19]
-                    lbl = str(entry.get("label", "?"))
-                    sec = str(entry.get("secondary_label", "")).strip()
-                    conf = self._as_float(entry.get("confidence", 0.0), 0.0)
-                    val = self._as_float(entry.get("valence", 0.0), 0.0)
-                    if sec and sec != lbl:
-                        lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) alt:{sec:<11} V:{val:+.2f}")
-                    else:
-                        lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) V:{val:+.2f}")
-                self._fallback_hist.setPlainText("\n".join(lines))
-        except Exception:
-            pass
+        def _work():
+            try:
+                r = self.client._session_get(
+                    f"{self.client.BASE_URL}/api/emotions/history",
+                    params={"limit": limit},
+                    timeout=3,
+                )
+                if not r.ok:
+                    return
+                history = r.json()
+                if not history:
+                    return
+                self._bg._call.emit(lambda h=history: self._apply_history(h))
+            except Exception as e:
+                logger.warning(f"Error refreshing emotion history: {e}")
+
+        self.client._executor.submit(_work)
+
+    def _apply_history(self, history):
+        """Apply fetched history data to chart / fallback text (main thread only)."""
+        if _CHARTS_AVAILABLE and self._emotion_series:
+            for series in self._emotion_series.values():
+                series.clear()
+            self._chart_tick = 0
+            for entry in history:
+                lbl = str(entry.get("label", "Neutral"))
+                conf = self._as_float(entry.get("confidence", 0.0), 0.0)
+                probs = self._coerce_probabilities(entry.get("emotion_probs", {}))
+                self._add_chart_point(lbl, conf, probs=probs)
+        elif not _CHARTS_AVAILABLE and hasattr(self, "_fallback_hist"):
+            lines = []
+            for entry in reversed(history):
+                ts = str(entry.get("timestamp", ""))[:19]
+                lbl = str(entry.get("label", "?"))
+                sec = str(entry.get("secondary_label", "")).strip()
+                conf = self._as_float(entry.get("confidence", 0.0), 0.0)
+                val = self._as_float(entry.get("valence", 0.0), 0.0)
+                if sec and sec != lbl:
+                    lines.append(
+                        f"[{ts}] {lbl:<11} ({conf:.0%}) alt:{sec:<11} V:{val:+.2f}"
+                    )
+                else:
+                    lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) V:{val:+.2f}")
+            self._fallback_hist.setPlainText("\n".join(lines))
 

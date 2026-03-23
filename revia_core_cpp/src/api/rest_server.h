@@ -1,5 +1,7 @@
 #pragma once
 #include <atomic>
+#include <thread>
+#include <vector>
 #include <httplib.h>
 
 namespace revia {
@@ -16,6 +18,7 @@ public:
     RestServer(int port, TelemetryEngine& telemetry, Pipeline& pipeline,
                PluginManager& plugins, EmotionNet& emotion,
                RouterClassifier& router, WsServer& ws);
+    ~RestServer();
     void run(std::atomic<bool>& running);
     void stop();
 
@@ -28,6 +31,8 @@ private:
     EmotionNet& emotion_;
     RouterClassifier& router_;
     WsServer& ws_;
+    std::vector<std::thread> pipeline_threads_;  // Store managed threads
+    mutable std::mutex threads_mtx_;  // Protect thread storage
 
     void setup_routes();
 };

@@ -2,6 +2,7 @@
 REVIA Integrations Tab
 Configure and control Discord & Twitch bot integrations.
 """
+import logging
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QGroupBox, QCheckBox, QPushButton,
@@ -9,6 +10,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
+
+logger = logging.getLogger(__name__)
 
 
 class IntegrationsTab(QScrollArea):
@@ -199,8 +202,8 @@ class IntegrationsTab(QScrollArea):
         }
         try:
             self.client.post("/api/integrations/config", json=payload)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error saving integration config: {e}")
 
     def _load_config(self):
         try:
@@ -224,37 +227,37 @@ class IntegrationsTab(QScrollArea):
             self.twitch_command.setText(t.get("command", "revia"))
             self.twitch_respond_all.setChecked(t.get("respond_to_all", False))
             self.twitch_max_len.setValue(t.get("max_response_len", 450))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error loading integration config: {e}")
 
     def _discord_start(self):
         self._save_config()
         try:
             self.client.post("/api/integrations/discord/start")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error starting Discord bot: {e}")
         self._refresh_status()
 
     def _discord_stop(self):
         try:
             self.client.post("/api/integrations/discord/stop")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error stopping Discord bot: {e}")
         self._refresh_status()
 
     def _twitch_start(self):
         self._save_config()
         try:
             self.client.post("/api/integrations/twitch/start")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error starting Twitch bot: {e}")
         self._refresh_status()
 
     def _twitch_stop(self):
         try:
             self.client.post("/api/integrations/twitch/stop")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error stopping Twitch bot: {e}")
         self._refresh_status()
 
     def _refresh_status(self):
@@ -282,5 +285,5 @@ class IntegrationsTab(QScrollArea):
                 self.twitch_status_lbl.setText(
                     f"Status: error — {t['last_error'][:60]}"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error refreshing integration status: {e}")

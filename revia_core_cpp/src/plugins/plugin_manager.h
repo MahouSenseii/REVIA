@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <optional>
 #include <nlohmann/json.hpp>
 
 namespace revia {
@@ -25,7 +26,7 @@ public:
     std::vector<PluginInfo> list() const;
     bool enable(const std::string& name);
     bool disable(const std::string& name);
-    PluginInfo* find(const std::string& name);
+    std::optional<PluginInfo> find(const std::string& name) const;
     nlohmann::json to_json() const;
 
 private:

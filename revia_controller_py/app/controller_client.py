@@ -1,4 +1,6 @@
 import json
+import os
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -6,10 +8,12 @@ from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtNetwork import QAbstractSocket
 
+_log = logging.getLogger(__name__)
+
 
 class ControllerClient(QObject):
-    BASE_URL = "http://127.0.0.1:8123"
-    WS_URL = "ws://127.0.0.1:8124"
+    BASE_URL = os.environ.get("REVIA_CORE_URL", "http://127.0.0.1:8123")
+    WS_URL = os.environ.get("REVIA_CORE_WS_URL", "ws://127.0.0.1:8124")
     poll_result_ready = Signal(object)
 
     def __init__(self, event_bus, parent=None):
@@ -20,7 +24,10 @@ class ControllerClient(QObject):
         self.rest_reachable = False
         self._last_status = {}
         self._poll_inflight = False
-        self._request_lock = threading.Lock()
+        # requests.Session is thread-safe for concurrent GET/POST; a single global
+        # lock is not needed and would serialise all parallel HTTP calls.
+        # _request_lock is retained only for any callers that still reference it.
+        self._request_lock = threading.Lock()  # kept for compatibility; not used below
         self._executor = ThreadPoolExecutor(
             max_workers=4,
             thread_name_prefix="revia-http",
@@ -39,11 +46,17 @@ class ControllerClient(QObject):
         self.ws.connected.connect(self._on_ws_connected)
         self.ws.disconnected.connect(self._on_ws_disconnected)
         self.ws.textMessageReceived.connect(self._on_ws_message)
+        self.ws.error.connect(self._on_ws_error)
         self.poll_result_ready.connect(self._emit_poll_result)
 
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.timeout.connect(self._try_connect)
         self.reconnect_timer.setInterval(3000)
+
+        self.ws_connection_timer = QTimer(self)
+        self.ws_connection_timer.setSingleShot(True)
+        self.ws_connection_timer.setInterval(5000)
+        self.ws_connection_timer.timeout.connect(self._on_ws_connection_timeout)
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_status)
@@ -70,17 +83,16 @@ class ControllerClient(QObject):
             self._executor.shutdown(wait=False)
 
     def _session_get(self, url, **kwargs):
-        with self._request_lock:
-            return self._session.get(url, **kwargs)
+        return self._session.get(url, **kwargs)
 
     def _session_post(self, url, **kwargs):
-        with self._request_lock:
-            return self._session.post(url, **kwargs)
+        return self._session.post(url, **kwargs)
 
     def _try_connect(self):
         # Only open when socket is fully unconnected (prevents double-open during reconnect)
         if not self.ws_connected and self.ws.state() == QAbstractSocket.UnconnectedState:
             self.ws.open(QUrl(self.WS_URL))
+            self.ws_connection_timer.start()
 
     def _set_core_reachability(self, reachable):
         reachable = bool(reachable)
@@ -91,11 +103,23 @@ class ControllerClient(QObject):
 
     def _on_ws_connected(self):
         self.ws_connected = True
+        self.ws_connection_timer.stop()
         self._set_core_reachability(True)
 
     def _on_ws_disconnected(self):
         self.ws_connected = False
+        self.ws_connection_timer.stop()
         if not self.rest_reachable:
+            self._set_core_reachability(False)
+
+    def _on_ws_error(self, error):
+        _log.debug("[ControllerClient] WebSocket error: %s", error)
+        self.ws_connection_timer.stop()
+
+    def _on_ws_connection_timeout(self):
+        _log.debug("[ControllerClient] WebSocket connection timeout")
+        if not self.ws_connected:
+            self.ws.close()
             self._set_core_reachability(False)
 
     def _on_ws_message(self, msg):
@@ -140,6 +164,13 @@ class ControllerClient(QObject):
                 }
                 self.event_bus.chat_complete_payload.emit(payload)
                 self.event_bus.chat_complete.emit(payload.get("text", ""))
+            elif msg_type == "chat_sentence":
+                sentence = data.get("sentence", "")
+                req_id = data.get("request_id", "")
+                if sentence:
+                    self.event_bus.chat_sentence.emit(sentence, req_id)
+            elif msg_type == "interrupt_ack":
+                self.event_bus.interrupt_ack.emit()
             elif msg_type == "log_entry":
                 self.event_bus.log_entry.emit(data.get("text", ""))
             elif msg_type == "proactive_start":
@@ -159,14 +190,26 @@ class ControllerClient(QObject):
                     timeout=(0.5, 1.0),
                 )
                 result = r.json() if r.ok else None
-            except Exception:
+            except Exception as exc:
+                _log.debug("[ControllerClient] Poll status error: %s", exc)
                 result = None
             self.poll_result_ready.emit(result)
 
-        self._executor.submit(_do)
+        future = self._executor.submit(_do)
+        future.add_done_callback(self._on_poll_future_done)
+
+    def _on_poll_future_done(self, future):
+        try:
+            if future.exception() is not None:
+                _log.debug("[ControllerClient] Poll future exception: %s", future.exception())
+        except Exception:
+            pass
+        finally:
+            # Always reset inflight flag so polling can resume even after errors
+            self._poll_inflight = False
 
     def _emit_poll_result(self, data):
-        self._poll_inflight = False
+        # Note: _poll_inflight is reset in _on_poll_future_done (single reset point)
         if data:
             self.rest_reachable = True
             self._last_status = data
