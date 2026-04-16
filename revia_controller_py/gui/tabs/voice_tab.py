@@ -18,6 +18,7 @@ from PySide6.QtGui import QFont
 from app.voice_profile import VoiceProfile, VoiceMode
 from app.voice_manager import VoiceManager
 from app.tts_backend import QWEN_SPEAKERS, QWEN_LANGUAGES, QWEN_MODEL_SIZES
+from app.ui_status import apply_status_style, clear_status_role
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class VoiceTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        # ── Qwen3-TTS Server ──
+        # â”€â”€ Qwen3-TTS Server â”€â”€
         srv_group = QGroupBox("Qwen3-TTS Server")
         srv_group.setObjectName("settingsGroup")
         sv = QFormLayout(srv_group)
@@ -100,14 +101,14 @@ class VoiceTab(QScrollArea):
         self._tts_launcher_tmp = None  # temp wrapper script for CPU-only builds
         layout.addWidget(srv_group)
 
-        # ── 3 Mode Tabs (matching Qwen3-TTS demo) ──
+        # â”€â”€ 3 Mode Tabs (matching Qwen3-TTS demo) â”€â”€
         self.mode_tabs = QTabWidget()
         self.mode_tabs.addTab(self._build_design_tab(), "Voice Design")
         self.mode_tabs.addTab(self._build_clone_tab(), "Voice Clone (Base)")
         self.mode_tabs.addTab(self._build_custom_tab(), "TTS (CustomVoice)")
         layout.addWidget(self.mode_tabs)
 
-        # ── Voice Library ──
+        # â”€â”€ Voice Library â”€â”€
         lib_group = QGroupBox("Voice Library")
         lib_group.setObjectName("settingsGroup")
         lib_layout = QVBoxLayout(lib_group)
@@ -125,7 +126,8 @@ class VoiceTab(QScrollArea):
         ]:
             b = QPushButton(text)
             b.setObjectName("secondaryBtn")
-            b.setFixedHeight(26)
+            b.setMinimumHeight(26)
+            b.setMaximumHeight(34)
             b.clicked.connect(slot)
             lib_btns.addWidget(b)
         lib_layout.addLayout(lib_btns)
@@ -137,7 +139,8 @@ class VoiceTab(QScrollArea):
         ]:
             b = QPushButton(text)
             b.setObjectName("secondaryBtn")
-            b.setFixedHeight(26)
+            b.setMinimumHeight(26)
+            b.setMaximumHeight(34)
             b.clicked.connect(slot)
             lib_btns2.addWidget(b)
         lib_layout.addLayout(lib_btns2)
@@ -149,7 +152,7 @@ class VoiceTab(QScrollArea):
         lib_layout.addWidget(self.lib_meta)
         layout.addWidget(lib_group)
 
-        # ── STT Input ──
+        # â”€â”€ STT Input â”€â”€
         stt_group = QGroupBox("Speech-to-Text (Input)")
         stt_group.setObjectName("settingsGroup")
         stf = QFormLayout(stt_group)
@@ -165,7 +168,7 @@ class VoiceTab(QScrollArea):
         stf.addRow("Activation:", self.ptt_mode)
         layout.addWidget(stt_group)
 
-        # ── Mic Test ──
+        # â”€â”€ Mic Test â”€â”€
         mic_group = QGroupBox("Microphone Test")
         mic_group.setObjectName("settingsGroup")
         ml = QVBoxLayout(mic_group)
@@ -173,7 +176,8 @@ class VoiceTab(QScrollArea):
         self.vol_bar.setRange(0, 100)
         self.vol_bar.setValue(0)
         self.vol_bar.setTextVisible(False)
-        self.vol_bar.setFixedHeight(18)
+        self.vol_bar.setMinimumHeight(18)
+        self.vol_bar.setMaximumHeight(28)
         self.vol_bar.setStyleSheet(
             "QProgressBar{border:1px solid #555;border-radius:4px;background:#1a1a2e;}"
             "QProgressBar::chunk{background:qlineargradient("
@@ -193,7 +197,7 @@ class VoiceTab(QScrollArea):
         ml.addLayout(mic_row)
         layout.addWidget(mic_group)
 
-        # ── Latency Metrics ──
+        # â”€â”€ Latency Metrics â”€â”€
         lat_group = QGroupBox("TTS Latency")
         lat_group.setObjectName("settingsGroup")
         ll = QHBoxLayout(lat_group)
@@ -211,7 +215,7 @@ class VoiceTab(QScrollArea):
         ll.addWidget(self.rtf_lbl)
         layout.addWidget(lat_group)
 
-        # ── Status ──
+        # â”€â”€ Status â”€â”€
         self.status_label = QLabel("Status: Ready")
         self.status_label.setFont(QFont("Consolas", 8))
         self.status_label.setObjectName("metricLabel")
@@ -228,9 +232,9 @@ class VoiceTab(QScrollArea):
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self._refresh_library()
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Voice Design Tab
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_design_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -290,9 +294,9 @@ class VoiceTab(QScrollArea):
         self._last_design_wav = None
         return w
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Voice Clone (Base) Tab
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_clone_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -378,9 +382,9 @@ class VoiceTab(QScrollArea):
         self._last_clone_wav = None
         return w
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # TTS (CustomVoice) Tab
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_custom_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -452,9 +456,9 @@ class VoiceTab(QScrollArea):
         self._last_custom_wav = None
         return w
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Generation actions (threaded)
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _run_design(self):
         text = self.design_text.toPlainText().strip()
@@ -467,7 +471,7 @@ class VoiceTab(QScrollArea):
             self.design_status.setText("Enter a voice description")
             return
         self.design_status.setText("Generating...")
-        self.design_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.design_status, "color: #ccaa00;")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_design(text, desc, lang)
@@ -478,11 +482,11 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_design_wav = wav
             self.design_status.setText(f"Generated: {wav}")
-            self.design_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.design_status, "color: #00aa40;")
             self.voice_mgr.play_wav(wav)
         else:
             self.design_status.setText(f"Failed: {metrics}")
-            self.design_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.design_status, "color: #cc3040;")
 
     def _run_clone(self):
         ref = self.clone_ref_path.text().strip()
@@ -502,7 +506,7 @@ class VoiceTab(QScrollArea):
             )
             return
         self.clone_status.setText("Cloning...")
-        self.clone_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.clone_status, "color: #ccaa00;")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_clone(
@@ -515,11 +519,11 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_clone_wav = wav
             self.clone_status.setText(f"Generated: {wav}")
-            self.clone_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.clone_status, "color: #00aa40;")
             self.voice_mgr.play_wav(wav)
         else:
             self.clone_status.setText(f"Failed: {metrics}")
-            self.clone_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.clone_status, "color: #cc3040;")
 
     def _run_custom(self):
         text = self.custom_text.toPlainText().strip()
@@ -531,7 +535,7 @@ class VoiceTab(QScrollArea):
             self.custom_status.setText("Enter text to synthesize")
             return
         self.custom_status.setText("Generating...")
-        self.custom_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.custom_status, "color: #ccaa00;")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_custom(
@@ -544,20 +548,20 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_custom_wav = wav
             self.custom_status.setText(f"Generated: {wav}")
-            self.custom_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.custom_status, "color: #00aa40;")
             self.voice_mgr.play_wav(wav)
         else:
             self.custom_status.setText(f"Failed: {metrics}")
-            self.custom_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.custom_status, "color: #cc3040;")
 
     def _play_last(self, mode):
         wav = getattr(self, f"_last_{mode}_wav", None)
         if wav and Path(wav).exists():
             self.voice_mgr.play_wav(wav)
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Save to Library
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _save_design(self):
         wav = self._last_design_wav
@@ -631,9 +635,9 @@ class VoiceTab(QScrollArea):
         self._refresh_library()
         self.custom_status.setText(f"Saved: {name.strip()}")
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Voice Library actions
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _refresh_library(self):
         self.voice_mgr.library.load_all()
@@ -735,9 +739,9 @@ class VoiceTab(QScrollArea):
         else:
             self._set_status("No WAV file for this voice", "#cc3040")
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Clone tab helpers
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _browse_ref_audio(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -749,7 +753,7 @@ class VoiceTab(QScrollArea):
 
     def _record_ref_audio(self):
         self.clone_status.setText("Recording 5 seconds...")
-        self.clone_status.setStyleSheet("color: #dc3250;")
+        apply_status_style(self.clone_status, "color: #dc3250;")
 
         def _do():
             try:
@@ -774,15 +778,15 @@ class VoiceTab(QScrollArea):
     def _on_rec_done(self, path, error=None):
         if error:
             self.clone_status.setText(f"Recording failed: {error}")
-            self.clone_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.clone_status, "color: #cc3040;")
         elif path:
             self.clone_ref_path.setText(path)
             self.clone_status.setText("Recording saved")
-            self.clone_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.clone_status, "color: #00aa40;")
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Engine / Devices / Metrics
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _on_engine_changed(self, text):
         if "pyttsx3" in text.lower():
@@ -830,15 +834,15 @@ class VoiceTab(QScrollArea):
 
     def _set_status(self, text, color="#808898"):
         self.status_label.setText(f"Status: {text}")
-        self.status_label.setStyleSheet(f"color: {color};")
+        apply_status_style(self.status_label, f"color: {color};")
 
     def _on_core_connection(self, connected):
         if connected:
             self._set_status("Core online", "#00aa40")
 
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Qwen3-TTS Local Server Management
-    # ══════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _start_tts_server(self):
         if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
@@ -866,7 +870,7 @@ class VoiceTab(QScrollArea):
             try:
                 print(f"[TTS-SRV] GUI CUDA avail: {_t.cuda.is_available()}")
             except Exception as _ce:
-                print(f"[TTS-SRV] GUI CUDA avail: ERROR – {_ce}")
+                print(f"[TTS-SRV] GUI CUDA avail: ERROR â€“ {_ce}")
         except Exception as _te:
             print(f"[TTS-SRV] GUI torch check failed: {_te}")
 
@@ -882,7 +886,7 @@ class VoiceTab(QScrollArea):
 
         qwen_module = self._resolve_qwen_module()
         if not qwen_module:
-            self.tts_server_status.setStyleSheet("color: #cc3333;")
+            apply_status_style(self.tts_server_status, "color: #cc3333;")
             self.tts_server_status.setText(
                 "Qwen3-TTS module not found. Install package, then retry."
             )
@@ -899,7 +903,7 @@ class VoiceTab(QScrollArea):
 
         self._tts_process.setProcessEnvironment(env)
         self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
-        self.tts_server_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.tts_server_status, "color: #ccaa00;")
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
 
@@ -961,7 +965,7 @@ class VoiceTab(QScrollArea):
 
         if is_cpu_only:
             # PyTorch is not compiled with CUDA.  Any call to torch.cuda.*
-            # raises AssertionError unconditionally — CUDA_VISIBLE_DEVICES
+            # raises AssertionError unconditionally â€” CUDA_VISIBLE_DEVICES
             # cannot help here.  Run qwen_tts via a small wrapper script
             # that monkey-patches torch.cuda.is_available() to return False
             # safely before the module is imported.
@@ -1059,7 +1063,7 @@ class VoiceTab(QScrollArea):
             r = requests.get(f"http://localhost:{port}/gradio_api/info", timeout=2)
             if r.ok:
                 self.tts_server_status.setText(f"Running on :{port}")
-                self.tts_server_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.tts_server_status, "color: #00aa40;")
                 self._tts_ready_timer.stop()
                 return
         except Exception as e:
@@ -1085,7 +1089,7 @@ class VoiceTab(QScrollArea):
                 pass
             self._tts_launcher_tmp = None
         self.tts_server_status.setText("Stopped")
-        self.tts_server_status.setStyleSheet("")
+        clear_status_role(self.tts_server_status)
         self.start_tts_btn.setEnabled(True)
         self.stop_tts_btn.setEnabled(False)
 
@@ -1103,7 +1107,7 @@ class VoiceTab(QScrollArea):
             self._append_tts_log_line(line)
             if "Running on" in line:
                 self.tts_server_status.setText("Running on :8000")
-                self.tts_server_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.tts_server_status, "color: #00aa40;")
                 if self._tts_ready_timer:
                     self._tts_ready_timer.stop()
 
@@ -1127,7 +1131,7 @@ class VoiceTab(QScrollArea):
 
         if exit_code == 0:
             self.tts_server_status.setText("Stopped")
-            self.tts_server_status.setStyleSheet("")
+            clear_status_role(self.tts_server_status)
         else:
             # Show the last error line in the status label so the user can
             # diagnose the crash without opening the console.
@@ -1136,14 +1140,14 @@ class VoiceTab(QScrollArea):
                 if line:
                     error_hint = line[:120]
                     break
-            self.tts_server_status.setStyleSheet("color: #cc3333;")
+            apply_status_style(self.tts_server_status, "color: #cc3333;")
             if error_hint:
                 self.tts_server_status.setText(
                     f"Exited ({exit_code}): {error_hint}"
                 )
             else:
                 self.tts_server_status.setText(
-                    f"Exited ({exit_code}) — check console for details"
+                    f"Exited ({exit_code}) â€” check console for details"
                 )
 
     def _clean_tts_log_line(self, line: str) -> str:

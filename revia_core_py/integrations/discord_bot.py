@@ -12,6 +12,14 @@ from typing import Callable
 logger = logging.getLogger("revia.discord")
 
 try:
+    from ipc import get_event_publisher
+except Exception:
+    try:
+        from revia_core_py.ipc import get_event_publisher
+    except Exception:
+        get_event_publisher = None
+
+try:
     import discord
     DISCORD_AVAILABLE = True
 except ImportError:
@@ -36,6 +44,9 @@ class REVIADiscordBot:
         self.last_error = None
         self.messages_processed = 0
         self._counter_lock = threading.Lock()
+        self._core_event_publisher = get_event_publisher() if get_event_publisher else None
+        # Sing command handler (set externally by IntegrationManager)
+        self.sing_command_handler = None
         # Pre-convert ID lists to sets of strings for O(1) per-message lookup
         self._allowed_guilds: set[str] = {str(g) for g in config.get("guild_ids", [])}
         self._allowed_channels: set[str] = {str(c) for c in config.get("channel_ids", [])}
@@ -83,6 +94,30 @@ class REVIADiscordBot:
             mention_only = cfg.get("mention_only", False)
             prefix = cfg.get("prefix", "!")
 
+            # Handle !sing command before general routing
+            sing_prefix = f"{prefix}sing"
+            if content.lower().startswith(sing_prefix):
+                handler = bot_ref.sing_command_handler
+                if handler:
+                    args = content[len(sing_prefix):].strip()
+                    username = message.author.display_name
+                    async with message.channel.typing():
+                        loop = asyncio.get_running_loop()
+                        try:
+                            reply = await loop.run_in_executor(
+                                bot_ref._executor, handler.handle, args, username
+                            )
+                            if reply:
+                                chunks = _split_message(reply, 1900)
+                                for chunk in chunks:
+                                    await message.channel.send(chunk)
+                        except Exception as exc:
+                            logger.error("[Discord] !sing error: %s", exc)
+                            await message.channel.send("Something went wrong with !sing.")
+                else:
+                    await message.channel.send("Sing mode is not enabled yet!")
+                return
+
             # Determine whether to respond
             if mention_only:
                 if not client.user.mentioned_in(message):
@@ -104,6 +139,7 @@ class REVIADiscordBot:
 
             username = message.author.display_name
             platform_context = f"[Discord user {username}]: {content}"
+            bot_ref._publish_user_text_event(message, content, username)
 
             # Natural typing delay — makes responses feel less instant/robotic (configurable, reduced default)
             delay_range = cfg.get("typing_delay_ms", [100, 400])  # Reduced from [600, 1800]
@@ -138,6 +174,41 @@ class REVIADiscordBot:
                     bot_ref.last_error = str(exc)
 
         return client
+
+    def _publish_user_text_event(self, message, content: str, username: str) -> None:
+        """Fire-and-forget Phase 1 bridge into the cpp EventBus.
+
+        The bridge is non-authoritative: Discord still calls the legacy
+        pipeline for the actual response until Core owns action selection.
+        """
+        publisher = self._core_event_publisher
+        if publisher is None:
+            return
+
+        author = getattr(message, "author", None)
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None)
+
+        user_id = str(getattr(author, "id", "")) if author else None
+        channel_id = str(getattr(channel, "id", "")) if channel else None
+        guild_id = str(getattr(guild, "id", "")) if guild else None
+
+        def _send() -> None:
+            publisher.publish_user_text(
+                content,
+                source="Discord",
+                user_id=user_id,
+                username=username,
+                channel_id=channel_id,
+                guild_id=guild_id,
+                metadata={"bridge": "discord_bot.phase1"},
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(self._executor, _send)
+        except RuntimeError:
+            _send()
 
     # ------------------------------------------------------------------
     # Voice channel support (placeholder)

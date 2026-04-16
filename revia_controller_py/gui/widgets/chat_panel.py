@@ -3,12 +3,17 @@ import logging
 import queue
 import re
 import threading
+import time
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit, QPushButton,
+    QLabel,
     QComboBox,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QTimer, Signal
 from PySide6.QtGui import QFont, QPixmap
+
+from app.ui_status import apply_status_style
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ class ChatPanel(QFrame):
         self._tts_worker_active = False
         self._tts_worker_lock = threading.Lock()
         self._awaiting_reply = False
+        self._awaiting_started_at = 0.0
         self._assistant_audio_active = False
         self._pending_input_source = "UserMessage"
         self._pending_request_id = ""
@@ -48,6 +54,24 @@ class ChatPanel(QFrame):
         # Each item: (text, image_b64, vision_context, stack_index, stack_total, source)
         self._outbound_queue = []
         self._OUTBOUND_QUEUE_MAX = 50  # Prevent unbounded memory growth
+        self._wired_voice_backend = None
+        self._activity_thinking_started_at = None
+        self._activity_thinking_duration = 0.0
+        self._activity_generation_started_at = None
+        self._activity_generation_duration = 0.0
+        self._activity_tts_session_active = False
+        self._activity_tts_generation_started_at = None
+        self._activity_tts_generation_accum = 0.0
+        self._activity_tts_generation_duration = 0.0
+        self._activity_tts_playback_started_at = None
+        self._activity_tts_playback_accum = 0.0
+        self._activity_tts_playback_duration = 0.0
+        self._activity_waiting_for_tts = False
+        self._activity_interrupted = False
+        self._activity_summary = "Ready"
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(100)
+        self._activity_timer.timeout.connect(self._refresh_activity_indicator)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -56,19 +80,30 @@ class ChatPanel(QFrame):
         self.chat_display = QTextEdit()
         self.chat_display.setObjectName("chatDisplay")
         self.chat_display.setReadOnly(True)
-        self.chat_display.setFont(QFont("Consolas", 10))
+        self.chat_display.setFont(QFont("Segoe UI", 10))
         layout.addWidget(self.chat_display, stretch=1)
+
+        self.activity_label = QLabel("Ready")
+        self.activity_label.setObjectName("chatActivity")
+        self.activity_label.setFont(QFont("Segoe UI", 9))
+        self.activity_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.activity_label.setProperty("activityState", "idle")
+        apply_status_style(self.activity_label, role="muted")
+        self.activity_label.setContentsMargins(10, 6, 10, 6)
+        layout.addWidget(self.activity_label)
 
         input_row = QFrame()
         input_row.setObjectName("chatInputRow")
-        input_row.setFixedHeight(48)
+        input_row.setMinimumHeight(48)
+        input_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         row_layout = QHBoxLayout(input_row)
         row_layout.setContentsMargins(8, 6, 8, 6)
         row_layout.setSpacing(6)
 
         self.mic_btn = QPushButton("\U0001f3a4")
         self.mic_btn.setObjectName("micBtn")
-        self.mic_btn.setFixedSize(36, 36)
+        self.mic_btn.setMinimumSize(34, 34)
+        self.mic_btn.setMaximumSize(42, 42)
         self.mic_btn.setCheckable(True)
         self.mic_btn.setToolTip("Toggle Listening (click to start/stop)")
         self.mic_btn.toggled.connect(self._on_mic_toggled)
@@ -76,7 +111,8 @@ class ChatPanel(QFrame):
 
         self.vision_btn = QPushButton("\U0001f441")
         self.vision_btn.setObjectName("visionBtn")
-        self.vision_btn.setFixedSize(36, 36)
+        self.vision_btn.setMinimumSize(34, 34)
+        self.vision_btn.setMaximumSize(42, 42)
         self.vision_btn.setCheckable(True)
         self.vision_btn.setToolTip("Toggle live vision context for messages")
         self.vision_btn.toggled.connect(self._on_vision_toggled)
@@ -84,7 +120,8 @@ class ChatPanel(QFrame):
 
         self.tts_combo = QComboBox()
         self.tts_combo.addItems(["pyttsx3 (Fast)", "Qwen3-TTS (Quality)", "Off"])
-        self.tts_combo.setFixedWidth(145)
+        self.tts_combo.setMinimumWidth(112)
+        self.tts_combo.setMaximumWidth(190)
         self.tts_combo.setToolTip("TTS engine for AI responses")
         self.tts_combo.currentTextChanged.connect(self._on_tts_engine_changed)
         row_layout.addWidget(self.tts_combo)
@@ -97,13 +134,15 @@ class ChatPanel(QFrame):
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setObjectName("sendBtn")
-        self.send_btn.setFixedSize(70, 36)
+        self.send_btn.setMinimumSize(58, 34)
+        self.send_btn.setMaximumWidth(86)
         row_layout.addWidget(self.send_btn)
 
         layout.addWidget(input_row)
 
         self.send_btn.clicked.connect(self._send)
         self.input_field.returnPressed.connect(self._send)
+        self.tts_session_finished.connect(self._on_tts_session_finished)
         self.event_bus.chat_request_accepted.connect(self._on_request_accepted)
         self.event_bus.chat_token_payload.connect(self._on_token_payload)
         self.event_bus.chat_complete_payload.connect(self._on_complete_payload)
@@ -117,6 +156,8 @@ class ChatPanel(QFrame):
             self.audio_service.speech_recognized.connect(
                 self._on_speech_recognized
             )
+            self.audio_service.tts_started.connect(self._on_fallback_tts_started)
+            self.audio_service.tts_finished.connect(self._on_fallback_tts_finished)
 
         # Wire up ContinuousAudioPipeline (PRD §6) for barge-in detection
         if self.continuous_audio:
@@ -148,16 +189,36 @@ class ChatPanel(QFrame):
                 self.tts_combo.setCurrentText("Qwen3-TTS (Quality)")
             elif eng == "pyttsx3":
                 self.tts_combo.setCurrentText("pyttsx3 (Fast)")
+            backend = getattr(vm, "backend", None)
+            if backend is not None and backend is not self._wired_voice_backend:
+                backend.synthesis_started.connect(self._on_tts_generation_started)
+                backend.synthesis_finished.connect(self._on_tts_generation_finished)
+                backend.playback_started.connect(self._on_tts_playback_started)
+                backend.playback_finished.connect(self._on_tts_playback_finished)
+                backend.playback_interrupted.connect(self._on_tts_playback_interrupted)
+                self._wired_voice_backend = backend
 
     def _on_barge_in_detected(self, fragment):
-        """User spoke while TTS was playing — interrupt output."""
+        """User spoke while TTS was playing — interrupt output.
+
+        IMPORTANT: This slot may fire from the ContinuousAudioPipeline's
+        background thread, so Qt widget calls must be marshalled to the GUI
+        thread via QTimer.singleShot(0, ...).
+        """
         logger.info("[ChatPanel] Barge-in detected: %s", fragment[:50])
         if self._assistant_audio_active:
+            # Stop TTS playback immediately (thread-safe — only touches locks)
             self._interrupt_output()
-            self.chat_display.append(
-                '<span style="color:#f59e0b;font-size:9px;">'
-                f'[Barge-in: "{fragment[:30]}..."]</span>'
-            )
+            # Also tell the server to abort token generation
+            try:
+                self.client.send_interrupt()
+            except Exception:
+                pass
+            # Marshal the Qt widget update to the GUI thread
+            safe_fragment = fragment[:30]
+            QTimer.singleShot(0, lambda sf=safe_fragment: self.chat_display.append(
+                self._fmt_system(f'Barge-in: &ldquo;{sf}...&rdquo;')
+            ))
 
     def _on_continuous_speech_onset(self):
         """ContinuousAudio detected user starting to speak."""
@@ -192,10 +253,7 @@ class ChatPanel(QFrame):
     def _on_speech_recognized(self, text):
         self._pending_input_source = "VoiceInput"
         self.input_field.setText(text)
-        self.chat_display.append(
-            '<span style="color:#dc3250;font-size:9px;">'
-            f'[Speech: "{text}"]</span>'
-        )
+        self.chat_display.append(self._fmt_speech(text))
         # Auto-send the recognized speech
         self._send()
         # Turn off mic if not in always-listening mode
@@ -208,7 +266,11 @@ class ChatPanel(QFrame):
         This enables sentence-level streaming: TTS starts speaking the first
         sentence while the LLM is still generating the rest.
         """
-        # Mark that server provides sentence events — disables old local extraction
+        # Mark that server provides sentence events — disables old local extraction.
+        # If fallback buffering already captured text before the first sentence
+        # event arrived, drop it so we do not replay the same text later.
+        if not self._server_sentence_streaming and self._tts_sentence_buf:
+            self._tts_sentence_buf = ""
         self._server_sentence_streaming = True
         if not self.voice_manager or not sentence.strip():
             return
@@ -224,30 +286,43 @@ class ChatPanel(QFrame):
         except queue.Full:
             logger.warning("[ChatPanel] TTS queue full, dropping sentence")
 
+    def _drain_tts_queue(self, max_items=200):
+        """Drain pending TTS items and keep Queue bookkeeping balanced."""
+        drained = 0
+        for _ in range(max_items):
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                self._tts_queue.task_done()
+                drained += 1
+        if drained >= max_items and not self._tts_queue.empty():
+            logger.warning("[ChatPanel] TTS queue drain hit safety cap (%d)", max_items)
+        return drained
+
     def _interrupt_output(self):
-        """Stop TTS playback and clear the sentence queue."""
+        """Stop TTS playback and clear the sentence queue.
+
+        Thread-safe: can be called from the audio thread (barge-in) or the
+        GUI thread. Qt signal emissions are marshalled via QTimer.singleShot.
+        """
         # Set interrupted flag first so the TTS worker stops picking up new items
         with self._tts_worker_lock:
             self._tts_session_interrupted = True
             self._assistant_audio_active = False
         # Drain the queue — get_nowait() is atomic; safety cap prevents infinite loop
-        drained = 0
-        for _ in range(200):  # Safety cap: queue maxsize is 20, 200 is generous
-            try:
-                self._tts_queue.get_nowait()
-                self._tts_queue.task_done()
-                drained += 1
-            except queue.Empty:
-                break
+        drained = self._drain_tts_queue()
         # Stop any active playback
         if self.voice_manager and hasattr(self.voice_manager, 'backend'):
             try:
                 self.voice_manager.backend.stop_output()
             except Exception:
                 pass
-        self._notify_continuous_audio_tts_state(False)
-        self.assistant_output_interrupted.emit()
-        logger.info("[ChatPanel] Output interrupted, TTS queue cleared")
+        # Marshal Qt-only calls to the GUI thread to avoid cross-thread crashes
+        QTimer.singleShot(0, lambda: self._notify_continuous_audio_tts_state(False))
+        QTimer.singleShot(0, self.assistant_output_interrupted.emit)
+        logger.info("[ChatPanel] Output interrupted, drained %d queued TTS items", drained)
 
     def _on_interrupt_ack(self):
         """Server acknowledged interrupt — clear TTS queue."""
@@ -255,10 +330,7 @@ class ChatPanel(QFrame):
 
     def _on_proactive_start(self):
         """Revia is about to speak unprompted — show a subtle indicator."""
-        self.chat_display.append(
-            '<span style="color:#a78bfa;font-size:9px;">'
-            '[Revia initiates...]</span>'
-        )
+        self.chat_display.append(self._fmt_system("Revia initiates..."))
 
     def _send(self):
         text = self.input_field.text().strip()
@@ -268,6 +340,11 @@ class ChatPanel(QFrame):
         reason = "voice input response" if source == "VoiceInput" else "manual user message"
         if self.is_assistant_speaking() and not self._awaiting_reply:
             self.interrupt_assistant_output()
+            # Also tell the server to stop generating so tokens don't pile up
+            try:
+                self.client.send_interrupt()
+            except Exception:
+                pass
             self._append_system_note("Interrupted previous speech for new message")
         if self._behavior_controller and not self._awaiting_reply:
             decision = self._behavior_controller.should_respond(
@@ -296,24 +373,17 @@ class ChatPanel(QFrame):
                 vision_context = self.camera_service.build_live_context()
             if image_b64:
                 self.chat_display.append(
-                    '<span style="color:#00d4ff;font-weight:bold;">You:</span> '
-                    f'{text} <span style="color:#888;font-size:9px;">'
-                    '[+ live vision frame/context]</span>'
+                    self._fmt_user(text, note="[+ vision frame]")
                 )
             else:
                 self.chat_display.append(
-                    '<span style="color:#00d4ff;font-weight:bold;">You:</span> '
-                    f'{text} <span style="color:#cc3040;font-size:9px;">'
-                    '[vision context only]</span>'
+                    self._fmt_user(text, note="[vision ctx]")
                 )
         else:
-            self.chat_display.append(
-                f'<span style="color:#00d4ff;font-weight:bold;">You:</span> {text}'
-            )
+            self.chat_display.append(self._fmt_user(text))
         if stack_total > 1:
             self.chat_display.append(
-                '<span style="color:#9ca3af;font-size:9px;">'
-                f'[Question stack detected: {stack_total}. Answering one-by-one.]</span>'
+                self._fmt_system(f"Stack detected: {stack_total} questions — answering one-by-one")
             )
 
         self.input_field.clear()
@@ -326,8 +396,7 @@ class ChatPanel(QFrame):
                     (q, image_b64, vision_context, idx, stack_total, source)
                 )
             self.chat_display.append(
-                '<span style="color:#9ca3af;font-size:9px;">'
-                '[Queued: sending after current reply]</span>'
+                self._fmt_system("Queued — sending after current reply")
             )
             self._pending_input_source = "UserMessage"
             return
@@ -383,18 +452,16 @@ class ChatPanel(QFrame):
 
     def _start_request(self, text, image_b64=None, vision_context=None, source="UserMessage", reason="manual user message"):
         self._awaiting_reply = True
+        self._awaiting_started_at = time.monotonic()
         self._pending_request_id = ""
         self._current_request_id = ""
         self._current_response = ""
         self._full_response = ""
         self._tts_sentence_buf = ""
         self._server_sentence_streaming = False  # Reset for each new request
-        # Drain any leftover TTS queue from previous response (fix TOCTOU race)
-        while True:
-            try:
-                self._tts_queue.get_nowait()
-            except queue.Empty:
-                break
+        drained = self._drain_tts_queue()
+        if drained:
+            logger.debug("[ChatPanel] Cleared %d stale TTS items before request start", drained)
         self.client.send_chat(
             text,
             image_b64=image_b64,
@@ -407,6 +474,7 @@ class ChatPanel(QFrame):
         if not isinstance(payload, dict):
             return
         self._pending_request_id = str(payload.get("request_id", "") or "")
+        self._begin_activity_request()
 
     def _on_token_payload(self, payload):
         if not isinstance(payload, dict):
@@ -425,12 +493,11 @@ class ChatPanel(QFrame):
                 f"[Revia] Ignored out-of-order token payload for request {request_id}"
             )
             return
+        self._start_activity_generation()
         if request_id and not self._current_request_id:
             self._current_request_id = request_id
         if not self._current_response:
-            self.chat_display.append(
-                '<span style="color:#a78bfa;font-weight:bold;">Revia:</span> '
-            )
+            self.chat_display.append(self._fmt_revia_start())
         self._current_response += token
         self._full_response += token
         cursor = self.chat_display.textCursor()
@@ -489,6 +556,15 @@ class ChatPanel(QFrame):
     def _tts_worker(self):
         """Background thread: consumes sentence queue and speaks each one in order."""
         while True:
+            # Check if interrupted before picking up the next item
+            with self._tts_worker_lock:
+                if self._tts_session_interrupted:
+                    self._tts_worker_active = False
+                    self._assistant_audio_active = False
+                    self._tts_session_interrupted = False
+                    self._notify_continuous_audio_tts_state(False)
+                    self.tts_session_finished.emit(True)  # True = interrupted
+                    return
             try:
                 item = self._tts_queue.get(timeout=1.0)
                 # Unpack (text, emotion) tuple
@@ -498,7 +574,15 @@ class ChatPanel(QFrame):
                     # Legacy: handle plain text items
                     sentence = item
                     emotion = self._current_emotion
+                # Re-check after blocking get — interrupt may have arrived while waiting
                 with self._tts_worker_lock:
+                    if self._tts_session_interrupted:
+                        self._tts_worker_active = False
+                        self._assistant_audio_active = False
+                        self._tts_session_interrupted = False
+                        self._notify_continuous_audio_tts_state(False)
+                        self.tts_session_finished.emit(True)
+                        return
                     self._assistant_audio_active = True
                 # Notify ContinuousAudio that TTS is playing (enables barge-in detection)
                 self._notify_continuous_audio_tts_state(True)
@@ -543,6 +627,7 @@ class ChatPanel(QFrame):
             self._current_emotion = label
         if self.voice_manager and emotion:
             self.voice_manager.apply_emotion_modifiers(emotion)
+        self._recover_stale_reply_state(data)
 
     def _on_complete_payload(self, payload):
         if not isinstance(payload, dict):
@@ -551,6 +636,9 @@ class ChatPanel(QFrame):
         request_id = str(payload.get("request_id", "") or "")
         speakable = bool(payload.get("speakable", True))
         mode = str(payload.get("mode", "") or "")
+        success = bool(payload.get("success", True))
+        error_type = str(payload.get("error_type", "") or "")
+        metadata = payload.get("metadata", {}) or {}
         if self._current_request_id and request_id and request_id != self._current_request_id:
             self.event_bus.log_entry.emit(
                 f"[Revia] Ignored stale completion payload for request {request_id}"
@@ -564,28 +652,26 @@ class ChatPanel(QFrame):
         if request_id and not self._current_request_id:
             self._current_request_id = request_id
 
-        if text and text == self._last_completed_text and mode != "NORMAL_RESPONSE":
+        self._finish_activity_request()
+
+        if (not text) and (not success) and error_type != "interrupted":
+            text = str(
+                metadata.get("fallback_text")
+                or "Uh... something's wrong. Someone tell my operator he messed up."
+            ).strip()
+
+        if text and text == self._last_completed_text and mode != "NORMAL_RESPONSE" and success:
             self.event_bus.log_entry.emit(
                 f"[Revia] Duplicate completion text suppressed for request {request_id or 'unknown'}"
             )
-            self._awaiting_reply = False
-            self._pending_request_id = ""
-            self._current_request_id = ""
-            if self._outbound_queue:
-                nxt_text, nxt_img, nxt_ctx, _nxt_i, _nxt_n, nxt_source = self._outbound_queue.pop(0)
-                # Bind variables via default args to avoid closure capture bugs
-                QTimer.singleShot(
-                    250,
-                    lambda _t=nxt_text, _i=nxt_img, _c=nxt_ctx, _s=nxt_source: self._start_request(
-                        _t, image_b64=_i, vision_context=_c, source=_s, reason="queued user message",
-                    ),
-                )
+            self._activity_waiting_for_tts = False
+            self._finalize_activity_summary()
+            self._clear_reply_tracking()
+            self._schedule_next_queued_request(delay_ms=250)
             return
 
         if not self._current_response and text:
-            self.chat_display.append(
-                f'<span style="color:#a78bfa;font-weight:bold;">Revia:</span> {text}'
-            )
+            self.chat_display.append(self._fmt_revia(text))
         self._current_response = ""
         self._full_response = ""
         self.chat_display.append("")
@@ -596,19 +682,24 @@ class ChatPanel(QFrame):
         if tts_mode != "Off" and speakable:
             if self.voice_manager:
                 if tts_mode.startswith("pyttsx3"):
-                    # Flush any remaining partial sentence from the streaming buffer
-                    self._flush_tts_sentences(end_of_response=True)
-                    remaining = self._tts_sentence_buf.strip()
-                    self._tts_sentence_buf = ""
-                    if remaining and not remaining.startswith('['):
-                        # Queue (text, emotion) tuple
-                        self._tts_queue.put((remaining, self._current_emotion))
-                        self._ensure_tts_worker()
+                    if self._server_sentence_streaming:
+                        self._tts_sentence_buf = ""
+                    else:
+                        # Only use the local fallback buffer when the server did
+                        # not stream sentence boundaries for this reply.
+                        self._flush_tts_sentences(end_of_response=True)
+                        remaining = self._tts_sentence_buf.strip()
+                        self._tts_sentence_buf = ""
+                        if remaining and not remaining.startswith('['):
+                            # Queue (text, emotion) tuple
+                            self._tts_queue.put((remaining, self._current_emotion))
+                            self._ensure_tts_worker()
                 else:
                     # For Qwen quality mode, synthesize once per completed reply
+                    # only when sentence streaming is unavailable.
                     clean = (text or "").strip()
                     self._tts_sentence_buf = ""
-                    if clean and not clean.startswith('['):
+                    if clean and not clean.startswith('[') and not self._server_sentence_streaming:
                         # Queue (text, emotion) tuple
                         self._tts_queue.put((clean, self._current_emotion))
                         self._ensure_tts_worker()
@@ -619,79 +710,312 @@ class ChatPanel(QFrame):
         else:
             self._tts_sentence_buf = ""
 
-        self._awaiting_reply = False
-        self._pending_request_id = ""
-        self._current_request_id = ""
-        if self._outbound_queue:
-            nxt_text, nxt_img, nxt_ctx, nxt_i, nxt_n, nxt_source = self._outbound_queue.pop(0)
-            if nxt_n > 1:
-                self.chat_display.append(
-                    '<span style="color:#9ca3af;font-size:9px;">'
-                    f'[Continuing stacked question {nxt_i}/{nxt_n}]</span>'
-                )
-            # Bind variables via default args to avoid closure capture bugs
-            QTimer.singleShot(
-                900,
-                lambda _t=nxt_text, _i=nxt_img, _c=nxt_ctx, _s=nxt_source: self._start_request(
-                    _t, image_b64=_i, vision_context=_c, source=_s, reason="queued user message",
-                ),
-            )
+        self._activity_waiting_for_tts = bool(
+            tts_mode != "Off" and speakable and (self.voice_manager or self.audio_service)
+        )
+        if error_type == "interrupted":
+            self._activity_interrupted = True
+            self._activity_waiting_for_tts = False
+            self._finalize_activity_summary()
+        elif not self._activity_waiting_for_tts:
+            self._finalize_activity_summary()
+        else:
+            QTimer.singleShot(350, self._finalize_activity_summary_if_ready)
+
+        self._clear_reply_tracking()
+        self._schedule_next_queued_request()
 
     def interrupt_assistant_output(self):
         self._tts_sentence_buf = ""
-        while True:
-            try:
-                self._tts_queue.get_nowait()
-            except queue.Empty:
-                break
-        self._assistant_audio_active = False
-        self._pending_request_id = ""
-        self._current_request_id = ""
-        self._tts_session_interrupted = True
-        with self._tts_worker_lock:
-            self._tts_worker_active = False
+        self._activity_interrupted = True
+        # Stop playback FIRST so speak_sync() unblocks before we touch worker state
         if self.voice_manager:
             try:
-                self.voice_manager.stop_output()
+                self.voice_manager.backend.stop_output()
             except Exception as e:
                 logger.warning(f"Error stopping voice output: {e}")
+        drained = self._drain_tts_queue()
+        # Set all flags under the lock atomically to avoid racing the TTS worker
+        with self._tts_worker_lock:
+            self._assistant_audio_active = False
+            self._tts_session_interrupted = True
+            # NOTE: we do NOT set _tts_worker_active = False here. The TTS worker
+            # thread will see _tts_session_interrupted and exit on its own. Setting
+            # it to False while the thread is still alive would allow a second worker
+            # to start concurrently, causing audio device contention crashes.
+        self._pending_request_id = ""
+        self._current_request_id = ""
+        self._notify_continuous_audio_tts_state(False)
+        if drained:
+            logger.debug("[ChatPanel] Cleared %d queued TTS items during manual interrupt", drained)
         self.assistant_output_interrupted.emit()
+
+    def _begin_activity_request(self):
+        now = time.monotonic()
+        self._activity_thinking_started_at = now
+        self._activity_thinking_duration = 0.0
+        self._activity_generation_started_at = None
+        self._activity_generation_duration = 0.0
+        self._activity_tts_session_active = False
+        self._activity_tts_generation_started_at = None
+        self._activity_tts_generation_accum = 0.0
+        self._activity_tts_generation_duration = 0.0
+        self._activity_tts_playback_started_at = None
+        self._activity_tts_playback_accum = 0.0
+        self._activity_tts_playback_duration = 0.0
+        self._activity_waiting_for_tts = False
+        self._activity_interrupted = False
+        self._refresh_activity_indicator()
+
+    def _start_activity_generation(self):
+        if self._activity_generation_started_at is not None:
+            return
+        now = time.monotonic()
+        if self._activity_thinking_started_at is not None:
+            self._activity_thinking_duration = max(
+                0.0,
+                now - self._activity_thinking_started_at,
+            )
+            self._activity_thinking_started_at = None
+        self._activity_generation_started_at = now
+        self._refresh_activity_indicator()
+
+    def _finish_activity_request(self):
+        now = time.monotonic()
+        if self._activity_generation_started_at is not None:
+            self._activity_generation_duration = max(
+                0.0,
+                now - self._activity_generation_started_at,
+            )
+            self._activity_generation_started_at = None
+        elif self._activity_thinking_started_at is not None:
+            self._activity_thinking_duration = max(
+                0.0,
+                now - self._activity_thinking_started_at,
+            )
+            self._activity_thinking_started_at = None
+        self._refresh_activity_indicator()
+
+    def _ensure_tts_activity_session(self):
+        if not self._activity_tts_session_active:
+            self._activity_tts_session_active = True
+            self._activity_tts_generation_started_at = None
+            self._activity_tts_generation_accum = 0.0
+            self._activity_tts_generation_duration = 0.0
+            self._activity_tts_playback_started_at = None
+            self._activity_tts_playback_accum = 0.0
+            self._activity_tts_playback_duration = 0.0
+
+    def _on_tts_generation_started(self):
+        self._ensure_tts_activity_session()
+        if self._activity_tts_generation_started_at is None:
+            self._activity_tts_generation_started_at = time.monotonic()
+        self._refresh_activity_indicator()
+
+    def _on_tts_generation_finished(self, _metrics=None):
+        if self._activity_tts_generation_started_at is not None:
+            self._activity_tts_generation_accum += max(
+                0.0,
+                time.monotonic() - self._activity_tts_generation_started_at,
+            )
+            self._activity_tts_generation_started_at = None
+        self._activity_tts_generation_duration = self._activity_tts_generation_accum
+        self._refresh_activity_indicator()
+
+    def _on_tts_playback_started(self):
+        self._ensure_tts_activity_session()
+        if self._activity_tts_playback_started_at is None:
+            self._activity_tts_playback_started_at = time.monotonic()
+        self._refresh_activity_indicator()
+
+    def _on_tts_playback_finished(self):
+        if self._activity_tts_playback_started_at is not None:
+            self._activity_tts_playback_accum += max(
+                0.0,
+                time.monotonic() - self._activity_tts_playback_started_at,
+            )
+            self._activity_tts_playback_started_at = None
+        self._activity_tts_playback_duration = self._activity_tts_playback_accum
+        self._refresh_activity_indicator()
+
+    def _on_tts_playback_interrupted(self):
+        self._activity_interrupted = True
+        self._on_tts_playback_finished()
+
+    def _on_fallback_tts_started(self):
+        # The lightweight fallback path only exposes a start/end speaking window,
+        # so treat it as playback timing rather than inventing a separate synth span.
+        self._on_tts_playback_started()
+
+    def _on_fallback_tts_finished(self):
+        self._on_tts_playback_finished()
+        self._finish_tts_activity_session(interrupted=False)
+
+    def _finish_tts_activity_session(self, interrupted=False):
+        now = time.monotonic()
+        if self._activity_tts_generation_started_at is not None:
+            self._activity_tts_generation_accum += max(
+                0.0,
+                now - self._activity_tts_generation_started_at,
+            )
+            self._activity_tts_generation_started_at = None
+        if self._activity_tts_playback_started_at is not None:
+            self._activity_tts_playback_accum += max(
+                0.0,
+                now - self._activity_tts_playback_started_at,
+            )
+            self._activity_tts_playback_started_at = None
+        self._activity_tts_generation_duration = self._activity_tts_generation_accum
+        self._activity_tts_playback_duration = self._activity_tts_playback_accum
+        self._activity_tts_session_active = False
+        if interrupted:
+            self._activity_interrupted = True
+        self._activity_waiting_for_tts = False
+        self._finalize_activity_summary()
+
+    def _on_tts_session_finished(self, interrupted):
+        self._finish_tts_activity_session(interrupted=bool(interrupted))
+
+    def _finalize_activity_summary_if_ready(self):
+        if self._activity_waiting_for_tts and self._activity_tts_session_active:
+            return
+        self._activity_waiting_for_tts = False
+        self._finalize_activity_summary()
+
+    def _finalize_activity_summary(self):
+        parts = []
+        if self._activity_thinking_duration > 0.0:
+            parts.append(f"Thinking {self._activity_thinking_duration:.1f}s")
+        if self._activity_generation_duration > 0.0:
+            parts.append(f"Generating {self._activity_generation_duration:.1f}s")
+        if self._activity_tts_generation_duration > 0.0:
+            parts.append(f"TTS Gen {self._activity_tts_generation_duration:.1f}s")
+        if self._activity_tts_playback_duration > 0.0:
+            parts.append(f"Speaking {self._activity_tts_playback_duration:.1f}s")
+        if not parts:
+            self._activity_summary = "Interrupted" if self._activity_interrupted else "Ready"
+        else:
+            summary = " | ".join(parts)
+            if self._activity_interrupted:
+                summary = f"Interrupted | {summary}"
+            self._activity_summary = summary
+        self._refresh_activity_indicator()
+
+    def _current_activity_text(self):
+        if self._activity_tts_playback_started_at is not None:
+            return f"Speaking {max(0.0, time.monotonic() - self._activity_tts_playback_started_at):.1f}s", True
+        if self._activity_tts_generation_started_at is not None:
+            return f"TTS Gen {max(0.0, time.monotonic() - self._activity_tts_generation_started_at):.1f}s", True
+        if self._activity_generation_started_at is not None:
+            return f"Generating {max(0.0, time.monotonic() - self._activity_generation_started_at):.1f}s", True
+        if self._activity_thinking_started_at is not None:
+            return f"Thinking {max(0.0, time.monotonic() - self._activity_thinking_started_at):.1f}s", True
+        return self._activity_summary, False
+
+    def _refresh_activity_indicator(self):
+        text, active = self._current_activity_text()
+        text = str(text or "Ready")
+        self.activity_label.setText(text)
+        self.activity_label.setToolTip(text)
+        self.activity_label.setProperty("activityState", "active" if active else "idle")
+        apply_status_style(
+            self.activity_label,
+            role="warning" if active else "muted",
+        )
+        if active:
+            if not self._activity_timer.isActive():
+                self._activity_timer.start()
+        elif self._activity_timer.isActive():
+            self._activity_timer.stop()
+
+    @staticmethod
+    def _activity_style(*, active: bool) -> str:
+        return ""
+
+    def _recover_stale_reply_state(self, data):
+        if not isinstance(data, dict) or not self._awaiting_reply:
+            return
+        request_lifecycle = data.get("request_lifecycle", {}) or {}
+        active_request_id = str(request_lifecycle.get("active_request_id", "") or "")
+        active_turn = request_lifecycle.get("active_turn", {}) or {}
+        runtime_state = str(data.get("state", "") or "")
+        known_request_id = self._current_request_id or self._pending_request_id
+        awaiting_age_s = (
+            time.monotonic() - self._awaiting_started_at
+            if self._awaiting_started_at > 0.0
+            else 0.0
+        )
+
+        if known_request_id and active_request_id and active_request_id != known_request_id:
+            self.event_bus.log_entry.emit(
+                f"[Revia] Clearing stale reply state for request {known_request_id} "
+                f"(active request is {active_request_id})"
+            )
+            self._clear_reply_tracking()
+            self._schedule_next_queued_request(delay_ms=250)
+            return
+
+        if known_request_id and not active_request_id and runtime_state in ("Idle", "Cooldown", "Error"):
+            self.event_bus.log_entry.emit(
+                f"[Revia] Clearing stale reply state for completed request {known_request_id}"
+            )
+            self._clear_reply_tracking()
+            self._schedule_next_queued_request(delay_ms=250)
+            return
+
+        if not known_request_id and not active_request_id and runtime_state in ("Idle", "Cooldown", "Error") and awaiting_age_s >= 5.0:
+            self.event_bus.log_entry.emit(
+                "[Revia] Clearing stale reply state after timeout with no active request"
+            )
+            self._clear_reply_tracking()
+            self._schedule_next_queued_request(delay_ms=250)
+
+    def _clear_reply_tracking(self):
+        self._awaiting_reply = False
+        self._awaiting_started_at = 0.0
+        self._pending_request_id = ""
+        self._current_request_id = ""
+        self._current_response = ""
+        self._full_response = ""
+        self._tts_sentence_buf = ""
+
+    def _schedule_next_queued_request(self, delay_ms=900):
+        if not self._outbound_queue:
+            return
+        nxt_text, nxt_img, nxt_ctx, nxt_i, nxt_n, nxt_source = self._outbound_queue.pop(0)
+        if nxt_n > 1:
+            self.chat_display.append(
+                self._fmt_system(f"Continuing question {nxt_i}/{nxt_n}")
+            )
+        QTimer.singleShot(
+            delay_ms,
+            lambda _t=nxt_text, _i=nxt_img, _c=nxt_ctx, _s=nxt_source: self._start_request(
+                _t, image_b64=_i, vision_context=_c, source=_s, reason="queued user message",
+            ),
+        )
 
     def _on_vision_toggled(self, active):
         self._vision_active = active
         self.vision_mode_changed.emit(bool(active))
         if active:
             self.vision_btn.setToolTip("Vision ON - every message includes a fresh frame")
-            self.vision_btn.setStyleSheet(
-                "background: rgba(0, 180, 220, 0.3); "
-                "border: 2px solid rgba(0, 180, 220, 0.6); "
-                "border-radius: 18px;"
-            )
             self.input_field.setPlaceholderText(
                 "Vision is live - ask about what the camera sees..."
             )
         else:
             self.vision_btn.setToolTip("Toggle live vision context for messages")
-            self.vision_btn.setStyleSheet("")
             self.input_field.setPlaceholderText("Type a message...")
 
     def _on_mic_toggled(self, active):
         if active:
             self.mic_btn.setToolTip("Listening... (click to stop)")
-            self.mic_btn.setStyleSheet(
-                "background: rgba(220, 50, 80, 0.3); "
-                "border: 2px solid rgba(220, 50, 80, 0.6); "
-                "border-radius: 18px;"
-            )
             self.chat_display.append(
-                '<span style="color:#dc3250;font-size:9px;">'
-                '[Listening... speak now]</span>'
+                self._fmt_system("🎤 Listening — speak now")
             )
             if self.audio_service:
                 self.audio_service.start_listening()
         else:
             self.mic_btn.setToolTip("Toggle Listening (click to start/stop)")
-            self.mic_btn.setStyleSheet("")
             if self.audio_service:
                 self.audio_service.stop_listening()
 
@@ -712,8 +1036,57 @@ class ChatPanel(QFrame):
             or (not self._tts_queue.empty())
         )
 
-    def _append_system_note(self, text):
-        self.chat_display.append(
-            '<span style="color:#9ca3af;font-size:9px;">'
-            f'[{text}]</span>'
+    # ── Anime message format helpers ─────────────────────────────────────────
+    @staticmethod
+    def _fmt_user(text: str, note: str = "") -> str:
+        """Right-aligned user bubble with violet accent."""
+        note_html = (
+            f' <span style="color:#6b5d8a;font-size:8px;">{note}</span>'
+            if note else ""
         )
+        return (
+            '<table width="100%" cellpadding="0" cellspacing="0"'
+            ' style="margin:3px 0 2px 0;">'
+            '<tr><td align="right">'
+            '<span style="color:#c084fc;font-weight:bold;">◆ You</span>'
+            f' <span style="color:#ede9fe;">{text}</span>{note_html}'
+            '</td></tr></table>'
+        )
+
+    @staticmethod
+    def _fmt_revia_start() -> str:
+        """Header span that opens a streaming Revia turn."""
+        return (
+            '<span style="color:#f9a8d4;font-weight:bold;">✦ Revia</span> '
+        )
+
+    @staticmethod
+    def _fmt_revia(text: str) -> str:
+        """Left-aligned Revia bubble with pink accent."""
+        return (
+            '<table width="100%" cellpadding="0" cellspacing="0"'
+            ' style="margin:3px 0 2px 0;">'
+            '<tr><td align="left">'
+            '<span style="color:#f9a8d4;font-weight:bold;">✦ Revia</span>'
+            f' <span style="color:#ede9fe;">{text}</span>'
+            '</td></tr></table>'
+        )
+
+    @staticmethod
+    def _fmt_system(text: str) -> str:
+        """Muted italic system annotation."""
+        return (
+            '<span style="color:#6b5d8a;font-size:8px;font-style:italic;">'
+            f'⬡ {text}</span>'
+        )
+
+    @staticmethod
+    def _fmt_speech(text: str) -> str:
+        """Pink speech-recognition tag."""
+        return (
+            '<span style="color:#f472b6;font-size:8px;font-style:italic;">'
+            f'🎤 &ldquo;{text}&rdquo;</span>'
+        )
+
+    def _append_system_note(self, text):
+        self.chat_display.append(self._fmt_system(text))

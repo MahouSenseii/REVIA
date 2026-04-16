@@ -25,7 +25,14 @@ class EventBus(QObject):
     connection_changed = Signal(bool)
     plugins_updated = Signal(list)
     neural_updated = Signal(dict)
+    ui_theme_changed = Signal(str)
     camera_frame = Signal(QPixmap)
     proactive_start = Signal()  # Revia is about to initiate a conversation
     chat_sentence = Signal(str, str)  # (sentence_text, request_id) — sentence-level TTS event
     interrupt_ack = Signal()  # Server acknowledged an interrupt request
+
+    # Sing mode signals
+    sing_state_changed = Signal(str)           # new state string
+    sing_progress = Signal(str, int, int)      # (stage, current, total)
+    sing_lyrics_update = Signal(int, str)      # (line_index, lyric_text)
+    sing_queue_changed = Signal()              # queue was modified

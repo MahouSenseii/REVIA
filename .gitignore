@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+logs/
+.env
+config.local.json
+*.pt
+.idea/workspace.xml
+.claude/
+data/memory_*.jsonl
+data/integrations_config.json
+revia_core_py/data/memory_*.jsonl
+revia_core_py/logs/
+revia_core_py/data/integrations_config.json

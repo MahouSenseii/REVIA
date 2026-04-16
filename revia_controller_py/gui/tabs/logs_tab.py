@@ -1,9 +1,49 @@
+import re
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QComboBox, QGroupBox,
     QPushButton, QTableWidget, QTableWidgetItem,
 )
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
+
+
+# ── Log level detection + colors ──
+
+_LEVEL_PATTERNS = {
+    "error": re.compile(
+        r"\[(?:Core:err|ERROR|CRITICAL)\]|error[: ]|failed|crash|exception|traceback",
+        re.IGNORECASE,
+    ),
+    "warning": re.compile(
+        r"\[(?:WARNING|WARN)\]|warning[: ]|deprecated|timeout",
+        re.IGNORECASE,
+    ),
+    "telemetry": re.compile(
+        r"\[(?:Telemetry|Neural|Status)\]|emotion_|pipeline timing|span",
+        re.IGNORECASE,
+    ),
+    "info": re.compile(
+        r"\[(?:Revia|Core|LLM|Model|TTS)\]",
+        re.IGNORECASE,
+    ),
+}
+
+_LEVEL_COLORS = {
+    "error":     QColor("#FF4444"),   # red
+    "warning":   QColor("#FFAA00"),   # amber
+    "telemetry": QColor("#66BBFF"),   # light blue
+    "info":      QColor("#CCCCCC"),   # light gray
+    "debug":     QColor("#888888"),   # dim gray
+}
+
+
+def _classify_log(text: str) -> str:
+    """Classify a log line into error/warning/telemetry/info/debug."""
+    for level, pattern in _LEVEL_PATTERNS.items():
+        if pattern.search(text):
+            return level
+    return "debug"
 
 
 class LogsTab(QWidget):
@@ -33,32 +73,35 @@ class LogsTab(QWidget):
         toggle_row.addStretch()
         layout.addLayout(toggle_row)
 
+        # Create log view BEFORE filter row so clear button lambda can reference it
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setObjectName("logView")
+        self.log_view.setFont(QFont("Consolas", 9))
+        self.log_view.setVisible(False)  # Hidden by default
+
         filter_row = QHBoxLayout()
         self.level_filter = QComboBox()
         self.level_filter.addItems(
             ["All", "Info", "Warning", "Error", "Telemetry"]
         )
         self.level_filter.setVisible(False)  # Hidden by default
+        self.level_filter.currentTextChanged.connect(self._apply_filter)
         filter_row.addWidget(QLabel("Level:"))
         filter_row.addWidget(self.level_filter)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search logs...")
         self.search.setVisible(False)  # Hidden by default
+        self.search.textChanged.connect(self._apply_filter)
         filter_row.addWidget(self.search)
 
         clear_btn = QPushButton("Clear")
         clear_btn.setObjectName("secondaryBtn")
-        clear_btn.clicked.connect(lambda: self.log_view.clear())
+        clear_btn.clicked.connect(self._clear_logs)
         filter_row.addWidget(clear_btn)
 
         layout.addLayout(filter_row)
-
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setObjectName("logView")
-        self.log_view.setFont(QFont("Consolas", 9))
-        self.log_view.setVisible(False)  # Hidden by default
         layout.addWidget(self.log_view)
 
         timing_group = QGroupBox("Pipeline Timing (Last Run)")
@@ -77,6 +120,10 @@ class LogsTab(QWidget):
         self.timing_list.setVisible(False)  # Hidden by default
         layout.addWidget(timing_group)
 
+        # Internal log buffer for filtering
+        self._log_buffer: list[tuple[str, str]] = []  # (level, text)
+        self._max_buffer = 2000
+
         self.event_bus.log_entry.connect(self._add_log)
         self.event_bus.telemetry_updated.connect(self._update_timing)
 
@@ -87,9 +134,67 @@ class LogsTab(QWidget):
         self.level_filter.setVisible(enabled)
         self.search.setVisible(enabled)
 
-    def _add_log(self, text):
-        if self.log_view.isVisible():
-            self.log_view.append(text)
+    def _add_log(self, text: str):
+        level = _classify_log(text)
+        self._log_buffer.append((level, text))
+
+        # Trim buffer
+        if len(self._log_buffer) > self._max_buffer:
+            self._log_buffer = self._log_buffer[-self._max_buffer:]
+
+        if not self.log_view.isVisible():
+            return
+
+        # Check if this line passes current filter
+        if not self._passes_filter(level, text):
+            return
+
+        self._append_colored(level, text)
+
+    def _append_colored(self, level: str, text: str):
+        """Append a log line with color based on severity level."""
+        color = _LEVEL_COLORS.get(level, _LEVEL_COLORS["debug"])
+
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        fmt = QTextCharFormat()
+        fmt.setForeground(color)
+
+        # Bold for errors
+        if level == "error":
+            fmt.setFontWeight(QFont.Bold)
+
+        cursor.insertText(text + "\n", fmt)
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
+
+    def _passes_filter(self, level: str, text: str) -> bool:
+        """Check if a log entry passes the current level and search filters."""
+        selected = self.level_filter.currentText().lower()
+        if selected != "all":
+            if selected != level:
+                return False
+
+        search_text = self.search.text().strip()
+        if search_text and search_text.lower() not in text.lower():
+            return False
+
+        return True
+
+    def _apply_filter(self, *_args):
+        """Re-render the log view with current filter settings."""
+        if not self.log_view.isVisible():
+            return
+
+        self.log_view.clear()
+        for level, text in self._log_buffer:
+            if self._passes_filter(level, text):
+                self._append_colored(level, text)
+
+    def _clear_logs(self):
+        self.log_view.clear()
+        self._log_buffer.clear()
 
     def _update_timing(self, data):
         spans = data.get("recent_spans", [])

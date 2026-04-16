@@ -1,24 +1,16 @@
 from collections import deque
 import logging
 from PySide6.QtWidgets import (
-    QScrollArea, QWidget, QVBoxLayout, QHBoxLayout,
+    QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QGroupBox, QProgressBar, QPushButton,
     QTextEdit, QCheckBox, QSpinBox,
 )
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPainter, QColor, QPen
 
+from app.ui_status import apply_status_style
+
 logger = logging.getLogger(__name__)
-
-
-class _BgBridge(QObject):
-    """Marshals callables from a background thread to the Qt main-thread event loop."""
-    _call = Signal(object)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._call.connect(lambda fn: fn())
-
 try:
     from PySide6.QtCharts import (
         QChart, QChartView, QLineSeries, QValueAxis,
@@ -65,7 +57,6 @@ class EmotionsTab(QScrollArea):
         super().__init__(parent)
         self.event_bus = event_bus
         self.client = client
-        self._bg = _BgBridge(self)
         self.setWidgetResizable(True)
 
         self._chart_tick = 0
@@ -81,47 +72,6 @@ class EmotionsTab(QScrollArea):
         header.setObjectName("tabHeader")
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
-
-        state_group = QGroupBox("Current Emotional State (User)")
-        state_group.setObjectName("settingsGroup")
-        sg = QVBoxLayout(state_group)
-
-        label_row = QHBoxLayout()
-        self.emo_label = QLabel("Neutral")
-        self.emo_label.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        self.emo_label.setAlignment(Qt.AlignCenter)
-        label_row.addWidget(self.emo_label, stretch=1)
-
-        self.emo_confidence = QLabel("conf: --")
-        self.emo_confidence.setFont(QFont("Consolas", 9))
-        self.emo_confidence.setObjectName("metricLabel")
-        label_row.addWidget(self.emo_confidence)
-        sg.addLayout(label_row)
-
-        def _make_vad_bar(name, color):
-            row = QHBoxLayout()
-            name_lbl = QLabel(name)
-            name_lbl.setFixedWidth(82)
-            name_lbl.setFont(QFont("Segoe UI", 9))
-            bar = QProgressBar()
-            bar.setRange(-100, 100)
-            bar.setValue(0)
-            bar.setTextVisible(True)
-            bar.setFormat(f"{name}: %v%%")
-            bar.setStyleSheet(
-                f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
-            )
-            row.addWidget(name_lbl)
-            row.addWidget(bar)
-            return row, bar
-
-        vrow, self.valence_bar = _make_vad_bar("Valence", "#4ade80")
-        arow, self.arousal_bar = _make_vad_bar("Arousal", "#f59e0b")
-        drow, self.dominance_bar = _make_vad_bar("Dominance", "#818cf8")
-        sg.addLayout(vrow)
-        sg.addLayout(arow)
-        sg.addLayout(drow)
-        layout.addWidget(state_group)
 
         probs_group = QGroupBox("Neural Inference (Top Probabilities)")
         probs_group.setObjectName("settingsGroup")
@@ -199,22 +149,23 @@ class EmotionsTab(QScrollArea):
         cgl.addLayout(ctrl_row)
 
         if _CHARTS_AVAILABLE:
-            legend_row = QHBoxLayout()
-            legend_row.setSpacing(12)
-            for emo, color in _EMOTION_COLORS.items():
+            legend_grid = QGridLayout()
+            legend_grid.setSpacing(6)
+            _cols = 6  # wrap after 6 items per row
+            for idx, (emo, color) in enumerate(_EMOTION_COLORS.items()):
                 dot = QLabel("●")
                 dot.setStyleSheet(f"color: {color};")
                 dot.setFont(QFont("Segoe UI", 10))
                 lbl = QLabel(emo)
                 lbl.setFont(QFont("Segoe UI", 8))
-                lbl.setStyleSheet("color: #94a3b8;")
+                apply_status_style(lbl, role="muted")
                 pair = QHBoxLayout()
                 pair.setSpacing(3)
                 pair.addWidget(dot)
                 pair.addWidget(lbl)
-                legend_row.addLayout(pair)
-            legend_row.addStretch()
-            cgl.addLayout(legend_row)
+                row_i, col_i = divmod(idx, _cols)
+                legend_grid.addLayout(pair, row_i, col_i)
+            cgl.addLayout(legend_grid)
 
         layout.addWidget(chart_group)
 
@@ -305,24 +256,8 @@ class EmotionsTab(QScrollArea):
 
     def _update_display(self, emo):
         label = str(emo.get("label", "Neutral"))
-        secondary = str(emo.get("secondary_label", "")).strip()
         conf = self._as_float(emo.get("confidence", 0.0))
         v = self._as_float(emo.get("valence", 0.0))
-        a = self._as_float(emo.get("arousal", 0.0))
-        d = self._as_float(emo.get("dominance", 0.0))
-
-        color = _EMOTION_COLORS.get(label, "#94a3b8")
-        self.emo_label.setText(label)
-        self.emo_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-
-        if secondary and secondary != label:
-            self.emo_confidence.setText(f"conf: {conf:.0%} | next: {secondary}")
-        else:
-            self.emo_confidence.setText(f"conf: {conf:.0%}")
-
-        self.valence_bar.setValue(int(v * 100))
-        self.arousal_bar.setValue(int(a * 100))
-        self.dominance_bar.setValue(int(d * 100))
 
         probs = self._coerce_probabilities(emo.get("emotion_probs", {}))
         ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
@@ -441,37 +376,26 @@ class EmotionsTab(QScrollArea):
 
     def _toggle_injection(self, enabled):
         # Fire-and-forget in background — no need to update UI from the response.
-        action = "enable" if enabled else "disable"
-        url = f"{self.client.BASE_URL}/api/neural/emotion_net/{action}"
-
-        def _work():
-            try:
-                self.client._session_post(url, timeout=2)
-            except Exception as e:
-                logger.warning(f"Error toggling emotion injection: {e}")
-
-        self.client._executor.submit(_work)
+        self.client.toggle_neural(
+            "emotion_net",
+            enabled,
+            on_error=lambda error, _detail=None: logger.warning(
+                "Error toggling emotion injection: %s", error
+            ),
+        )
 
     def _refresh_history(self):
         limit = self.hist_limit.value()
-
-        def _work():
-            try:
-                r = self.client._session_get(
-                    f"{self.client.BASE_URL}/api/emotions/history",
-                    params={"limit": limit},
-                    timeout=3,
-                )
-                if not r.ok:
-                    return
-                history = r.json()
-                if not history:
-                    return
-                self._bg._call.emit(lambda h=history: self._apply_history(h))
-            except Exception as e:
-                logger.warning(f"Error refreshing emotion history: {e}")
-
-        self.client._executor.submit(_work)
+        self.client.get_async(
+            "/api/emotions/history",
+            params={"limit": limit},
+            timeout=3,
+            default=[],
+            on_success=lambda history: self._apply_history(history or []),
+            on_error=lambda error, _detail=None: logger.warning(
+                "Error refreshing emotion history: %s", error
+            ),
+        )
 
     def _apply_history(self, history):
         """Apply fetched history data to chart / fallback text (main thread only)."""
@@ -499,4 +423,3 @@ class EmotionsTab(QScrollArea):
                 else:
                     lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) V:{val:+.2f}")
             self._fallback_hist.setPlainText("\n".join(lines))
-

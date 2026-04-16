@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -134,9 +135,9 @@ class HumanFeelLayer:
     """
 
     def __init__(self, profile_engine=None, rng_seed: int | None = None):
-        self._pe  = profile_engine
-        self._profile_engine = profile_engine
+        self._pe = profile_engine
         self._rng = random.Random(rng_seed)
+        self._rng_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -169,35 +170,36 @@ class HumanFeelLayer:
                 elapsed_ms=(time.monotonic() - t0) * 1000,
             )
 
-        if rng_seed is not None:
-            self._rng.seed(rng_seed)
+        with self._rng_lock:
+            if rng_seed is not None:
+                self._rng.seed(rng_seed)
 
-        result = HFLResult(original=reply, processed=reply)
+            result = HFLResult(original=reply, processed=reply)
 
-        # 1. Thinking pause
-        result = self._apply_thinking_pause(result)
+            # 1. Thinking pause
+            result = self._apply_thinking_pause(result)
 
-        # 2. Self-correction
-        result = self._apply_self_correction(result)
+            # 2. Self-correction
+            result = self._apply_self_correction(result)
 
-        # 3. Prosody
-        result.prosody = self._compute_prosody(emotion_label)
+            # 3. Prosody
+            result.prosody = self._compute_prosody(emotion_label)
 
-        # 4. Verbosity trim
-        result = self._apply_verbosity_trim(result)
+            # 4. Verbosity trim
+            result = self._apply_verbosity_trim(result)
 
-        # 5. Inject personality quirks from profile
-        if hasattr(self, '_profile_engine') and self._profile_engine:
-            quirks = self._profile_engine.get_speech_quirks()
-            freq = self._profile_engine.get_quirk_frequency()
-        else:
-            quirks = ["honestly", "here's the thing", "ngl", "okay so", "like"]
-            freq = 0.15
-        result.processed = self.inject_quirks(result.processed, quirks, freq)
+            # 5. Inject personality quirks from profile
+            if self._pe:
+                quirks = self._pe.get_speech_quirks()
+                freq = self._pe.get_quirk_frequency()
+            else:
+                quirks = ["honestly", "here's the thing", "ngl", "okay so", "like"]
+                freq = 0.15
+            result.processed = self.inject_quirks(result.processed, quirks, freq)
 
-        # 6. Inject emotional vocalizations
-        if emotion_label and emotion_label.lower() not in ("neutral", "disabled", "---", ""):
-            result.processed = self.inject_vocalizations(result.processed, emotion_label)
+            # 6. Inject emotional vocalizations
+            if emotion_label and emotion_label.lower() not in ("neutral", "disabled", "---", ""):
+                result.processed = self.inject_vocalizations(result.processed, emotion_label)
 
         result.elapsed_ms = (time.monotonic() - t0) * 1000
         _log.debug(
@@ -241,8 +243,9 @@ class HumanFeelLayer:
         pos        = self._rng.choice(eligible)
         correction = self._rng.choice(_SELF_CORRECTIONS)
 
-        # Insert correction phrase at boundary
-        new_text = text[:pos] + correction + text[pos + 1:]   # replace delimiter char
+        # Insert correction phrase AFTER the delimiter, preserving the original char
+        delimiter = text[pos]
+        new_text = text[:pos + 1] + " " + correction + text[pos + 1:].lstrip()
         result.processed       = new_text
         result.correction_added = True
         result.notes.append(f"self_correction at pos {pos}: {correction!r}")
@@ -285,14 +288,15 @@ class HumanFeelLayer:
         """Randomly inject personality quirks at sentence boundaries."""
         if not quirks or not text:
             return text
-        sentences = text.split('. ')
+        # Split on sentence-ending punctuation while preserving the delimiter
+        parts = re.split(r'(?<=[.!?]) +', text)
         result = []
-        for i, sent in enumerate(sentences):
-            if i > 0 and self._rng.random() < frequency and quirks:
+        for i, sent in enumerate(parts):
+            if i > 0 and sent and self._rng.random() < frequency and quirks:
                 quirk = self._rng.choice(quirks)
-                sent = f"{quirk}, {sent[0].lower()}{sent[1:]}" if sent else sent
+                sent = f"{quirk}, {sent[0].lower()}{sent[1:]}"
             result.append(sent)
-        return '. '.join(result)
+        return ' '.join(result)
 
     def inject_vocalizations(self, text: str, emotion: str) -> str:
         """Add emotional vocalizations based on current mood."""
@@ -303,10 +307,14 @@ class HumanFeelLayer:
             "angry": ["ugh", "seriously", "wow okay"],
             "sad": ["sigh", "*sigh*", "..."],
         }
-        if emotion in markers and self._rng.random() < 0.25:
+        if emotion in markers and text and self._rng.random() < 0.25:
             marker = self._rng.choice(markers[emotion])
             if self._rng.random() < 0.5:
-                text = f"{marker}, {text[0].lower()}{text[1:]}"
+                # Prepend marker before text
+                if len(text) > 1:
+                    text = f"{marker}, {text[0].lower()}{text[1:]}"
+                else:
+                    text = f"{marker}, {text}"
             else:
                 # Insert after first sentence
                 dot = text.find('. ')

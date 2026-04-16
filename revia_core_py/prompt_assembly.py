@@ -1,26 +1,7 @@
 from __future__ import annotations
 
-from copy import deepcopy
-
+from persona_manager import DEFAULT_PROMPT_PROFILE, normalize_profile
 from runtime_models import ResponseMode
-
-
-FALLBACK_PROFILE = {
-    "character_name": "Revia",
-    "persona": (
-        "A confident, emotionally-aware digital companion who is curious, "
-        "calm under pressure, and genuinely helpful."
-    ),
-    "traits": "confident, intelligent, curious, empathetic, playful",
-    "response_style": "Conversational",
-    "verbosity": "Normal",
-    "greeting": "Hey, I'm Revia. Ready when you are.",
-    "character_prompt": (
-        "You are Revia, a living digital intelligence inside a computer system. "
-        "You speak naturally in first person, stay grounded in the real conversation, "
-        "and remain in character across every reply."
-    ),
-}
 
 
 class CharacterProfileManager:
@@ -28,11 +9,7 @@ class CharacterProfileManager:
         self._log = log_fn
 
     def get_active_profile(self, profile: dict | None) -> dict:
-        merged = deepcopy(FALLBACK_PROFILE)
-        if isinstance(profile, dict):
-            for key, value in profile.items():
-                if value not in (None, ""):
-                    merged[key] = value
+        merged = normalize_profile(profile)
         valid, issues = self.validate_profile_context(merged)
         if not valid:
             self._log(
@@ -42,27 +19,92 @@ class CharacterProfileManager:
             )
         return merged
 
+    @staticmethod
+    def _sanitize_profile_field(value: str, max_len: int = 500) -> str:
+        """Strip known prompt-injection patterns from profile fields."""
+        text = str(value or "")[:max_len]
+        # Remove attempts to override system instructions
+        import re as _re
+        text = _re.sub(
+            r"(?i)(ignore\s+(all\s+)?previous\s+instructions|"
+            r"you\s+are\s+now\s+|"
+            r"system\s*:\s*|"
+            r"<\s*/?system\s*>|"
+            r"\[INST\]|\[/INST\]|"
+            r"<<\s*SYS\s*>>)",
+            "[filtered]",
+            text,
+        )
+        return text
+
     def build_character_context(self, profile: dict | None, *, include_greeting_instruction: bool = False) -> str:
         prof = self.get_active_profile(profile)
-        name = prof.get("character_name", "Revia")
-        persona = prof.get("persona", "")
-        traits = prof.get("traits", "")
-        style = prof.get("response_style", "Conversational")
-        verbosity = prof.get("verbosity", "Normal")
-        greeting = prof.get("greeting", "")
-        char_prompt = prof.get("character_prompt", "")
+        persona_def = prof.get("persona_definition", {}) or {}
+        interaction = persona_def.get("interaction_style", {}) or {}
+
+        name = self._sanitize_profile_field(
+            persona_def.get("name") or prof.get("character_name", "Revia"),
+            50,
+        )
+        persona = self._sanitize_profile_field(
+            persona_def.get("summary") or prof.get("persona", "")
+        )
+        traits = self._sanitize_profile_field(
+            ", ".join(persona_def.get("traits", []) or []) or prof.get("traits", ""),
+            200,
+        )
+        style = self._sanitize_profile_field(
+            interaction.get("response_style") or prof.get("response_style", "Conversational"),
+            50,
+        )
+        verbosity = self._sanitize_profile_field(
+            interaction.get("verbosity") or prof.get("verbosity", "Normal"),
+            50,
+        )
+        greeting = self._sanitize_profile_field(
+            interaction.get("greeting") or prof.get("greeting", ""),
+            200,
+        )
+        char_prompt = self._sanitize_profile_field(
+            persona_def.get("identity_prompt") or prof.get("character_prompt", ""),
+            2000,
+        )
+        style_prompt = self._sanitize_profile_field(
+            persona_def.get("style_prompt", ""),
+            1200,
+        )
+        collaboration_prompt = self._sanitize_profile_field(
+            persona_def.get("collaboration_prompt", ""),
+            1200,
+        )
+        extra_modules = []
+        for module in persona_def.get("modules", []) or []:
+            if not isinstance(module, dict):
+                continue
+            module_name = str(module.get("name", "")).strip().lower()
+            if module_name in {"identity", "style", "collaboration"}:
+                continue
+            module_text = self._sanitize_profile_field(module.get("content", ""), 800)
+            if module_text:
+                extra_modules.append((module_name, module_text))
 
         parts = []
-        parts.append(char_prompt or FALLBACK_PROFILE["character_prompt"])
-        parts.append(f"Persona: {persona}")
+        parts.append(char_prompt or DEFAULT_PROMPT_PROFILE["character_prompt"])
+        parts.append(f"Active persona: {name}. {persona}")
         parts.append(f"Personality traits: {traits}")
         parts.append(f"Response style: {style}. Verbosity: {verbosity}.")
+        if style_prompt:
+            parts.append(style_prompt)
+        if collaboration_prompt:
+            parts.append(collaboration_prompt)
+        for module_name, module_text in extra_modules:
+            parts.append(f"{module_name.title()} module: {module_text}")
         parts.append(
             "Stay anchored to the current user message. Do not reset into a generic "
             "assistant identity, and do not ignore the user's real question."
         )
         parts.append(
-            "Keep a stable first-person identity as Revia across all replies, "
+            f"Keep a stable first-person identity as {name} across all replies, "
             "including tool, status, and recovery messages."
         )
         parts.append(
@@ -76,25 +118,28 @@ class CharacterProfileManager:
         if include_greeting_instruction and greeting:
             parts.append(
                 f"If this turn is explicitly a greeting/startup turn, greet naturally in a way like: \"{greeting}\""
-            )
+        )
         parts.append(
             "If you are uncertain, say so clearly and suggest a next step instead of "
             "pretending the request succeeded."
         )
         parts.append(
-            "Avoid generic assistant phrasing. Sound like Revia, not a default helper bot."
+            f"Avoid generic assistant phrasing. Sound like {name}, not a default helper bot."
         )
         parts.append(
-            f"Active profile confirmation: you are {name}."
+            f"Active persona confirmation: you are {name}."
         )
         return "\n".join(parts)
 
     def validate_profile_context(self, profile: dict | None) -> tuple[bool, list[str]]:
-        prof = profile or {}
+        prof = normalize_profile(profile)
+        persona_def = prof.get("persona_definition", {}) or {}
         issues = []
         if not str(prof.get("character_name", "")).strip():
             issues.append("missing character_name")
-        if not str(prof.get("character_prompt", "")).strip():
+        if not str(
+            persona_def.get("identity_prompt") or prof.get("character_prompt", "")
+        ).strip():
             issues.append("missing character_prompt")
         if not str(prof.get("persona", "")).strip():
             issues.append("missing persona")
@@ -106,8 +151,26 @@ class PromptAssemblyManager:
         self._log = log_fn
         self._profile_manager = profile_manager
 
-    def _personality_error(self, profile_name, error_type):
-        """Generate in-character error response instead of generic system message."""
+    def _personality_error(self, profile_name, error_type, profile: dict | None = None):
+        """Generate in-character error response.
+
+        If the active profile has a ``fallback_msg`` field, that takes
+        priority — it's the operator-configured error response.  Otherwise
+        fall back to generic in-character quips.
+        """
+        # Check the profile for an explicit fallback message first
+        fallback = ""
+        if isinstance(profile, dict):
+            fallback = profile.get("fallback_msg", "")
+        if not fallback:
+            try:
+                merged = self._profile_manager.get_active_profile(profile)
+                fallback = (merged or {}).get("fallback_msg", "")
+            except Exception:
+                pass
+        if fallback:
+            return fallback
+
         responses = {
             "timeout": [
                 "Ugh, my brain just froze for a sec... what were we talking about?",
@@ -117,7 +180,7 @@ class PromptAssemblyManager:
             "generation_failed": [
                 "I had something really good to say but it just... vanished.",
                 "Okay wow, total brain fart. Try me again?",
-                "Something went wrong in my head. Not the first time, won't be the last.",
+                "My brain just short-circuited. Not the first time, won't be the last.",
             ],
             "empty_response": [
                 "Hmm, my response came out empty. That's weird.",
@@ -253,17 +316,24 @@ class PromptAssemblyManager:
 
         lines.append(f"Verbosity guideline: {verbosity_label}.")
 
+        def _safe_float(val, default=0.5):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
         emotion_intensity = bp.get("emotion_intensity", None)
         if emotion_intensity is not None:
-            if float(emotion_intensity) < 0.35:
+            ei = _safe_float(emotion_intensity, 0.5)
+            if ei < 0.35:
                 lines.append("Emotional tone: keep affect subdued and professional.")
-            elif float(emotion_intensity) > 0.70:
+            elif ei > 0.70:
                 lines.append("Emotional tone: express warmth and emotion openly.")
             else:
                 lines.append("Emotional tone: balanced — natural warmth without exaggeration.")
 
         self_correction_rate = bp.get("self_correction_rate", None)
-        if self_correction_rate is not None and float(self_correction_rate) > 0.20:
+        if self_correction_rate is not None and _safe_float(self_correction_rate, 0.0) > 0.20:
             lines.append(
                 "Self-correction style: occasionally rephrase mid-sentence to show "
                 "genuine thinking (e.g. '— actually, let me put it this way…')."
@@ -271,9 +341,10 @@ class PromptAssemblyManager:
 
         question_propensity = bp.get("question_propensity", None)
         if question_propensity is not None:
-            if float(question_propensity) < 0.15:
+            qp = _safe_float(question_propensity, 0.25)
+            if qp < 0.15:
                 lines.append("Follow-up questions: avoid asking follow-up questions unless essential.")
-            elif float(question_propensity) > 0.40:
+            elif qp > 0.40:
                 lines.append("Follow-up questions: invite the user to elaborate when relevant.")
 
         # Mood baseline - sets default emotional state
@@ -283,17 +354,17 @@ class PromptAssemblyManager:
 
         # Humor tendency
         humor = bp.get("humor_tendency", None)
-        if humor is not None and float(humor) > 0.25:
+        if humor is not None and _safe_float(humor, 0.0) > 0.25:
             lines.append("Humor style: be witty and playful where appropriate. Don't force it.")
 
         # Empathy weight
         empathy = bp.get("empathy_weight", None)
-        if empathy is not None and float(empathy) > 0.50:
+        if empathy is not None and _safe_float(empathy, 0.0) > 0.50:
             lines.append("Emotional engagement: prioritize understanding and validating feelings.")
 
         # Sarcasm ceiling
         sarcasm = bp.get("sarcasm_ceiling", None)
-        if sarcasm is not None and float(sarcasm) > 0.15:
+        if sarcasm is not None and _safe_float(sarcasm, 0.0) > 0.15:
             lines.append("Sarcasm is okay in moderation when context calls for it.")
 
         # ── Speech quirks and catchphrases ──────────────────────────────
@@ -325,9 +396,10 @@ class PromptAssemblyManager:
             elif affect_mode == "amplified":
                 lines.append("Delivery hint: be expressive, energetic, and emotionally present.")
 
-            if float(rate) < 0.90:
+            rate_f = _safe_float(rate, 1.0)
+            if rate_f < 0.90:
                 lines.append("Pacing hint: speak at a slower, more deliberate pace in this reply.")
-            elif float(rate) > 1.10:
+            elif rate_f > 1.10:
                 lines.append("Pacing hint: keep the reply brisk and energetic.")
 
         if not lines:

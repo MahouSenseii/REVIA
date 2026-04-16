@@ -7,19 +7,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QSpinBox, QComboBox, QGroupBox, QCheckBox,
     QPushButton, QTableWidget, QTableWidgetItem, QListWidget,
 )
-from PySide6.QtCore import QObject, QTimer, QProcess, Signal
+from PySide6.QtCore import QTimer, QProcess
 from PySide6.QtGui import QFont
 
+from app.backend_sync_client import BackendSyncClient
+from app.ui_async import UiThreadBridge
+from app.ui_status import apply_status_style, clear_status_role
+
 logger = logging.getLogger(__name__)
-
-
-class _BgBridge(QObject):
-    """Marshals callables from a background thread to the Qt main-thread event loop."""
-    _call = Signal(object)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._call.connect(lambda fn: fn())
 
 
 class SystemTab(QScrollArea):
@@ -30,7 +25,9 @@ class SystemTab(QScrollArea):
         self.theme_mgr = theme_mgr
         self._core_process = None
         self._auto_start_attempted = False
-        self._bg = _BgBridge(self)
+        self._neural_refresh_inflight = False
+        self._bg = UiThreadBridge(self)
+        self._sync_client = BackendSyncClient(event_bus)
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -50,7 +47,7 @@ class SystemTab(QScrollArea):
 
         sv_info = QLabel(
             "Start the Python core server directly from the UI. "
-            "It will auto-connect once ready."
+            "This is the primary REVIA runtime and will auto-connect once ready."
         )
         sv_info.setFont(QFont("Segoe UI", 8))
         sv_info.setWordWrap(True)
@@ -170,8 +167,8 @@ class SystemTab(QScrollArea):
         theme_group.setObjectName("settingsGroup")
         tg = QFormLayout(theme_group)
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Dark", "Light"])
-        self.theme_combo.currentTextChanged.connect(self._change_theme)
+        self._load_theme_combo()
+        self.theme_combo.currentIndexChanged.connect(self._change_theme)
         tg.addRow("Theme:", self.theme_combo)
         layout.addWidget(theme_group)
 
@@ -315,6 +312,8 @@ class SystemTab(QScrollArea):
 
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
         self.event_bus.connection_changed.connect(self._on_core_connection)
+        if hasattr(self.event_bus, "ui_theme_changed"):
+            self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
 
     # --- Core server management ---
 
@@ -379,13 +378,13 @@ class SystemTab(QScrollArea):
     def _start_core_server(self):
         if self._core_process and self._core_process.state() == QProcess.Running:
             self.server_status.setText("Server: Already running")
-            self.server_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.server_status, "color: #ccaa00;")
             return
 
         script = self._find_core_script()
         if not script:
             self.server_status.setText("Server: core_server.py not found!")
-            self.server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.server_status, "color: #cc3040;")
             return
 
         host = self.core_host.text().strip() or "127.0.0.1"
@@ -395,7 +394,7 @@ class SystemTab(QScrollArea):
         # Disable button immediately to prevent double-clicks; show checking state.
         self.start_server_btn.setEnabled(False)
         self.server_status.setText("Server: Checking...")
-        self.server_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.server_status, "color: #ccaa00;")
 
         # Offload the pre-flight "already running?" HTTP check to the background.
         def _check():
@@ -419,7 +418,7 @@ class SystemTab(QScrollArea):
                     ) and bool(data.get("architecture"))
             except Exception as e:
                 logger.debug(f"Error checking running core version: {e}")
-            self._bg._call.emit(
+            self._bg.dispatch(
                 lambda: self._launch_core_or_connect(
                     script, host, rest, ws,
                     already_running, running_version, running_has_arch,
@@ -440,7 +439,7 @@ class SystemTab(QScrollArea):
                 self.server_status.setText(
                     "Server: Already running externally - connecting..."
                 )
-                self.server_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.server_status, "color: #00aa40;")
                 self.event_bus.log_entry.emit(
                     f"[Core] Found existing server on port {rest} "
                     f"(v{running_version or '?'}), connecting"
@@ -450,7 +449,7 @@ class SystemTab(QScrollArea):
                 return
 
             self.server_status.setText("Server: Legacy core detected - upgrading...")
-            self.server_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.server_status, "color: #ccaa00;")
             self.event_bus.log_entry.emit(
                 f"[Core] Existing server on port {rest} is legacy "
                 f"(v{running_version or '?'}). Replacing with current core."
@@ -479,13 +478,13 @@ class SystemTab(QScrollArea):
         if not self._core_process.waitForStarted(5000):
             err = self._core_process.errorString()
             self.server_status.setText(f"Server: Failed - {err}")
-            self.server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.server_status, "color: #cc3040;")
             self.event_bus.log_entry.emit(f"[Core] Failed to start: {err}")
             self.start_server_btn.setEnabled(True)
             return
 
         self.server_status.setText("Server: Starting...")
-        self.server_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.server_status, "color: #ccaa00;")
         self.start_server_btn.setEnabled(False)
         self.stop_server_btn.setEnabled(True)
         self._connect_attempts = 0
@@ -506,13 +505,13 @@ class SystemTab(QScrollArea):
         # Check if process died before spending time on an HTTP probe.
         if self._core_process and self._core_process.state() == QProcess.NotRunning:
             self.server_status.setText("Server: Failed to start (check Logs)")
-            self.server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.server_status, "color: #cc3040;")
             self.start_server_btn.setEnabled(True)
             self.stop_server_btn.setEnabled(False)
             return
         if self._connect_attempts > 15:
             self.server_status.setText("Server: Timeout waiting for REST")
-            self.server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.server_status, "color: #cc3040;")
             return
 
         attempts = self._connect_attempts  # snapshot for the closure
@@ -533,14 +532,14 @@ class SystemTab(QScrollArea):
             def _apply(ok=ok, ver=ver, a=attempts):
                 if ok:
                     self.server_status.setText(f"Server: Running (v{ver})")
-                    self.server_status.setStyleSheet("color: #00aa40;")
+                    apply_status_style(self.server_status, "color: #00aa40;")
                     self._connect_core()
                 else:
                     self.server_status.setText(f"Server: Starting ({a * 2}s...)")
-                    self.server_status.setStyleSheet("color: #ccaa00;")
+                    apply_status_style(self.server_status, "color: #ccaa00;")
                     QTimer.singleShot(2000, self._auto_connect_after_start)
 
-            self._bg._call.emit(_apply)
+            self._bg.dispatch(_apply)
 
         self.client._executor.submit(_check)
 
@@ -563,7 +562,7 @@ class SystemTab(QScrollArea):
         }
         desc = error_names.get(error, f"Error code {error}")
         self.server_status.setText(f"Server: {desc}")
-        self.server_status.setStyleSheet("color: #cc3040;")
+        apply_status_style(self.server_status, "color: #cc3040;")
         self.event_bus.log_entry.emit(f"[Core] Process error: {desc}")
         self.start_server_btn.setEnabled(True)
         self.stop_server_btn.setEnabled(False)
@@ -602,7 +601,7 @@ class SystemTab(QScrollArea):
         self.server_status.setText(
             f"Server: Stopped (exit {exit_code}){detail}"
         )
-        self.server_status.setStyleSheet("color: #cc3040;")
+        apply_status_style(self.server_status, "color: #cc3040;")
         self.event_bus.log_entry.emit(
             f"[Core] Process exited with code {exit_code}{detail}"
         )
@@ -627,7 +626,7 @@ class SystemTab(QScrollArea):
                 self._core_process.kill()
             self._core_process.waitForFinished(3000)
             self.server_status.setText("Server: Stopped")
-            self.server_status.setStyleSheet("")
+            clear_status_role(self.server_status)
             self.start_server_btn.setEnabled(True)
             self.stop_server_btn.setEnabled(False)
             self._core_process = None
@@ -647,7 +646,7 @@ class SystemTab(QScrollArea):
         self.client.WS_URL = f"ws://{host}:{ws}"
 
         self.core_status.setText("Status: Connecting...")
-        self.core_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.core_status, "color: #ccaa00;")
         self.core_connect_btn.setEnabled(False)
 
         if self.client.connected:
@@ -672,7 +671,7 @@ class SystemTab(QScrollArea):
                         self.core_status.setText(
                             f"Status: Connected | v{v} | State: {s}"
                         )
-                        self.core_status.setStyleSheet("color: #00aa40;")
+                        apply_status_style(self.core_status, "color: #00aa40;")
                         self.core_disconnect_btn.setEnabled(True)
                         self.core_connect_btn.setEnabled(True)
                 else:
@@ -680,19 +679,19 @@ class SystemTab(QScrollArea):
 
                     def _apply(c=sc):
                         self.core_status.setText(f"Status: REST error ({c})")
-                        self.core_status.setStyleSheet("color: #cc3040;")
+                        apply_status_style(self.core_status, "color: #cc3040;")
                         self.core_connect_btn.setEnabled(True)
 
-                self._bg._call.emit(_apply)
+                self._bg.dispatch(_apply)
             except Exception as ex:
                 err = str(ex)
 
                 def _apply_err(e=err):
-                    self.core_status.setText(f"Status: Unreachable — {e}")
-                    self.core_status.setStyleSheet("color: #cc3040;")
+                    self.core_status.setText(f"Status: Unreachable â€” {e}")
+                    apply_status_style(self.core_status, "color: #cc3040;")
                     self.core_connect_btn.setEnabled(True)
 
-                self._bg._call.emit(_apply_err)
+                self._bg.dispatch(_apply_err)
 
         self.client._executor.submit(_check)
 
@@ -701,12 +700,12 @@ class SystemTab(QScrollArea):
         self.client.connected = False
         self.event_bus.connection_changed.emit(False)
         self.core_status.setText("Status: Disconnected")
-        self.core_status.setStyleSheet("")
+        clear_status_role(self.core_status)
         self.core_disconnect_btn.setEnabled(False)
 
     def _ping_core(self):
         self.core_status.setText("Status: Pinging...")
-        self.core_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.core_status, "color: #ccaa00;")
         QTimer.singleShot(50, self._do_ping)
 
     def _do_ping(self):
@@ -724,20 +723,20 @@ class SystemTab(QScrollArea):
                         self.core_status.setText(
                             f"Status: Online | Ping: {lat:.0f} ms"
                         )
-                        self.core_status.setStyleSheet("color: #00aa40;")
+                        apply_status_style(self.core_status, "color: #00aa40;")
                 else:
                     sc = r.status_code
 
                     def _apply(c=sc):
                         self.core_status.setText(f"Status: Error ({c})")
-                        self.core_status.setStyleSheet("color: #cc3040;")
+                        apply_status_style(self.core_status, "color: #cc3040;")
 
-                self._bg._call.emit(_apply)
+                self._bg.dispatch(_apply)
             except Exception as e:
                 logger.debug(f"Error checking core status: {e}")
-                self._bg._call.emit(lambda: (
+                self._bg.dispatch(lambda: (
                     self.core_status.setText("Status: Unreachable"),
-                    self.core_status.setStyleSheet("color: #cc3040;"),
+                    apply_status_style(self.core_status, "color: #cc3040;"),
                 ))
 
         self.client._executor.submit(_check)
@@ -745,10 +744,12 @@ class SystemTab(QScrollArea):
     def _on_core_connection(self, connected):
         if connected:
             self.core_status.setText("Status: Connected (WebSocket live)")
-            self.core_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.core_status, "color: #00aa40;")
             self.core_disconnect_btn.setEnabled(True)
+            self._refresh_plugins()
+            self._refresh_neural()
         else:
-            # Probe REST in the background — avoids blocking the main thread
+            # Probe REST in the background â€” avoids blocking the main thread
             # on what could be a 1-second timeout during a WS disconnect event.
             def _check():
                 rest_ok = False
@@ -765,29 +766,73 @@ class SystemTab(QScrollArea):
                         self.core_status.setText(
                             "Status: REST online (WebSocket reconnecting)"
                         )
-                        self.core_status.setStyleSheet("color: #ccaa00;")
+                        apply_status_style(self.core_status, "color: #ccaa00;")
                         self.core_disconnect_btn.setEnabled(False)
                         self.arch_overall.setText("Overall: Degraded (WS offline)")
-                        self.arch_overall.setStyleSheet("color: #ccaa00;")
+                        apply_status_style(self.arch_overall, "color: #ccaa00;")
                     else:
                         self.core_status.setText("Status: Disconnected")
-                        self.core_status.setStyleSheet("color: #cc3040;")
+                        apply_status_style(self.core_status, "color: #cc3040;")
                         self.core_disconnect_btn.setEnabled(False)
                         self.arch_overall.setText("Overall: Offline")
-                        self.arch_overall.setStyleSheet("color: #cc3040;")
+                        apply_status_style(self.arch_overall, "color: #cc3040;")
                         for lbl in self.arch_labels.values():
                             lbl.setText("OFFLINE")
-                            lbl.setStyleSheet("color: #cc3040;")
+                            apply_status_style(lbl, "color: #cc3040;")
 
-                self._bg._call.emit(_apply)
+                self._bg.dispatch(_apply)
 
             self.client._executor.submit(_check)
 
-    def _change_theme(self, theme):
-        self.theme_mgr.apply_theme(theme.lower())
+    def _load_theme_combo(self):
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        active = self.theme_mgr.current_theme
+        for theme in self.theme_mgr.available_themes():
+            self.theme_combo.addItem(theme.DisplayName, theme.ThemeId)
+        index = self.theme_combo.findData(active)
+        self.theme_combo.setCurrentIndex(max(index, 0))
+        self.theme_combo.blockSignals(False)
+
+    def _change_theme(self, _index=None):
+        theme_id = self.theme_combo.currentData()
+        if not theme_id:
+            return
+        applied = self.theme_mgr.apply_theme(theme_id)
+        self._sync_client.publish_config_change(
+            {
+                "scope": "ui.theme",
+                "action": "apply",
+                "theme_id": applied,
+            }
+        )
+        if hasattr(self.event_bus, "ui_theme_changed"):
+            self.event_bus.ui_theme_changed.emit(applied)
+        self.event_bus.log_entry.emit(f"[CoreSync] UI theme apply: {applied}")
+
+    def _on_theme_changed(self, theme_id):
+        index = self.theme_combo.findData(theme_id)
+        if index < 0:
+            self._load_theme_combo()
+            index = self.theme_combo.findData(theme_id)
+        if index >= 0 and index != self.theme_combo.currentIndex():
+            self.theme_combo.blockSignals(True)
+            self.theme_combo.setCurrentIndex(index)
+            self.theme_combo.blockSignals(False)
 
     def _refresh_plugins(self):
-        plugins = self.client.get_plugins()
+        self.client.get_async(
+            "/api/plugins",
+            timeout=2,
+            default=[],
+            on_success=self._apply_plugins,
+            on_error=lambda error, _detail=None: logger.warning(
+                "Error refreshing plugins: %s", error
+            ),
+        )
+
+    def _apply_plugins(self, plugins):
+        plugins = list(plugins or [])
         self.plugin_table.setRowCount(len(plugins))
         for i, p in enumerate(plugins):
             cb = QCheckBox()
@@ -813,64 +858,85 @@ class SystemTab(QScrollArea):
     def _on_websearch_toggled(self, enabled: bool):
         self.client.toggle_websearch(enabled)
         self.websearch_info.setText("Status: ON" if enabled else "Status: OFF")
-        self.websearch_info.setStyleSheet(
-            "color: #00aa40;" if enabled else "color: #888888;"
-        )
+        apply_status_style(self.websearch_info, role="success" if enabled else "muted")
 
     def _refresh_neural(self):
-        data = self.client.get_neural()
-        if data:
-            en = data.get("emotion_net", {})
-            self.emotion_info.setText(
-                f"Inference: {en.get('last_inference_ms', 0):.1f} ms "
-                f"| Output: {en.get('last_output', '---')}"
-            )
-            rc = data.get("router_classifier", {})
-            self.router_info.setText(
-                f"Inference: {rc.get('last_inference_ms', 0):.1f} ms "
-                f"| Output: {rc.get('last_output', '---')}"
-            )
-        # Sync web search toggle with actual server state
-        ws_data = self.client.get_websearch_status()
-        if ws_data:
-            enabled = ws_data.get("enabled", False)
-            self.websearch_toggle.blockSignals(True)
-            self.websearch_toggle.setChecked(enabled)
-            self.websearch_toggle.blockSignals(False)
-            backend = ws_data.get("backend", "")
-            ddg_ok = ws_data.get("ddg_available", False)
-            if enabled:
-                self.websearch_info.setText(
-                    f"Status: ON | Backend: {backend}"
-                )
-                self.websearch_info.setStyleSheet("color: #00aa40;")
-            else:
-                self.websearch_info.setText(
-                    "Status: OFF"
-                    + ("" if ddg_ok else " (install duckduckgo-search for full results)")
-                )
-                self.websearch_info.setStyleSheet("color: #888888;")
-        status = self.client.get("/api/status", timeout=1) or {}
-        arch = status.get("architecture", {})
-        if arch:
-            self._update_architecture(arch)
-        elif status:
-            self.arch_overall.setText("Overall: Partial (legacy core status)")
-            self.arch_overall.setStyleSheet("color: #ccaa00;")
-            core_lbl = self.arch_labels.get("core_reasoning")
-            if core_lbl:
-                core_lbl.setText("ONLINE | Core status endpoint reachable")
-                core_lbl.setStyleSheet("color: #00aa40;")
-            for key, lbl in self.arch_labels.items():
-                if key == "core_reasoning":
-                    continue
-                lbl.setText("UNKNOWN | Upgrade core for module telemetry")
-                lbl.setStyleSheet("color: #808898;")
+        if self._neural_refresh_inflight:
+            return
+        if not (self.client.connected or self.client.rest_reachable):
+            return
+
+        self._neural_refresh_inflight = True
+        cached_status = self.client.get_status_snapshot()
+
+        def _work(cached_status=cached_status):
+            data = self.client.get_neural() or {}
+            ws_data = self.client.get_websearch_status() or {}
+            status = dict(cached_status or {})
+            if not status or not status.get("architecture"):
+                status = self.client.get("/api/status", timeout=1) or status
+
+            def _apply():
+                self._neural_refresh_inflight = False
+                if data:
+                    en = data.get("emotion_net", {})
+                    self.emotion_info.setText(
+                        f"Inference: {en.get('last_inference_ms', 0):.1f} ms "
+                        f"| Output: {en.get('last_output', '---')}"
+                    )
+                    rc = data.get("router_classifier", {})
+                    self.router_info.setText(
+                        f"Inference: {rc.get('last_inference_ms', 0):.1f} ms "
+                        f"| Output: {rc.get('last_output', '---')}"
+                    )
+                if ws_data:
+                    enabled = ws_data.get("enabled", False)
+                    self.websearch_toggle.blockSignals(True)
+                    self.websearch_toggle.setChecked(enabled)
+                    self.websearch_toggle.blockSignals(False)
+                    backend = ws_data.get("backend", "")
+                    ddg_ok = ws_data.get("ddg_available", False)
+                    if enabled:
+                        self.websearch_info.setText(
+                            f"Status: ON | Backend: {backend}"
+                        )
+                        apply_status_style(self.websearch_info, "color: #00aa40;")
+                    else:
+                        self.websearch_info.setText(
+                            "Status: OFF"
+                            + ("" if ddg_ok else " (install duckduckgo-search for full results)")
+                        )
+                        apply_status_style(self.websearch_info, "color: #888888;")
+                arch = status.get("architecture", {})
+                if arch:
+                    self._update_architecture(arch)
+                elif status:
+                    self.arch_overall.setText("Overall: Partial (legacy core status)")
+                    apply_status_style(self.arch_overall, "color: #ccaa00;")
+                    core_lbl = self.arch_labels.get("core_reasoning")
+                    if core_lbl:
+                        core_lbl.setText("ONLINE | Core status endpoint reachable")
+                        apply_status_style(core_lbl, "color: #00aa40;")
+                    for key, lbl in self.arch_labels.items():
+                        if key == "core_reasoning":
+                            continue
+                        lbl.setText("UNKNOWN | Upgrade core for module telemetry")
+                        apply_status_style(lbl, "color: #808898;")
+
+            self._bg.dispatch(_apply)
+
+        try:
+            self.client._executor.submit(_work)
+        except Exception as exc:
+            self._neural_refresh_inflight = False
+            logger.debug(f"Failed to submit neural refresh: {exc}")
 
     def _on_telemetry(self, data):
         state = str(data.get("state", "Unknown"))
         llm = data.get("llm_connection", {}) or {}
         readiness = data.get("conversation_readiness", {}) or {}
+        request_lifecycle = data.get("request_lifecycle", {}) or {}
+        active_turn = request_lifecycle.get("active_turn", {}) or {}
         emotion = data.get("emotion", {})
         router = data.get("router", {})
         self.emotion_info.setText(
@@ -884,16 +950,21 @@ class SystemTab(QScrollArea):
         llm_state = str(llm.get("state", "Disconnected"))
         llm_detail = str(llm.get("detail", "")).strip()
         ready_flag = "Ready" if readiness.get("ready", False) else "Waiting"
+        stage = str(active_turn.get("lifecycle_reason", "") or "").strip()
+        state_text = f"{state} | Stage: {stage}" if stage else state
         self.core_status.setText(
-            f"Status: {state} | LLM: {llm_state} | Conversation: {ready_flag}"
+            f"Status: {state_text} | LLM: {llm_state} | Conversation: {ready_flag}"
             + (f" | {llm_detail}" if llm_detail else "")
         )
-        if readiness.get("ready", False):
-            self.core_status.setStyleSheet("color: #00aa40;")
-        elif llm_state == "Error" or state == "Error":
-            self.core_status.setStyleSheet("color: #cc3040;")
+        normalized_state = state.strip().lower()
+        if llm_state == "Error" or normalized_state == "error":
+            apply_status_style(self.core_status, "color: #cc3040;")
+        elif normalized_state in {"thinking", "generating", "speaking", "listening", "cooldown"}:
+            apply_status_style(self.core_status, "color: #ccaa00;")
+        elif readiness.get("ready", False):
+            apply_status_style(self.core_status, "color: #00aa40;")
         else:
-            self.core_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.core_status, "color: #ccaa00;")
         arch = data.get("architecture", {})
         if arch:
             self._update_architecture(arch)
@@ -903,25 +974,25 @@ class SystemTab(QScrollArea):
         overall_ready = architecture.get("overall_ready")
         if overall_ready is None:
             self.arch_overall.setText("Overall: Unknown")
-            self.arch_overall.setStyleSheet("color: #808898;")
+            apply_status_style(self.arch_overall, "color: #808898;")
         elif overall_ready:
             self.arch_overall.setText("Overall: Ready")
-            self.arch_overall.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.arch_overall, "color: #00aa40;")
         else:
             self.arch_overall.setText("Overall: Partial")
-            self.arch_overall.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.arch_overall, "color: #ccaa00;")
 
         for key, label in self.arch_labels.items():
             if key not in modules:
                 label.setText("UNKNOWN")
-                label.setStyleSheet("color: #808898;")
+                apply_status_style(label, "color: #808898;")
                 continue
             module = modules.get(key, {})
             online = bool(module.get("online", False))
             detail = str(module.get("detail", "")).strip()
             if online:
                 label.setText("ONLINE" + (f" | {detail}" if detail else ""))
-                label.setStyleSheet("color: #00aa40;")
+                apply_status_style(label, "color: #00aa40;")
             else:
                 label.setText("OFFLINE" + (f" | {detail}" if detail else ""))
-                label.setStyleSheet("color: #cc3040;")
+                apply_status_style(label, "color: #cc3040;")

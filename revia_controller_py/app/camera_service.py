@@ -202,9 +202,14 @@ class CameraService(QObject):
         self._detector_filter_names = parsed
 
         if "YOLO" not in eng:
-            self._yolo_model = None
-            self._yolo_model_id = ""
-            self._detector_future = None
+            # Acquire _detector_lock before clearing the model.  _detect_with_yolo()
+            # holds this lock for the full inference duration, so waiting here
+            # guarantees no in-flight YOLO call is still using _yolo_model when we
+            # null it out, preventing use-after-free / AttributeError crashes.
+            with self._detector_lock:
+                self._yolo_model = None
+                self._yolo_model_id = ""
+                self._detector_future = None
 
     def connect_camera(self, source, resolution="640x480"):
         self.disconnect_camera()

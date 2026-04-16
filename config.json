@@ -18,7 +18,7 @@
         "router_classifier_enabled": true
     },
     "memory": {
-        "backend": "ChromaDB",
+        "backend": "Redis",
         "collection": "revia_memories",
         "max_results": 5,
         "auto_store": true
@@ -26,7 +26,7 @@
     "integrations": {
         "discord": {
             "enabled": false,
-            "bot_token": "",
+            "bot_token_env": "REVIA_DISCORD_BOT_TOKEN",
             "channel_ids": [],
             "guild_ids": [],
             "prefix": "!",
@@ -35,7 +35,7 @@
         },
         "twitch": {
             "enabled": false,
-            "oauth_token": "",
+            "oauth_token_env": "REVIA_TWITCH_OAUTH_TOKEN",
             "channels": [],
             "prefix": "!",
             "command": "revia",

@@ -1,87 +1,95 @@
-# REVIA — Neural Assistant Controller
+# REVIA
 
-Hybrid C++ core + Python (PySide6) controller with futuristic sci-fi UI, neural network modules, plugin system, telemetry, and safe learning/adaptation.
+Local AI assistant with a PySide6 controller UI and a Python core server that handles chat, memory, telemetry, integrations, and live runtime state.
 
-## Architecture
+## Primary Runtime
 
-```
-revia_core_cpp/    — C++20 real-time pipeline, REST + WebSocket server
-revia_controller_py/ — PySide6 GUI controller, connects to core via HTTP/WS
-```
+REVIA now treats the Python core as the main runtime:
 
-## Quick Start (Windows)
+- `revia_core_py/` is the primary backend
+- `revia_controller_py/` is the main desktop controller
+- `revia_core_cpp/` remains in the repo as an experimental/secondary core
 
-### 1. Build C++ Core
+## Memory
 
-Requirements: CMake 3.20+, C++20 compiler (MSVC 2022 recommended), Git.
+Persistent memory is Redis-first with automatic local JSONL fallback:
+
+- Primary backend: Redis via Docker
+- Fallback backend: `revia_core_py/data/memory_<profile>.jsonl`
+- Profile-aware memory switching is handled by the Python core
+
+## Quick Start
+
+### 1. Install base dependencies
 
 ```powershell
-cd revia_core_cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
+pip install -r requirements.txt
 ```
 
-Run the core:
+Optional extras:
+
 ```powershell
-.\build\Release\revia_core.exe
-# REST on 127.0.0.1:8123, WebSocket on 127.0.0.1:8124
+pip install -r requirements-optional.txt
+pip install -r requirements-sing.txt
 ```
 
-### 2. Run Python Controller
+### 2. Start Redis memory backend
 
-Requirements: Python 3.10+
+```powershell
+docker compose up -d revia-redis
+```
+
+Or start the full Docker stack:
+
+```powershell
+docker compose up -d
+```
+
+### 3. Run the Python core
+
+```powershell
+cd revia_core_py
+python core_server.py
+```
+
+REST defaults to `http://127.0.0.1:8123` and WebSocket defaults to `ws://127.0.0.1:8124`.
+
+### 4. Run the controller
 
 ```powershell
 cd revia_controller_py
-pip install -r requirements.txt
 python main.py
 ```
 
-The controller will show **Health: Offline** if the C++ core is not running, and **Health: Online** once connected. The GUI is fully functional either way — it gracefully handles missing core.
+The controller auto-start path in the UI also launches the Python core directly.
 
-## Features
+## Environment
 
-- **Dark + Light themes** — toggle in System tab
-- **Neural Modules** — EmotionNet (VAD emotion detection) + RouterClassifier (intent routing)
-- **Plugin System** — STT/TTS/Vision/Memory/LLM/Tools with enable/disable
-- **Pipeline Telemetry** — per-stage latency tracking with live UI updates
-- **Batched Listening** — micro-batch audio frames with partial STT and early routing
-- **Safe Learning** — behavior tuning, memory-based RAG, routing feedback export (no autonomous retraining)
-- **8 config tabs** — Profile, Model, Memory, Voice, Vision, Filters, Logs, System
+Copy `.env.example` into `.env` and set any values you need:
 
-## Pipeline Stages (Timed)
+- `REDIS_HOST`
+- `REDIS_PORT`
+- `REVIA_REST_PORT`
+- `REVIA_WS_PORT`
+- `REVIA_DISCORD_BOT_TOKEN`
+- `REVIA_TWITCH_OAUTH_TOKEN`
 
-| Stage | Description |
-|---|---|
-| input_capture | Receive user input |
-| stt_batch_collect | Micro-batch audio frames |
-| stt_decode_partial | Partial STT decode |
-| router_classify | RouterClassifier inference |
-| emotion_infer | EmotionNet inference |
-| rag_retrieve | Memory/RAG retrieval |
-| prompt_assemble | Build prompt with context |
-| llm_generate_total | LLM token generation |
-| tts_synthesize | Text-to-speech synthesis |
-| memory_write | Store conversation to memory |
+Integration secrets are env-aware and should not be committed into source-controlled config files.
 
-## REST API
+## Optional Features
 
-| Endpoint | Method | Description |
-|---|---|---|
-| /api/status | GET | System state + health |
-| /api/telemetry | GET | Full telemetry snapshot |
-| /api/plugins | GET | List all plugins |
-| /api/plugins/{name}/enable | POST | Enable plugin |
-| /api/plugins/{name}/disable | POST | Disable plugin |
-| /api/neural | GET | Neural module status |
-| /api/neural/{name}/enable | POST | Enable neural module |
-| /api/neural/{name}/disable | POST | Disable neural module |
-| /api/chat | POST | Send chat message (JSON: {"text": "..."}) |
-| /api/profile | GET/POST | Get/save profile |
+- `requirements-optional.txt`
+  Includes `depthai` and `duckduckgo-search`
+- `requirements-sing.txt`
+  Includes sing-mode dependencies such as `demucs`, `openai-whisper`, `librosa`, and `scipy`
 
-## WebSocket Events (port 8124)
+## Main Interfaces
 
-- `telemetry_update` — periodic metrics snapshot
-- `status_update` — pipeline state changes
-- `chat_token` — streaming token from LLM
-- `chat_complete` — full response complete
+- REST: `/api/status`, `/api/chat`, `/api/profile`, `/api/memory/*`, `/api/integrations/*`
+- WebSocket events: `telemetry_update`, `status_update`, `chat_token`, `chat_complete`
+
+## Notes
+
+- The controller now centralizes most tab HTTP work through a shared async client layer to reduce duplicated UI networking code.
+- Redis-backed memory status is surfaced directly in the Memory and System tabs.
+- The C++ core is still present, but the Python core is the recommended runtime if you want the most complete feature set and persistent memory behavior.

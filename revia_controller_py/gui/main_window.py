@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
+    QSplitter, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QProcess
 
 from app.camera_service import CameraService
 from app.audio_service import AudioService
@@ -13,7 +14,6 @@ from gui.widgets.sidebar import SidebarWidget
 from gui.widgets.topbar import TopBar
 from gui.widgets.chat_panel import ChatPanel
 from gui.widgets.inference_panel import InferencePanel
-from gui.widgets.status_panel import StatusPanel
 from gui.tabs.profile_tab import ProfileTab
 from gui.tabs.model_tab import ModelTab
 from gui.tabs.memory_tab import MemoryTab
@@ -22,8 +22,10 @@ from gui.tabs.vision_tab import VisionTab
 from gui.tabs.filters_tab import FiltersTab
 from gui.tabs.logs_tab import LogsTab
 from gui.tabs.system_tab import SystemTab
+from gui.tabs.theme_tab import ThemeTab
 from gui.tabs.emotions_tab import EmotionsTab
 from gui.tabs.integrations_tab import IntegrationsTab
+from gui.tabs.sing_tab import SingTab
 
 
 class MainWindow(QMainWindow):
@@ -39,11 +41,10 @@ class MainWindow(QMainWindow):
         self.runtime_state_sync = None
         self.assistant_status_manager = None
         self.setWindowTitle("REVIA \u2014 Neural Assistant Controller")
-        self.setMinimumSize(1400, 900)
+        self.setMinimumSize(720, 520)
         self._build_ui()
         self._connect_signals()
         self.conversation_starter.enable()
-        self.conversation_starter.greet_on_startup(delay_ms=6_000)
         QTimer.singleShot(600, self._auto_start_services_on_launch)
 
     def _build_ui(self):
@@ -53,23 +54,28 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        self.shell_splitter = QSplitter(Qt.Horizontal)
+        self.shell_splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(self.shell_splitter)
+
         # Left sidebar
         self.sidebar = SidebarWidget(self.event_bus)
-        self.sidebar.setFixedWidth(200)
-        main_layout.addWidget(self.sidebar)
+        self.sidebar.setMinimumWidth(118)
+        self.sidebar.setMaximumWidth(220)
+        self.sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.shell_splitter.addWidget(self.sidebar)
 
         # Center area
         center = QWidget()
         center.setObjectName("centerPanel")
+        center.setMinimumWidth(320)
+        center.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(10, 10, 10, 10)
         center_layout.setSpacing(8)
 
         self.topbar = TopBar(self.event_bus)
         center_layout.addWidget(self.topbar)
-
-        self.status_panel = StatusPanel(self.event_bus)
-        center_layout.addWidget(self.status_panel)
 
         self.chat_panel = ChatPanel(
             self.event_bus, self.client, self.audio_service
@@ -80,13 +86,14 @@ class MainWindow(QMainWindow):
         self.inference_panel = InferencePanel(self.event_bus)
         center_layout.addWidget(self.inference_panel)
 
-        main_layout.addWidget(center, stretch=1)
+        self.shell_splitter.addWidget(center)
 
         # Right tabs
         self.tabs = QTabWidget()
         self.tabs.setObjectName("rightTabs")
-        self.tabs.setMinimumWidth(360)
-        self.tabs.setMaximumWidth(440)
+        self.tabs.setMinimumWidth(260)
+        self.tabs.setMaximumWidth(620)
+        self.tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         self.profile_tab = ProfileTab(self.event_bus, self.client)
         self.tabs.addTab(
@@ -137,9 +144,15 @@ class MainWindow(QMainWindow):
             self.filters_tab, "Filters"
         )
         self.tabs.addTab(LogsTab(self.event_bus), "Logs")
+        self.sing_tab = SingTab(self.event_bus, self.client)
+        self.tabs.addTab(self.sing_tab, "Sing")
         self.tabs.addTab(
             IntegrationsTab(self.event_bus, self.client), "Integrations"
         )
+        self.theme_tab = ThemeTab(
+            self.event_bus, self.client, self.theme_mgr
+        )
+        self.tabs.addTab(self.theme_tab, "Theme")
         self.system_tab = SystemTab(
             self.event_bus, self.client, self.theme_mgr
         )
@@ -174,7 +187,11 @@ class MainWindow(QMainWindow):
             parent=self,
         )
 
-        main_layout.addWidget(self.tabs)
+        self.shell_splitter.addWidget(self.tabs)
+        self.shell_splitter.setStretchFactor(0, 0)
+        self.shell_splitter.setStretchFactor(1, 4)
+        self.shell_splitter.setStretchFactor(2, 1)
+        self.shell_splitter.setSizes([180, 780, 360])
 
     def _connect_signals(self):
         self.event_bus.connection_changed.connect(self._on_connection)
@@ -187,7 +204,9 @@ class MainWindow(QMainWindow):
             )
 
     def _on_connection(self, connected):
-        self.topbar.set_health("Connecting" if connected else "Offline")
+        self.topbar.set_health("Online" if connected else "Offline")
+        if connected and self.conversation_starter:
+            self.conversation_starter.greet_on_startup(delay_ms=6_000)
 
     def _auto_start_services_on_launch(self):
         if hasattr(self.system_tab, "auto_start_on_launch"):
@@ -199,15 +218,24 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.camera_service.disconnect_camera()
-        if (getattr(self.model_tab, '_llm_process', None)
-                and self.model_tab._llm_process.state() != 0):
-            self.model_tab._stop_llm_server()
-        if (self.system_tab._core_process
-                and self.system_tab._core_process.state() != 0):
-            self.system_tab._stop_core_server()
-        if (self.voice_tab._tts_process
-                and self.voice_tab._tts_process.state() != 0):
-            self.voice_tab._stop_tts_server()
+        try:
+            proc = getattr(self.model_tab, '_llm_process', None)
+            if proc and proc.state() == QProcess.Running:
+                self.model_tab._stop_llm_server()
+        except Exception:
+            pass
+        try:
+            proc = getattr(self.system_tab, '_core_process', None)
+            if proc and proc.state() == QProcess.Running:
+                self.system_tab._stop_core_server()
+        except Exception:
+            pass
+        try:
+            proc = getattr(self.voice_tab, '_tts_process', None)
+            if proc and proc.state() == QProcess.Running:
+                self.voice_tab._stop_tts_server()
+        except Exception:
+            pass
         if hasattr(self.client, "shutdown"):
             self.client.shutdown()
         super().closeEvent(event)

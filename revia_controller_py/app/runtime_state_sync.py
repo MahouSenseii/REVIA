@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from PySide6.QtCore import QObject, QTimer
 
 
@@ -34,7 +32,7 @@ class RuntimeStateSync(QObject):
         self.chat_panel = chat_panel
         self.audio_service = audio_service
         self.assistant_status_manager = assistant_status_manager
-        self._last_telemetry = {}
+        self._last_pushed_snapshot: dict | None = None
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -74,112 +72,38 @@ class RuntimeStateSync(QObject):
         ):
             signal.connect(lambda *_args: self.schedule_sync())
 
-    def _on_telemetry(self, data):
-        if isinstance(data, dict):
-            self._last_telemetry = dict(data)
+    def _on_telemetry(self, _data):
         self.schedule_sync()
 
     def schedule_sync(self):
         self._debounce.start()
 
     def collect_snapshot(self) -> dict:
-        if self.assistant_status_manager is not None:
-            return self.assistant_status_manager.build_runtime_config_snapshot()
-
-        try:
-            # Snapshot access must be thread-safe; Qt signal emissions from other threads
-            # may modify _last_telemetry concurrently. This try-except is a safety net.
-            telemetry = dict(self._last_telemetry or {})
-        except (RuntimeError, RecursionError) as exc:
-            # Catch Qt thread safety or recursion issues
-            telemetry = {}
-        emotion = telemetry.get("emotion", {}) or {}
-        state = str(telemetry.get("state", "Idle") or "Idle")
-
-        source_is_online = self.model_tab.source_type.currentIndex() == 1
-        local_model_name = os.path.basename(self.model_tab.local_path.text().strip())
-        online_model_name = self.model_tab.api_model.currentText().strip()
-
-        filter_enabled = any(
-            (
-                self.filters_tab.nsfw_filter.isChecked(),
-                self.filters_tab.profanity_filter.isChecked(),
-                self.filters_tab.pii_filter.isChecked(),
-                self.filters_tab.injection_guard.isChecked(),
+        if self.assistant_status_manager is None:
+            raise RuntimeError(
+                "RuntimeStateSync.collect_snapshot() called with no AssistantStatusManager; "
+                "this is a programmer error — always pass assistant_status_manager."
             )
-        )
-        if filter_enabled:
-            if all(
-                (
-                    self.filters_tab.nsfw_filter.isChecked(),
-                    self.filters_tab.pii_filter.isChecked(),
-                    self.filters_tab.injection_guard.isChecked(),
-                )
-            ):
-                filter_level = "strict"
-            else:
-                filter_level = "standard"
-        else:
-            filter_level = "off"
+        return self.assistant_status_manager.build_runtime_config_snapshot()
 
-        active_profile = ""
-        try:
-            voice_mgr = getattr(self.voice_tab, "voice_mgr", None)
-            active_profile = getattr(getattr(voice_mgr, "active_profile", None), "name", "")
-        except Exception:
-            active_profile = ""
-
-        return {
-            "online_enabled": bool(source_is_online or self.system_tab.websearch_toggle.isChecked()),
-            "web_search_enabled": self.system_tab.websearch_toggle.isChecked(),
-            "safety_filter_enabled": filter_enabled,
-            "nsfw_filter_enabled": self.filters_tab.nsfw_filter.isChecked(),
-            "profanity_filter_enabled": self.filters_tab.profanity_filter.isChecked(),
-            "pii_filter_enabled": self.filters_tab.pii_filter.isChecked(),
-            "prompt_injection_guard_enabled": self.filters_tab.injection_guard.isChecked(),
-            "content_filter_level": filter_level,
-            "local_llm_enabled": not source_is_online,
-            "local_llm_provider": (
-                self.model_tab.api_provider.currentText()
-                if source_is_online
-                else self.model_tab.local_server.currentText()
-            ),
-            "local_llm_endpoint": (
-                self.model_tab.api_endpoint.text().strip()
-                if source_is_online
-                else self.model_tab.local_server_url.text().strip()
-            ),
-            "voice_input_enabled": self.audio_service.is_stt_available(),
-            "voice_output_enabled": self.chat_panel.is_tts_enabled(),
-            "current_tts_voice": active_profile or self.voice_tab.engine_combo.currentText(),
-            "memory_enabled": (
-                self.memory_tab.memory_backend.currentText() != "None"
-                and self.memory_tab.auto_store.isChecked()
-            ),
-            "emotion_mode_enabled": self.system_tab.emotion_toggle.isChecked(),
-            "current_emotion": str(emotion.get("label", "Neutral") or "Neutral"),
-            # tool_access_enabled reflects whether *any* tool is active, not
-            # just web-search, so the core can gate tool use correctly.
-            "tool_access_enabled": (
-                self.system_tab.websearch_toggle.isChecked()
-                or self.system_tab.router_toggle.isChecked()
-            ),
-            "tool_modes": {
-                "web_search": self.system_tab.websearch_toggle.isChecked(),
-                "router": self.system_tab.router_toggle.isChecked(),
-            },
-            "active_persona_profile_name": self.profile_tab.char_name.text().strip() or "Revia",
-            "active_persona_profile_id": self.profile_tab.profile_name.text().strip() or "default",
-            "streaming_enabled": True,
-            "current_model_name": online_model_name or local_model_name or "None",
-            "fallback_model_name": "",
-            "safe_mode_enabled": filter_enabled,
-            "moderation_mode": filter_level,
-            "ui_state": state,
-            "tts_engine": self.voice_tab.engine_combo.currentText(),
-            "stt_mode": self.voice_tab.ptt_mode.currentText(),
-        }
+    # Keys whose values change every poll (timers, elapsed counters) and
+    # should NOT trigger a config push by themselves.
+    _VOLATILE_KEYS = frozenset({
+        "stt_timer", "stt_current_elapsed", "stt_last_listen_duration",
+        "stt_last_processing_duration", "stt_last_total_duration",
+        "tts_timer", "tts_current_elapsed", "tts_last_generation_duration",
+        "tts_last_playback_duration", "tts_last_total_duration",
+    })
 
     def push_now(self):
         snapshot = self.collect_snapshot()
+        # Compare only non-volatile keys to decide if we should POST.
+        # Timer fields tick every poll and would defeat the dedup check.
+        stable = {k: v for k, v in snapshot.items() if k not in self._VOLATILE_KEYS}
+        if self._last_pushed_snapshot is not None:
+            prev_stable = {k: v for k, v in self._last_pushed_snapshot.items()
+                           if k not in self._VOLATILE_KEYS}
+            if stable == prev_stable:
+                return
+        self._last_pushed_snapshot = snapshot
         self.client.push_runtime_config(snapshot)

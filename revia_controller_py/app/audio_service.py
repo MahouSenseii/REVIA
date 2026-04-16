@@ -108,6 +108,11 @@ class AudioService(QObject):
             self._listening = False
             return
 
+        _STT_MAX_CONSECUTIVE_ERRORS = 5
+        _STT_BACKOFF_BASE_S = 2.0
+        _STT_BACKOFF_CAP_S = 60.0
+        _consecutive_errors = 0
+
         try:
             with mic as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
@@ -122,10 +127,7 @@ class AudioService(QObject):
                             source, timeout=5, phrase_time_limit=15
                         )
                     except sr.WaitTimeoutError:
-                        if self._always_listening:
-                            continue
-                        else:
-                            continue
+                        continue
                     except Exception:
                         continue
 
@@ -136,6 +138,7 @@ class AudioService(QObject):
                         self._stt_phase = "processing"
                         self.stt_processing_started.emit()
                         text = recognizer.recognize_google(audio)
+                        _consecutive_errors = 0  # reset on success
                         if text.strip():
                             self.speech_recognized.emit(text.strip())
                             self.stt_processing_finished.emit(True, "")
@@ -149,10 +152,24 @@ class AudioService(QObject):
                         self.stt_processing_finished.emit(False, "")
                         self._stt_phase = "listening" if self._listening else "idle"
                     except sr.RequestError as e:
+                        _consecutive_errors += 1
                         self._stt_phase = "error"
                         self.stt_error.emit(f"STT API error: {e}")
                         self.stt_processing_finished.emit(False, f"STT API error: {e}")
                         self.status_changed.emit(f"STT API error: {e}")
+                        if _consecutive_errors >= _STT_MAX_CONSECUTIVE_ERRORS:
+                            self.status_changed.emit(
+                                f"STT: too many consecutive errors ({_consecutive_errors}), stopping"
+                            )
+                            self._listening = False
+                            break
+                        # Exponential backoff before next attempt
+                        backoff = min(
+                            _STT_BACKOFF_BASE_S * (2 ** (_consecutive_errors - 1)),
+                            _STT_BACKOFF_CAP_S,
+                        )
+                        self._stop_event.wait(timeout=backoff)
+                        self._stt_phase = "listening" if self._listening else "idle"
         finally:
             if not self._always_listening:
                 self._listening = False
@@ -169,6 +186,8 @@ class AudioService(QObject):
             target=self._tts_speak, args=(text,), daemon=True
         ).start()
 
+    _TTS_TIMEOUT_S = 30  # Maximum seconds to wait for pyttsx3 to finish speaking
+
     def _tts_speak(self, text):
         with self._tts_lock:
             try:
@@ -181,7 +200,29 @@ class AudioService(QObject):
                     self._tts_engine.setProperty("rate", 180)
                 self.tts_started.emit()
                 self._tts_engine.say(text)
-                self._tts_engine.runAndWait()
+                # pyttsx3.runAndWait() blocks until the driver finishes but can hang
+                # indefinitely on some platforms.  Run it in a daemon thread and join
+                # with a timeout so we never stall the caller thread permanently.
+                done = threading.Event()
+                tts_engine = self._tts_engine
+
+                def _run():
+                    try:
+                        tts_engine.runAndWait()
+                    finally:
+                        done.set()
+
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                if not done.wait(timeout=self._TTS_TIMEOUT_S):
+                    # Timed out — stop the engine and reset so the next call reinitialises.
+                    try:
+                        tts_engine.stop()
+                    except Exception:
+                        pass
+                    self._tts_engine = None
+                    self.status_changed.emit("TTS timed out")
+                    return
                 self.tts_finished.emit()
             except Exception as e:
                 self._tts_engine = None  # reset so next call retries init

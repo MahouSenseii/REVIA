@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,7 +52,8 @@ _REPAIR_PHRASES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Personality trait whitelist (phrases allowed to repeat)
 # ---------------------------------------------------------------------------
-_PERSONALITY_WHITELIST = set()  # Will be populated from profile quirks
+_PERSONALITY_WHITELIST: frozenset = frozenset()  # Atomically replaced; thread-safe
+_PERSONALITY_WHITELIST_LOCK = threading.Lock()
 
 # Default score thresholds (PRD §12 — overridden by profile in practice)
 _DEFAULT_LOOP_RISK_TRIGGER = 0.65   # score above this → repair action
@@ -117,7 +119,9 @@ class AntiLoopEngine:
     def set_personality_whitelist(cls, phrases: list):
         """Set phrases that are allowed to repeat (catchphrases, quirks)."""
         global _PERSONALITY_WHITELIST
-        _PERSONALITY_WHITELIST = {p.lower().strip() for p in phrases}
+        # Atomically replace with a frozenset — safe for concurrent readers
+        with _PERSONALITY_WHITELIST_LOCK:
+            _PERSONALITY_WHITELIST = frozenset(p.lower().strip() for p in phrases)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -267,8 +271,8 @@ class AntiLoopEngine:
         if not my_start:
             return 0.0
 
-        # Truncate to the configured lookback context (use character count proxy)
-        lookback = recent_replies[-6:]   # last 6 replies
+        # Truncate to the configured lookback window
+        lookback = recent_replies[-window:]
         max_sim = 0.0
         for prev in lookback:
             prev_start = _starter(prev)
@@ -297,7 +301,8 @@ class AntiLoopEngine:
         if not my_tokens:
             return 0.0
 
-        lookback = recent_replies[-4:]   # last 4 turns
+        window = max(4, self._get_detection_window() // 2)
+        lookback = recent_replies[-window:]
         all_prev: set[str] = set()
         for r in lookback:
             all_prev |= _token_set(r)

@@ -23,10 +23,27 @@ def _ensure_local_venv_python():
     if cur.lower() == target.lower():
         return
     # Relaunch this controller under the project's local .venv interpreter.
+    print(f"[REVIA Controller] Relaunching under local virtualenv: {target}")
     os.execv(target, [target, str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def _load_local_env():
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 def main():
     _ensure_local_venv_python()
+    _load_local_env()
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QFont
@@ -44,7 +61,7 @@ def main():
     event_bus = EventBus()
     client = ControllerClient(event_bus)
     theme_mgr = ThemeManager(app)
-    theme_mgr.apply_theme("dark")
+    theme_mgr.apply_theme(theme_mgr.current_theme)
 
     window = MainWindow(event_bus, client, theme_mgr)
     window.showMaximized()
@@ -52,7 +69,7 @@ def main():
     client.start()
 
     ret = app.exec()
-    client.shutdown()   # stop() + executor.shutdown(); ensures clean thread teardown
+    client.shutdown()
     sys.exit(ret)
 
 

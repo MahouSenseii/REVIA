@@ -256,8 +256,15 @@ class QwenTTSBackend(QObject):
                 self._begin_playback()
                 started = True
                 sd.play(data, sr)
-                # Poll for interrupt instead of blocking on sd.wait()
-                while sd.get_stream().active:
+                # Poll for interrupt instead of blocking on sd.wait().
+                # Guard sd.get_stream() — it raises PortAudioError if playback
+                # already finished between the loop condition check and the call.
+                while True:
+                    try:
+                        if not sd.get_stream().active:
+                            break
+                    except Exception:
+                        break
                     if self._interrupt_requested:
                         sd.stop()
                         break
@@ -338,8 +345,15 @@ class QwenTTSBackend(QObject):
             self._begin_playback()
             started = True
             sd.play(data, sr)
-            # Poll for interrupt instead of blocking on sd.wait()
-            while sd.get_stream().active:
+            # Poll for interrupt instead of blocking on sd.wait().
+            # Guard sd.get_stream() — it raises PortAudioError if playback
+            # already finished between the loop condition check and the call.
+            while True:
+                try:
+                    if not sd.get_stream().active:
+                        break
+                except Exception:
+                    break
                 if self._interrupt_requested:
                     sd.stop()
                     break
@@ -389,11 +403,20 @@ class QwenTTSBackend(QObject):
     def _qwen_design(self, text, voice_description, language, output_path):
         # API: predict(text, language, voice_description, api_name="/generate_voice_design")
         #   -> (generated_audio: filepath, status: str)
+        # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
+        # _get_client uses self._lock internally; re-entering a non-reentrant Lock
+        # from the same thread would block indefinitely.
+        try:
+            client = self._get_client("design")
+        except Exception as exc:
+            _log.error("[TTS] Voice Design client error: %s", exc)
+            self.error_occurred.emit(f"Voice Design error: {exc}")
+            return None, str(exc)
+
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
-                client = self._get_client("design")
                 result = client.predict(
                     text,
                     language,
@@ -412,13 +435,22 @@ class QwenTTSBackend(QObject):
     def _qwen_clone(self, target_text, ref_audio, ref_text, language,
                      x_vector_only, output_path, model_size="1.7B",
                      style_instruction=""):
+        # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
+        # _get_client uses self._lock internally; re-entering a non-reentrant Lock
+        # from the same thread would block indefinitely.
+        try:
+            from gradio_client import handle_file
+            client = self._get_client("clone")
+            ref = handle_file(str(ref_audio))
+        except Exception as exc:
+            _log.error("[TTS] Voice Clone client error: %s", exc)
+            self.error_occurred.emit(f"Voice Clone error: {exc}")
+            return None, str(exc)
+
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
-                from gradio_client import handle_file
-                client = self._get_client("clone")
-                ref = handle_file(str(ref_audio))
 
                 # Local server (0.6B Base): /run_voice_clone
                 #   params: ref_aud, ref_txt, use_xvec, text, lang_disp
@@ -461,11 +493,20 @@ class QwenTTSBackend(QObject):
         # API: predict(text, language, speaker, instruct, model_size,
         #              api_name="/generate_custom_voice")
         #   -> (generated_audio: filepath, status: str)
+        # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
+        # _get_client uses self._lock internally; re-entering a non-reentrant Lock
+        # from the same thread would block indefinitely.
+        try:
+            client = self._get_client("custom")
+        except Exception as exc:
+            _log.error("[TTS] CustomVoice client error: %s", exc)
+            self.error_occurred.emit(f"CustomVoice error: {exc}")
+            return None, str(exc)
+
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
-                client = self._get_client("custom")
                 result = client.predict(
                     text,
                     language,
@@ -601,6 +642,99 @@ class QwenTTSBackend(QObject):
             finally:
                 if started:
                     self._finish_playback()
+
+    # ── Sing Mode ──
+
+    def get_sing_mode(self):
+        """Get or create a SingMode instance backed by this TTS engine.
+
+        Usage:
+            sing = tts.get_sing_mode()
+            analysis = sing.prepare("song.wav", voice_profile)
+            sing.play()
+        """
+        if not hasattr(self, "_sing_mode") or self._sing_mode is None:
+            from .sing_mode import SingMode
+            self._sing_mode = SingMode(self)
+        return self._sing_mode
+
+    def sing_karaoke(self, wav_path, voice_profile=None, language="en",
+                     on_ready=None, on_progress=None, on_lyrics=None):
+        """Convenience method: prepare and play a song in karaoke mode.
+
+        Runs preparation in a background thread. When ready, plays automatically.
+
+        Args:
+            wav_path: Path to WAV file of the song
+            voice_profile: VoiceProfile for Revia's singing voice
+            language: Language hint for lyrics extraction
+            on_ready: Callback(SongAnalysis) when preparation is done
+            on_progress: Callback(stage_name, current, total)
+            on_lyrics: Callback(line_index, LyricLine) during playback
+        """
+        sing = self.get_sing_mode()
+
+        if on_progress:
+            sing.on_progress = on_progress
+        if on_lyrics:
+            sing.on_lyrics_update = on_lyrics
+
+        def _when_ready(analysis):
+            if analysis.karaoke_output_path:
+                sing.play(analysis)
+            if on_ready:
+                on_ready(analysis)
+
+        sing.prepare_async(wav_path, voice_profile, language, callback=_when_ready)
+
+    def stop_singing(self):
+        """Stop any active sing mode playback or preparation."""
+        if hasattr(self, "_sing_mode") and self._sing_mode is not None:
+            self._sing_mode.stop()
+
+    def init_sing_system(self, event_bus=None, get_mood_fn=None):
+        """Initialise the full !sing system: library, queue, command handler.
+
+        Call this once after the TTS backend is ready. Returns the
+        ``SingCommandHandler`` instance which should be wired to the
+        Twitch/Discord bots and the GUI Sing tab.
+
+        Args:
+            event_bus: Optional ``EventBus`` for emitting sing signals.
+            get_mood_fn: Callable returning Revia's current mood string.
+
+        Returns:
+            (library, queue, handler) tuple.
+        """
+        from .song_library import SongLibrary
+        from .sing_queue import SingQueue
+        from .sing_command import SingCommandHandler
+
+        library = SongLibrary()
+        queue = SingQueue(
+            library,
+            get_current_mood=get_mood_fn,
+            auto_pick_enabled=True,
+            auto_pick_random_chance=0.3,
+        )
+        handler = SingCommandHandler(
+            library=library,
+            queue=queue,
+            sing_mode_factory=self.get_sing_mode,
+            voice_profile_fn=getattr(self, "_get_active_voice_profile", None),
+        )
+
+        # Wire event bus signals
+        if event_bus:
+            def _on_state(state: str):
+                event_bus.sing_state_changed.emit(state)
+            handler._on_state = _on_state
+            queue.on_queue_changed = lambda: event_bus.sing_queue_changed.emit()
+
+        self._sing_library = library
+        self._sing_queue = queue
+        self._sing_handler = handler
+        return library, queue, handler
 
     def _play_wav_winsound(self, wav_path):
         if sys.platform != "win32":

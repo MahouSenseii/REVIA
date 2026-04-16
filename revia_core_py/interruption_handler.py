@@ -63,32 +63,35 @@ class RecoveryAction(str, Enum):
 # Keyword banks (PRD §8.1 — classification signals)
 # ---------------------------------------------------------------------------
 
-_CORRECTION_PATTERNS = [
+def _compile_patterns(patterns: list[str]) -> list["re.Pattern"]:
+    return [re.compile(p) for p in patterns]
+
+_CORRECTION_PATTERNS = _compile_patterns([
     r"\b(no|wrong|incorrect|actually|that'?s? not right|wait)\b",
     r"\b(you said|you mentioned|that's wrong|not quite)\b",
     r"\b(actually|in fact|to be precise|correction)\b",
-]
+])
 
-_SOCIAL_PATTERNS = [
+_SOCIAL_PATTERNS = _compile_patterns([
     r"^(yeah|yep|yes|ok|okay|mhm|uh-?huh|right|sure|got it|i see|oh|ah|hmm|mm)\.?$",
     r"^(cool|great|nice|interesting|wow|alright|understood)\.?$",
-]
+])
 
-_URGENT_PATTERNS = [
+_URGENT_PATTERNS = _compile_patterns([
     r"\b(stop|halt|wait|hold on|emergency|urgent|quick|asap|help|now)\b",
     r"\b(stop talking|be quiet|quiet|shush|shut up)\b",
-]
+])
 
-_EMERGENT_PATTERNS = [
+_EMERGENT_PATTERNS = _compile_patterns([
     r"\b(actually|wait|by the way|also|one more thing|i forgot|important)\b",
     r"\b(oh i should mention|i just realized|quick question|real quick)\b",
-]
+])
 
-_TOPICAL_PATTERNS = [
+_TOPICAL_PATTERNS = _compile_patterns([
     r"\b(what about|how about|speaking of|changing the subject|different question)\b",
     r"\b(actually i wanted to ask|let me ask you|can you tell me|forget that)\b",
     r"\b(never mind|let's talk about|i meant to ask)\b",
-]
+])
 
 
 # ---------------------------------------------------------------------------
@@ -277,12 +280,13 @@ class InterruptionHandler:
     @staticmethod
     def _match_score(
         text: str,
-        patterns: list[str],
+        patterns: list,
         full_line: bool = False,
     ) -> float:
         """
         Return a [0, 1] match score for the given pattern list.
         ``full_line=True`` requires the ENTIRE text to match (for social acks).
+        Accepts pre-compiled re.Pattern objects or raw strings.
         """
         lower = text.lower().strip()
         if not lower:
@@ -291,10 +295,10 @@ class InterruptionHandler:
         hits = 0
         for pat in patterns:
             if full_line:
-                if re.fullmatch(pat, lower):
+                if (pat.fullmatch(lower) if hasattr(pat, 'fullmatch') else re.fullmatch(pat, lower)):
                     hits += 1
             else:
-                if re.search(pat, lower):
+                if (pat.search(lower) if hasattr(pat, 'search') else re.search(pat, lower)):
                     hits += 1
 
         # Normalise against list length; any single hit earns at least 0.5

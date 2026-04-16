@@ -62,8 +62,12 @@ void TelemetryEngine::end_span(TelemetrySpan& s) {
         }
     }
     if (log_file_.is_open()) {
-        // Let OS buffer writes - remove explicit flush for async I/O performance
         log_file_ << s.to_json().dump() << "\n";
+        // Flush every 50 entries so a crash doesn't lose the entire in-memory buffer.
+        if (++write_count_ >= 50) {
+            log_file_.flush();
+            write_count_ = 0;
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+import copy
 import json as json_mod
 from pathlib import Path
 
@@ -9,7 +10,16 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QTimer
 
+from app.ui_status import apply_status_style
+
 PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
+PERSONA_PRESETS = [
+    ("Custom", "custom"),
+    ("Default Revia", "default"),
+    ("Casual", "casual"),
+    ("Serious", "serious"),
+    ("Empathetic", "empathetic"),
+]
 
 
 class ProfileTab(QScrollArea):
@@ -17,6 +27,7 @@ class ProfileTab(QScrollArea):
         super().__init__(parent)
         self.event_bus = event_bus
         self.client = client
+        self._loaded_profile_data = {}
         self.setObjectName("profileTab")
         self.setWidgetResizable(True)
 
@@ -46,6 +57,11 @@ class ProfileTab(QScrollArea):
         self.traits = QLineEdit()
         self.traits.setPlaceholderText("e.g. friendly, curious, witty")
         ig.addRow("Traits:", self.traits)
+
+        self.persona_preset = QComboBox()
+        for label, value in PERSONA_PRESETS:
+            self.persona_preset.addItem(label, value)
+        ig.addRow("Persona Preset:", self.persona_preset)
 
         layout.addWidget(identity_group)
 
@@ -120,6 +136,26 @@ class ProfileTab(QScrollArea):
 
         layout.addWidget(prompt_group)
 
+        persona_group = QGroupBox("Persona Modules")
+        persona_group.setObjectName("settingsGroup")
+        pm = QFormLayout(persona_group)
+
+        self.persona_style_prompt = QTextEdit()
+        self.persona_style_prompt.setMaximumHeight(72)
+        self.persona_style_prompt.setPlaceholderText(
+            "How this persona should sound in replies..."
+        )
+        pm.addRow("Voice Guide:", self.persona_style_prompt)
+
+        self.persona_collab_prompt = QTextEdit()
+        self.persona_collab_prompt.setMaximumHeight(72)
+        self.persona_collab_prompt.setPlaceholderText(
+            "How this persona should collaborate with the user..."
+        )
+        pm.addRow("Collab Guide:", self.persona_collab_prompt)
+
+        layout.addWidget(persona_group)
+
         # Save row
         save_row = QHBoxLayout()
         self.profile_name = QLineEdit("default")
@@ -191,8 +227,74 @@ class ProfileTab(QScrollArea):
         for f in sorted(PROFILES_DIR.glob("*.json")):
             self.profile_combo.addItem(f.stem)
 
+    def _selected_persona_preset(self):
+        value = self.persona_preset.currentData()
+        return str(value or "custom")
+
+    def _set_persona_preset(self, preset_name):
+        preset = str(preset_name or "custom").strip().lower()
+        for idx in range(self.persona_preset.count()):
+            if self.persona_preset.itemData(idx) == preset:
+                self.persona_preset.setCurrentIndex(idx)
+                return
+        self.persona_preset.setCurrentIndex(0)
+
+    @staticmethod
+    def _split_csv(value):
+        return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+    @staticmethod
+    def _module_text(persona_def, module_name):
+        if not isinstance(persona_def, dict):
+            return ""
+        direct = str(persona_def.get(f"{module_name}_prompt", "") or "").strip()
+        if direct:
+            return direct
+        for module in persona_def.get("modules", []) or []:
+            if not isinstance(module, dict):
+                continue
+            name = str(module.get("name", "") or "").strip().lower()
+            if name == module_name:
+                return str(module.get("content", "") or "").strip()
+        return ""
+
     def _collect(self):
-        return {
+        data = copy.deepcopy(self._loaded_profile_data or {})
+        persona_def = copy.deepcopy(data.get("persona_definition", {}) or {})
+        persona_def.update({
+            "name": self.char_name.text().strip() or "Revia",
+            "preset": self._selected_persona_preset(),
+            "summary": self.persona.toPlainText().strip(),
+            "identity_prompt": self.char_prompt.toPlainText().strip(),
+            "style_prompt": self.persona_style_prompt.toPlainText().strip(),
+            "collaboration_prompt": self.persona_collab_prompt.toPlainText().strip(),
+            "traits": self._split_csv(self.traits.text()),
+            "interaction_style": {
+                "response_style": self.response_style.currentText(),
+                "verbosity": self.verbosity.currentText(),
+                "greeting": self.greeting.text().strip(),
+            },
+        })
+
+        modules = []
+        if persona_def.get("identity_prompt"):
+            modules.append({
+                "name": "identity",
+                "content": persona_def["identity_prompt"],
+            })
+        if persona_def.get("style_prompt"):
+            modules.append({
+                "name": "style",
+                "content": persona_def["style_prompt"],
+            })
+        if persona_def.get("collaboration_prompt"):
+            modules.append({
+                "name": "collaboration",
+                "content": persona_def["collaboration_prompt"],
+            })
+        persona_def["modules"] = modules
+
+        data.update({
             "character_name": self.char_name.text(),
             "persona": self.persona.toPlainText(),
             "traits": self.traits.text(),
@@ -204,13 +306,31 @@ class ProfileTab(QScrollArea):
             "fallback_msg": self.fallback_msg.text(),
             "greeting": self.greeting.text(),
             "character_prompt": self.char_prompt.toPlainText(),
-        }
+            "persona_preset": self._selected_persona_preset(),
+            "persona_definition": persona_def,
+        })
+        return data
 
     def _apply(self, data):
-        self.char_name.setText(data.get("character_name", ""))
-        self.persona.setPlainText(data.get("persona", ""))
-        self.traits.setText(data.get("traits", ""))
-        self.voice_path.setText(data.get("voice_path", ""))
+        self._loaded_profile_data = copy.deepcopy(data or {})
+        persona_def = data.get("persona_definition", {}) or {}
+        traits_text = data.get("traits", "")
+        if isinstance(traits_text, list):
+            traits_text = ", ".join(str(item) for item in traits_text if str(item).strip())
+        if not str(traits_text or "").strip():
+            traits_text = ", ".join(persona_def.get("traits", []) or [])
+
+        self.char_name.setText(
+            str(data.get("character_name") or persona_def.get("name") or "")
+        )
+        self.persona.setPlainText(
+            str(data.get("persona") or persona_def.get("summary") or "")
+        )
+        self.traits.setText(str(traits_text or ""))
+        self.voice_path.setText(str(data.get("voice_path", "") or ""))
+        self._set_persona_preset(
+            data.get("persona_preset") or persona_def.get("preset") or "custom"
+        )
 
         idx = self.voice_tone.findText(data.get("voice_tone", ""))
         if idx >= 0:
@@ -218,16 +338,42 @@ class ProfileTab(QScrollArea):
         idx = self.language.findText(data.get("language", ""))
         if idx >= 0:
             self.language.setCurrentIndex(idx)
-        idx = self.response_style.findText(data.get("response_style", ""))
+        idx = self.response_style.findText(
+            str(
+                data.get("response_style")
+                or ((persona_def.get("interaction_style") or {}).get("response_style"))
+                or ""
+            )
+        )
         if idx >= 0:
             self.response_style.setCurrentIndex(idx)
-        idx = self.verbosity.findText(data.get("verbosity", ""))
+        idx = self.verbosity.findText(
+            str(
+                data.get("verbosity")
+                or ((persona_def.get("interaction_style") or {}).get("verbosity"))
+                or ""
+            )
+        )
         if idx >= 0:
             self.verbosity.setCurrentIndex(idx)
 
-        self.fallback_msg.setText(data.get("fallback_msg", ""))
-        self.greeting.setText(data.get("greeting", ""))
-        self.char_prompt.setPlainText(data.get("character_prompt", ""))
+        self.fallback_msg.setText(str(data.get("fallback_msg", "") or ""))
+        self.greeting.setText(
+            str(
+                data.get("greeting")
+                or ((persona_def.get("interaction_style") or {}).get("greeting"))
+                or ""
+            )
+        )
+        self.char_prompt.setPlainText(
+            str(data.get("character_prompt") or persona_def.get("identity_prompt") or "")
+        )
+        self.persona_style_prompt.setPlainText(
+            self._module_text(persona_def, "style")
+        )
+        self.persona_collab_prompt.setPlainText(
+            self._module_text(persona_def, "collaboration")
+        )
 
     # --- Actions ---
 
@@ -236,7 +382,7 @@ class ProfileTab(QScrollArea):
         name = self.profile_name.text().strip()
         if not name:
             self.profile_status.setText("Enter a profile name first.")
-            self.profile_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.profile_status, "color: #cc3040;")
             return
 
         path = PROFILES_DIR / f"{name}.json"
@@ -247,19 +393,19 @@ class ProfileTab(QScrollArea):
         self.client.save_profile(data)
         self._refresh_profile_list()
         self.profile_status.setText(f"Saved: {path.name}")
-        self.profile_status.setStyleSheet("color: #00aa40;")
+        apply_status_style(self.profile_status, "color: #00aa40;")
 
     def _load(self):
         name = self.profile_combo.currentText()
         if not name:
             self.profile_status.setText("No profile selected.")
-            self.profile_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.profile_status, "color: #cc3040;")
             return
 
         path = PROFILES_DIR / f"{name}.json"
         if not path.exists():
             self.profile_status.setText(f"File not found: {path.name}")
-            self.profile_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.profile_status, "color: #cc3040;")
             return
 
         with open(path, "r", encoding="utf-8") as f:
@@ -269,7 +415,7 @@ class ProfileTab(QScrollArea):
         self.profile_name.setText(name)
         self.client.save_profile(data)
         self.profile_status.setText(f"Loaded: {name}")
-        self.profile_status.setStyleSheet("color: #00aa40;")
+        apply_status_style(self.profile_status, "color: #00aa40;")
 
     def _delete_profile(self):
         name = self.profile_combo.currentText()
@@ -286,7 +432,7 @@ class ProfileTab(QScrollArea):
                 path.unlink()
                 self._refresh_profile_list()
                 self.profile_status.setText(f"Deleted: {name}")
-                self.profile_status.setStyleSheet("color: #ccaa00;")
+                apply_status_style(self.profile_status, "color: #ccaa00;")
 
     def _export(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -296,7 +442,7 @@ class ProfileTab(QScrollArea):
             with open(path, "w", encoding="utf-8") as f:
                 json_mod.dump(self._collect(), f, indent=2, ensure_ascii=False)
             self.profile_status.setText(f"Exported to {Path(path).name}")
-            self.profile_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.profile_status, "color: #00aa40;")
 
     def _import(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -308,10 +454,10 @@ class ProfileTab(QScrollArea):
                     data = json_mod.load(f)
                 self._apply(data)
                 self.profile_status.setText(f"Imported: {Path(path).name}")
-                self.profile_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.profile_status, "color: #00aa40;")
             except Exception as e:
                 self.profile_status.setText(f"Import error: {e}")
-                self.profile_status.setStyleSheet("color: #cc3040;")
+                apply_status_style(self.profile_status, "color: #cc3040;")
 
     def _browse_voice(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -326,11 +472,18 @@ class ProfileTab(QScrollArea):
         self._load_from_core()
 
     def _load_from_core(self):
-        data = self.client.get_profile() or {}
+        self.client.get_async(
+            "/api/profile",
+            timeout=2,
+            default={},
+            on_success=self._apply_profile_from_core,
+        )
+
+    def _apply_profile_from_core(self, data):
         if not data:
             return
         self._apply(data)
         name = data.get("character_name", "default").strip() or "default"
         self.profile_name.setText(name)
         self.profile_status.setText("Loaded profile from core.")
-        self.profile_status.setStyleSheet("color: #00aa40;")
+        apply_status_style(self.profile_status, "color: #00aa40;")

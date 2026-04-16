@@ -53,6 +53,15 @@ _OFFSET_HOLD_FRAMES = 8           # consecutive silence frames → fire offset
 # Silero VAD (https://github.com/snakers4/silero-vad) provides ML-based detection.
 _DEFAULT_ENERGY_THRESHOLD = 0.005
 
+# ── Barge-in anti-echo tuning ───────────────────────────────────────────────
+# Without a proper AEC (acoustic echo canceller), the microphone will pick up
+# Revia's own voice bleeding back through the speakers and trigger false
+# barge-in. These parameters make barge-in detection conservative while TTS
+# is actively playing.
+_BARGE_IN_GRACE_S        = 1.20   # ignore barge-in for first 1.2 s of TTS
+_BARGE_IN_HOLD_FRAMES    = 6      # 6 × 30 ms = 180 ms sustained speech to fire
+_BARGE_IN_ENERGY_MULT    = 1.80   # additional energy multiplier during TTS
+
 
 # ---------------------------------------------------------------------------
 # ContinuousAudioPipeline
@@ -101,9 +110,20 @@ class ContinuousAudioPipeline(QObject):
         self._silence_hold   = 0   # consecutive silence frames
         self._partial_buffer: list[str] = []
 
+        # Ambient noise tracking — protected by _ambient_lock so that any external
+        # reader (e.g. a UI diagnostics thread) never races with the VAD writer.
+        self._ambient_lock    = threading.Lock()
+        self._ambient_samples: list[float] = []
+        self._ambient_level: float = _DEFAULT_ENERGY_THRESHOLD * 0.5
+
         # Flag readable by the pipeline to know if TTS is active
         # Set this to True while Revia is speaking so the VAD can detect barge-in
         self._revia_speaking = threading.Event()
+        # Timestamp (monotonic) when Revia most recently started speaking.
+        # Used by the barge-in anti-echo grace window so that Revia's own
+        # speaker output during the first _BARGE_IN_GRACE_S cannot trigger
+        # a false interruption.
+        self._tts_start_monotonic: float = 0.0
 
         # STT callback — inject a callable(bytes) -> str for partial transcription
         # When None, the pipeline only emits onset/offset events without text
@@ -132,8 +152,17 @@ class ContinuousAudioPipeline(QObject):
         Called by the TTS subsystem to inform the VAD that Revia is currently
         producing speech.  When True, any detected user speech fires
         interruption_detected instead of (or in addition to) speech_onset.
+
+        Records the monotonic start-time so the barge-in grace window
+        (see _BARGE_IN_GRACE_S) can suppress false interruptions caused by
+        acoustic echo during the first moments of TTS playback.
         """
         if is_speaking:
+            # Only bump the start-time if transitioning from not-speaking.
+            # Repeated True calls during a single utterance keep the grace
+            # anchored to the actual start.
+            if not self._revia_speaking.is_set():
+                self._tts_start_monotonic = time.monotonic()
             self._revia_speaking.set()
         else:
             self._revia_speaking.clear()
@@ -203,37 +232,70 @@ class ContinuousAudioPipeline(QObject):
     def _update_state(self, is_speech: bool, raw_frame: bytes) -> None:
         """
         State-machine: track onset/offset hold counters and emit events.
+
+        While Revia is speaking, barge-in is subject to two anti-echo
+        defenses (see _BARGE_IN_GRACE_S and _BARGE_IN_HOLD_FRAMES):
+
+          • Grace period — no barge-in during the first 1.2 s of TTS,
+            when echo from Revia's own speakers is most likely to be
+            misclassified as user speech.
+          • Stricter hold   — barge-in requires 6 consecutive speech
+            frames (180 ms of sustained sound) rather than the 2 frames
+            used for clean onset. Transient echo and keypresses are
+            filtered out.
+
+        Legitimate user barge-in (continuous speaking past 180 ms,
+        after the grace window) still fires interruption_detected.
         """
         if is_speech:
             self._silence_hold = 0
             self._speech_hold += 1
 
-            if self._speech_hold == _ONSET_HOLD_FRAMES and not self._in_speech:
-                with self._lock:
-                    self._in_speech = True
-                _log.debug("[ContinuousAudio] speech_onset")
-
-                if self._revia_speaking.is_set():
-                    # Barge-in: fire interruption rather than clean onset
-                    fragment = self._get_partial_text(raw_frame)
-                    try:
-                        self.interruption_detected.emit(fragment)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self.speech_onset.emit()
-                    except Exception:
-                        pass
-
-            elif self._in_speech:
-                # Stream partial transcript while speaking
+            if self._in_speech:
+                # Already in a speech run — stream any partial transcript
                 partial = self._get_partial_text(raw_frame)
                 if partial:
                     try:
                         self.partial_transcript.emit(partial)
                     except Exception:
                         pass
+                return
+
+            revia_speaking = self._revia_speaking.is_set()
+            required_hold = (
+                _BARGE_IN_HOLD_FRAMES if revia_speaking else _ONSET_HOLD_FRAMES
+            )
+
+            # Anti-echo grace period for barge-in.
+            if revia_speaking:
+                grace_elapsed = time.monotonic() - self._tts_start_monotonic
+                if grace_elapsed < _BARGE_IN_GRACE_S:
+                    return
+
+            if self._speech_hold < required_hold:
+                return
+
+            with self._lock:
+                self._in_speech = True
+
+            if revia_speaking:
+                _log.debug(
+                    "[ContinuousAudio] barge-in detected "
+                    "(hold=%d frames, grace_elapsed=%.2fs)",
+                    self._speech_hold,
+                    time.monotonic() - self._tts_start_monotonic,
+                )
+                fragment = self._get_partial_text(raw_frame)
+                try:
+                    self.interruption_detected.emit(fragment)
+                except Exception:
+                    pass
+            else:
+                _log.debug("[ContinuousAudio] speech_onset")
+                try:
+                    self.speech_onset.emit()
+                except Exception:
+                    pass
 
         else:
             self._speech_hold = 0
@@ -275,19 +337,26 @@ class ContinuousAudioPipeline(QObject):
 
     def _update_ambient_noise(self, rms: float):
         """Track ambient noise for adaptive VAD threshold."""
-        if not hasattr(self, '_ambient_samples'):
-            self._ambient_samples = []
-        self._ambient_samples.append(rms)
-        if len(self._ambient_samples) > 100:
-            self._ambient_samples.pop(0)
-        self._ambient_level = sum(self._ambient_samples) / len(self._ambient_samples)
+        with self._ambient_lock:
+            self._ambient_samples.append(rms)
+            if len(self._ambient_samples) > 100:
+                self._ambient_samples.pop(0)
+            self._ambient_level = sum(self._ambient_samples) / len(self._ambient_samples)
 
     def _is_speech(self, rms: float) -> bool:
-        """Detect speech with adaptive threshold above ambient noise."""
-        if not hasattr(self, '_ambient_level'):
-            self._ambient_level = self._get_energy_threshold() * 0.5
+        """Detect speech with adaptive threshold above ambient noise.
+
+        While TTS is active the threshold is multiplied by
+        _BARGE_IN_ENERGY_MULT to suppress echo from Revia's own speakers
+        (acoustic leak from speaker to microphone).  Real user speech
+        typically exceeds this boosted threshold; echo does not.
+        """
+        with self._ambient_lock:
+            ambient = self._ambient_level
         # Speech must be significantly above ambient noise
-        threshold = max(self._get_energy_threshold(), self._ambient_level * 2.5)
+        threshold = max(self._get_energy_threshold(), ambient * 2.5)
+        if self._revia_speaking.is_set():
+            threshold *= _BARGE_IN_ENERGY_MULT
         return rms > threshold
 
     # ── Audio I/O ─────────────────────────────────────────────────────────

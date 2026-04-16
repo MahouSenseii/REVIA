@@ -382,11 +382,12 @@ class BehaviorController:
             return self._blocked(trigger, "assistant already speaking")
 
         if kind == TriggerKind.RESPONSE.value:
-            if current_state in (ReviaState.THINKING.value, ReviaState.SPEAKING.value, ReviaState.COOLDOWN.value):
+            # User-driven replies should remain conversational: let the
+            # controller interrupt any existing speech first, and do not gate
+            # the human behind pacing cooldowns. Only an actively thinking turn
+            # remains a hard block.
+            if current_state == ReviaState.THINKING.value:
                 return self._blocked(trigger, f"state={current_state}")
-            remaining = self.remaining_cooldown("response")
-            if remaining > 0 and not trigger.force:
-                return self._blocked(trigger, "response cooldown active", "response", remaining)
 
         elif kind == TriggerKind.AUTONOMOUS.value:
             if not auto_initiation_allowed:

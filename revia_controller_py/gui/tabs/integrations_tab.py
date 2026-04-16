@@ -20,6 +20,7 @@ class IntegrationsTab(QScrollArea):
         self.event_bus = event_bus
         self.client = client
         self.setWidgetResizable(True)
+        self._status_refresh_inflight = False
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -54,6 +55,9 @@ class IntegrationsTab(QScrollArea):
         self.discord_token.setPlaceholderText("Bot token from Discord Developer Portal")
         self.discord_token.setEchoMode(QLineEdit.Password)
         d_form.addRow("Bot Token:", self.discord_token)
+        self.discord_token_status = QLabel("Token: not configured")
+        self.discord_token_status.setObjectName("metricLabel")
+        d_form.addRow("", self.discord_token_status)
 
         self.discord_channels = QLineEdit()
         self.discord_channels.setPlaceholderText("Channel IDs, comma-separated (leave blank for all)")
@@ -105,6 +109,9 @@ class IntegrationsTab(QScrollArea):
         self.twitch_token.setPlaceholderText("oauth:xxxxxxxxxxxxxxxxxxxxxxxx")
         self.twitch_token.setEchoMode(QLineEdit.Password)
         t_form.addRow("OAuth Token:", self.twitch_token)
+        self.twitch_token_status = QLabel("Token: not configured")
+        self.twitch_token_status.setObjectName("metricLabel")
+        t_form.addRow("", self.twitch_token_status)
 
         self.twitch_channels = QLineEdit()
         self.twitch_channels.setPlaceholderText("channel1, channel2 (lowercase names)")
@@ -170,6 +177,17 @@ class IntegrationsTab(QScrollArea):
     def _parse_comma_list(text: str) -> list:
         return [item.strip() for item in text.split(",") if item.strip()]
 
+    @staticmethod
+    def _format_secret_status(secret_name: str, data: dict) -> str:
+        if not isinstance(data, dict):
+            return f"{secret_name}: not configured"
+        if data.get(f"{secret_name}_set"):
+            source = data.get(f"{secret_name}_source", "saved")
+            preview = data.get(f"{secret_name}_preview", "")
+            detail = f" ({preview})" if preview else ""
+            return f"{secret_name}: configured via {source}{detail}"
+        return f"{secret_name}: not configured"
+
     def _build_discord_config(self) -> dict:
         return {
             "enabled": self.discord_enabled.isChecked(),
@@ -196,94 +214,154 @@ class IntegrationsTab(QScrollArea):
     # ------------------------------------------------------------------
 
     def _save_config(self):
+        self._save_config_async()
+
+    def _save_config_async(self, on_complete=None):
         payload = {
             "discord": self._build_discord_config(),
             "twitch": self._build_twitch_config(),
         }
-        try:
-            self.client.post("/api/integrations/config", json=payload)
-        except Exception as e:
-            logger.error(f"Error saving integration config: {e}")
+        self.client.post_async(
+            "/api/integrations/config",
+            json=payload,
+            timeout=5,
+            default={},
+            on_success=lambda _data: (
+                self._load_config(),
+                on_complete() if callable(on_complete) else None,
+            ),
+            on_error=lambda error, _detail=None: logger.error(
+                "Error saving integration config: %s", error
+            ),
+        )
 
     def _load_config(self):
-        try:
-            cfg = self.client.get("/api/integrations/config")
-            if not cfg:
-                return
-            d = cfg.get("discord", {})
-            t = cfg.get("twitch", {})
+        self.client.get_async(
+            "/api/integrations/config",
+            timeout=3,
+            default={},
+            on_success=self._apply_config,
+            on_error=lambda error, _detail=None: logger.warning(
+                "Error loading integration config: %s", error
+            ),
+        )
 
-            self.discord_enabled.setChecked(d.get("enabled", False))
-            self.discord_token.setText(d.get("bot_token", ""))
-            self.discord_channels.setText(", ".join(str(c) for c in d.get("channel_ids", [])))
-            self.discord_guilds.setText(", ".join(str(g) for g in d.get("guild_ids", [])))
-            self.discord_prefix.setText(d.get("prefix", "!"))
-            self.discord_mention_only.setChecked(d.get("mention_only", False))
+    def _apply_config(self, cfg):
+        if not cfg:
+            return
+        d = cfg.get("discord", {})
+        t = cfg.get("twitch", {})
 
-            self.twitch_enabled.setChecked(t.get("enabled", False))
-            self.twitch_token.setText(t.get("oauth_token", ""))
-            self.twitch_channels.setText(", ".join(t.get("channels", [])))
-            self.twitch_prefix.setText(t.get("prefix", "!"))
-            self.twitch_command.setText(t.get("command", "revia"))
-            self.twitch_respond_all.setChecked(t.get("respond_to_all", False))
-            self.twitch_max_len.setValue(t.get("max_response_len", 450))
-        except Exception as e:
-            logger.warning(f"Error loading integration config: {e}")
+        self.discord_enabled.setChecked(d.get("enabled", False))
+        self.discord_token.clear()
+        self.discord_token.setPlaceholderText(
+            "Bot token from Discord Developer Portal"
+        )
+        self.discord_token_status.setText(
+            self._format_secret_status("bot_token", d)
+        )
+        self.discord_channels.setText(
+            ", ".join(str(c) for c in d.get("channel_ids", []))
+        )
+        self.discord_guilds.setText(
+            ", ".join(str(g) for g in d.get("guild_ids", []))
+        )
+        self.discord_prefix.setText(d.get("prefix", "!"))
+        self.discord_mention_only.setChecked(d.get("mention_only", False))
+
+        self.twitch_enabled.setChecked(t.get("enabled", False))
+        self.twitch_token.clear()
+        self.twitch_token.setPlaceholderText("oauth:xxxxxxxxxxxxxxxxxxxxxxxx")
+        self.twitch_token_status.setText(
+            self._format_secret_status("oauth_token", t)
+        )
+        self.twitch_channels.setText(", ".join(t.get("channels", [])))
+        self.twitch_prefix.setText(t.get("prefix", "!"))
+        self.twitch_command.setText(t.get("command", "revia"))
+        self.twitch_respond_all.setChecked(t.get("respond_to_all", False))
+        self.twitch_max_len.setValue(t.get("max_response_len", 450))
 
     def _discord_start(self):
-        self._save_config()
-        try:
-            self.client.post("/api/integrations/discord/start")
-        except Exception as e:
-            logger.error(f"Error starting Discord bot: {e}")
-        self._refresh_status()
+        self._save_config_async(
+            on_complete=lambda: self.client.post_async(
+                "/api/integrations/discord/start",
+                default={},
+                on_success=lambda _data: self._refresh_status(),
+                on_error=lambda error, _detail=None: logger.error(
+                    "Error starting Discord bot: %s", error
+                ),
+            )
+        )
 
     def _discord_stop(self):
-        try:
-            self.client.post("/api/integrations/discord/stop")
-        except Exception as e:
-            logger.error(f"Error stopping Discord bot: {e}")
-        self._refresh_status()
+        self.client.post_async(
+            "/api/integrations/discord/stop",
+            default={},
+            on_success=lambda _data: self._refresh_status(),
+            on_error=lambda error, _detail=None: logger.error(
+                "Error stopping Discord bot: %s", error
+            ),
+        )
 
     def _twitch_start(self):
-        self._save_config()
-        try:
-            self.client.post("/api/integrations/twitch/start")
-        except Exception as e:
-            logger.error(f"Error starting Twitch bot: {e}")
-        self._refresh_status()
+        self._save_config_async(
+            on_complete=lambda: self.client.post_async(
+                "/api/integrations/twitch/start",
+                default={},
+                on_success=lambda _data: self._refresh_status(),
+                on_error=lambda error, _detail=None: logger.error(
+                    "Error starting Twitch bot: %s", error
+                ),
+            )
+        )
 
     def _twitch_stop(self):
-        try:
-            self.client.post("/api/integrations/twitch/stop")
-        except Exception as e:
-            logger.error(f"Error stopping Twitch bot: {e}")
-        self._refresh_status()
+        self.client.post_async(
+            "/api/integrations/twitch/stop",
+            default={},
+            on_success=lambda _data: self._refresh_status(),
+            on_error=lambda error, _detail=None: logger.error(
+                "Error stopping Twitch bot: %s", error
+            ),
+        )
 
     def _refresh_status(self):
-        try:
-            status = self.client.get("/api/integrations/status")
-            if not status:
-                return
-            d = status.get("discord", {})
-            t = status.get("twitch", {})
+        if self._status_refresh_inflight:
+            return
+        self._status_refresh_inflight = True
+        self.client.get_async(
+            "/api/integrations/status",
+            timeout=3,
+            default={},
+            on_success=self._apply_status,
+            on_error=self._on_refresh_status_error,
+        )
 
-            self.discord_status_lbl.setText(f"Status: {d.get('status', 'stopped')}")
-            self.discord_msgs_lbl.setText(
-                f"Messages processed: {d.get('messages_processed', 0)}"
-            )
-            if d.get("last_error"):
-                self.discord_status_lbl.setText(
+    def _on_refresh_status_error(self, error, _detail=None):
+        self._status_refresh_inflight = False
+        logger.warning("Error refreshing integration status: %s", error)
+
+    def _apply_status(self, status):
+        self._status_refresh_inflight = False
+        if not status:
+            return
+        d = status.get("discord", {})
+        t = status.get("twitch", {})
+
+        self.discord_status_lbl.setText(f"Status: {d.get('status', 'stopped')}")
+        self.discord_msgs_lbl.setText(
+            f"Messages processed: {d.get('messages_processed', 0)}"
+        )
+        if d.get("last_error"):
+            self.discord_status_lbl.setText(
                     f"Status: error — {d['last_error'][:60]}"
-                )
-
-            self.twitch_status_lbl.setText(f"Status: {t.get('status', 'stopped')}")
-            self.twitch_msgs_lbl.setText(
-                f"Messages processed: {t.get('messages_processed', 0)}"
             )
-            if t.get("last_error"):
-                self.twitch_status_lbl.setText(
+
+        self.twitch_status_lbl.setText(f"Status: {t.get('status', 'stopped')}")
+        self.twitch_msgs_lbl.setText(
+            f"Messages processed: {t.get('messages_processed', 0)}"
+        )
+        if t.get("last_error"):
+            self.twitch_status_lbl.setText(
                     f"Status: error — {t['last_error'][:60]}"
-                )
-        except Exception as e:
-            logger.warning(f"Error refreshing integration status: {e}")
+            )

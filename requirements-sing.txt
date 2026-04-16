@@ -1,0 +1,4 @@
+demucs
+openai-whisper
+librosa
+scipy

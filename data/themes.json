@@ -1,0 +1,27 @@
+{
+  "active_theme": "anime",
+  "custom_themes": [
+    {
+      "ThemeId": "anime_custom",
+      "DisplayName": "Anime Custom",
+      "IsBuiltIn": false,
+      "PrimaryBackground": "#22223a",
+      "SecondaryBackground": "#22223a",
+      "Surface": "#22223a",
+      "SurfaceAlt": "#2d2d4a",
+      "PrimaryText": "#fff7ff",
+      "SecondaryText": "#c9c3d9",
+      "Accent": "#ff7ac8",
+      "AccentHover": "#ff9bd6",
+      "AccentActive": "#e85cad",
+      "Border": "#4b4564",
+      "ButtonPrimary": "#ff7ac8",
+      "ButtonSecondary": "#343452",
+      "Success": "#6be6a4",
+      "Warning": "#ffd166",
+      "Error": "#ff6b8a",
+      "Info": "#8bd3ff",
+      "Disabled": "#79748a"
+    }
+  ]
+}

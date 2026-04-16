@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any
 
+from persona_manager import normalize_profile, resolve_persona_preset_name
+
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -240,7 +242,12 @@ class ProfileEngine:
         Returns the merged & validated profile.
         """
         t0 = time.monotonic()
-        merged = self._deep_merge(copy.deepcopy(PRD_DEFAULT_PROFILE), raw or {})
+        preset_name = resolve_persona_preset_name(raw)
+        base = copy.deepcopy(PRD_DEFAULT_PROFILE)
+        if preset_name in PROFILE_PRESETS:
+            base = self._deep_merge(base, PROFILE_PRESETS[preset_name])
+        merged = self._deep_merge(base, raw or {})
+        merged = normalize_profile(merged)
         issues = self._validate(merged)
         if issues:
             for issue in issues:
@@ -387,27 +394,33 @@ class ProfileEngine:
 
     def get_trait_weights(self) -> dict:
         """Return weighted personality traits from active profile."""
-        return dict(self._profile.get("trait_weights", {}))
+        with self._lock:
+            return dict(self._profile.get("trait_weights", {}))
 
     def get_speech_quirks(self) -> list:
         """Return speech quirks/catchphrases from active profile."""
-        return list(self._profile.get("speech_quirks", []))
+        with self._lock:
+            return list(self._profile.get("speech_quirks", []))
 
     def get_quirk_frequency(self) -> float:
         """Return how often quirks should be injected (0.0-1.0)."""
-        return float(self._profile.get("quirk_frequency", 0.15))
+        with self._lock:
+            return float(self._profile.get("quirk_frequency", 0.15))
 
     def get_mood_baseline(self) -> str:
         """Return the default emotional state for this character."""
-        return str(self._profile.get("mood_baseline", "neutral"))
+        with self._lock:
+            return str(self._profile.get("mood_baseline", "neutral"))
 
     def get_emotional_volatility(self) -> float:
         """Return how quickly/strongly emotions shift (0.0-1.0)."""
-        return float(self._profile.get("emotional_volatility", 0.5))
+        with self._lock:
+            return float(self._profile.get("emotional_volatility", 0.5))
 
     def get_reply_type_weights(self) -> dict:
         """Return weighted reply type preferences."""
-        return dict(self._profile.get("reply_type_weights", {"explain": 0.5, "react": 0.5}))
+        with self._lock:
+            return dict(self._profile.get("reply_type_weights", {"explain": 0.5, "react": 0.5}))
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -440,7 +453,7 @@ class ProfileEngine:
                     f"(0.55); this effectively disables answer validation"
                 )
         rp = behavior.get("regen_patience", None)
-        if rp is not None and float(mat or 0.85) > 0.85 and int(rp) < 3:
+        if rp is not None and mat is not None and float(mat) >= 0.85 and int(rp) < 3:
             issues.append(
                 f"regen_patience={rp} too low for high threshold={mat}; "
                 f"will cause frequent fallback accepts"
@@ -451,12 +464,12 @@ class ProfileEngine:
     # inlined in _validate() (regen_patience check, lines above).
 
     def _notify_swap_listeners(self):
-        listeners = []
         with self._lock:
             listeners = list(self._swap_listeners)
+            profile_snapshot = copy.deepcopy(self._profile)
         for fn in listeners:
             try:
-                fn(self._profile)
+                fn(profile_snapshot)
             except Exception as exc:
                 self._log(f"[ProfileEngine] Swap listener error: {exc}")
 

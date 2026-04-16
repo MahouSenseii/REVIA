@@ -304,7 +304,7 @@ class AnswerValidationSystem:
         sentences = [s.strip() for s in re.split(r"[.!?]+", reply) if s.strip()]
         seen: dict[str, int] = {}
         for s in sentences:
-            key = s.lower()[:60]
+            key = s.lower()[:120]
             seen[key] = seen.get(key, 0) + 1
         max_repeats = max(seen.values(), default=1)
         if max_repeats >= 3:
@@ -423,10 +423,9 @@ class AnswerValidationSystem:
         if self._pe:
             profile_quirks = self._pe.get_speech_quirks()
         humor_patterns = ["lol", "haha", "lmao", "bruh", "ngl", "imagine", "literally"] + profile_quirks
-        for pattern in humor_patterns:
-            if pattern and pattern.lower() in response.lower():
-                score += 0.15
-                break
+        resp_lower = response.lower()
+        if any(p and p.lower() in resp_lower for p in humor_patterns):
+            score += 0.15
         # Personality expression (questions, exclamations, ellipsis)
         if response.count('?') >= 1:
             score += 0.1

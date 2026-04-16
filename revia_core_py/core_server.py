@@ -15,6 +15,24 @@ from pathlib import Path
 # Make the integrations package importable when running from any CWD
 sys.path.insert(0, str(Path(__file__).parent))
 
+
+def _load_local_env():
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_env()
+
 # Sentence boundary detection for streaming TTS (compiled once at module level)
 _SENTENCE_ENDERS = re.compile(r'[.!?]+["\')\]]?\s|[\n]')
 
@@ -72,6 +90,8 @@ except ImportError:
         class adapters:
             class HTTPAdapter:
                 def __init__(self, **kw): pass
+            class Retry:
+                def __init__(self, **kw): pass
     requests = _RequestsShim()
 
 from flask import Flask, request, jsonify
@@ -98,6 +118,7 @@ from runtime_models import (
     TurnManager,
 )
 from runtime_status import RuntimeStatusManager
+from reinforcement_learner import ReinforcementLearner, RewardSignal
 from vllm_backend import VLLMEnhancer, VLLMGenerateResult, classify_prompt_complexity
 
 # ---------------------------------------------------------------------------
@@ -186,6 +207,20 @@ def _record_emotion(emo):
     with _emotion_history_lock:
         _emotion_history.append(entry)
         # deque(maxlen=100) auto-evicts oldest -- no manual trimming needed
+
+
+def _emotion_history_snapshot(limit=None):
+    with _emotion_history_lock:
+        snapshot = list(_emotion_history)
+    if limit is None:
+        return snapshot
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return []
+    return snapshot[-limit:]
 
 
 _gpu_stats_cache = {"gpu_percent": 0.0, "vram_used_mb": 0.0, "vram_total_mb": 0.0}
@@ -338,7 +373,7 @@ class TelemetryEngine:
                 self._flush_counter += 1
                 if self._flush_counter >= 10:
                     self._log.flush()
-                self._flush_counter = 0
+                    self._flush_counter = 0
 
     def snapshot(self):
         with self._lock:
@@ -376,6 +411,15 @@ prompt_assembly_manager = PromptAssemblyManager(
 turn_manager = TurnManager(log_fn=_revia_log)
 
 # ---------------------------------------------------------------------------
+# Reinforcement Learning Engine — adaptive behavioral parameter tuning
+# ---------------------------------------------------------------------------
+rl_engine = ReinforcementLearner(
+    data_dir=Path(__file__).parent / "data",
+    log_fn=_revia_log,
+)
+rl_engine.load()
+
+# ---------------------------------------------------------------------------
 # PRD §4 -- Profile Engine (canonical source for all behavioral parameters)
 # ---------------------------------------------------------------------------
 profile_engine = ProfileEngine(log_fn=_revia_log)
@@ -400,8 +444,16 @@ class LLMBackend:
         self._generate_lock = threading.Lock() # serializes all LLM generations
         # Persistent HTTP session -- reuses TCP connections for lower latency
         self._session = requests.Session()
+        try:
+            from urllib3.util.retry import Retry as _Retry
+            _retry_strategy = _Retry(
+                total=2, backoff_factor=0.3,
+                status_forcelist=[502, 503, 504],
+            )
+        except ImportError:
+            _retry_strategy = 0  # no retries if urllib3 is unavailable
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=4, pool_maxsize=8, max_retries=0
+            pool_connections=16, pool_maxsize=32, max_retries=_retry_strategy
         )
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
@@ -755,12 +807,15 @@ class LLMBackend:
             **_pe_profile.get("emotion", {}),
         }
         # Inject personality data: mood baseline (quirks/freq handled by prompt_assembly)
-        mood_baseline = profile.get("mood_baseline", _pe_profile.get("mood_baseline", ""))
+        # Use the module-level `profile` dict safely via globals() to avoid
+        # NameError if this method is called before the global is initialised.
+        _active_profile = globals().get("profile") or {}
+        mood_baseline = _active_profile.get("mood_baseline", _pe_profile.get("mood_baseline", ""))
         if mood_baseline:
             behavior_params["mood_baseline"] = mood_baseline
 
         system_text = prompt_assembly_manager.build_full_prompt_context(
-            profile=profile,
+            profile=_active_profile,
             runtime_context=runtime_context,
             memory_context=mem_ctx,
             emotion_context=emotion_context,
@@ -776,18 +831,21 @@ class LLMBackend:
                 messages.append(msg)
             last = convo[-1]
             if image_b64 and last.get("role") == "user":
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": last["content"]},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}"
-                            },
-                        },
-                    ],
+                # Handle content that may already be a multimodal list
+                last_content = last.get("content", "")
+                if isinstance(last_content, str):
+                    text_parts = [{"type": "text", "text": last_content}]
+                elif isinstance(last_content, list):
+                    text_parts = list(last_content)
+                else:
+                    text_parts = [{"type": "text", "text": str(last_content)}]
+                text_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_b64}"
+                    },
                 })
+                messages.append({"role": "user", "content": text_parts})
             else:
                 messages.append(last)
         return messages
@@ -911,7 +969,7 @@ class LLMBackend:
         full_text = ""
         t0 = time.perf_counter()
 
-        with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
+        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, 180)) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
                 # Check for interrupt before processing each token
@@ -944,6 +1002,18 @@ class LLMBackend:
             return len(content.split())
         telemetry.llm["context_length"] = sum(_count_words(m["content"]) for m in messages) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
+        # If generation was interrupted, discard partial output — don't commit
+        if self._is_interrupted():
+            return AssistantResponse(
+                text="",
+                response_mode=ResponseMode.ERROR_RESPONSE.value,
+                success=False,
+                error_type="interrupted",
+                retryable=True,
+                speakable=False,
+                commit_to_history=False,
+                commit_to_memory=False,
+            )
         if not full_text.strip():
             return AssistantResponse(
                 text="Hmm, my response came out empty. That's weird.",
@@ -986,7 +1056,7 @@ class LLMBackend:
         full_text = ""
         t0 = time.perf_counter()
 
-        with req.post(url, headers=headers, json=body, stream=True, timeout=60) as resp:
+        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, 180)) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
                 # Check for interrupt before processing each token (thread-safe)
@@ -1012,6 +1082,18 @@ class LLMBackend:
         telemetry.llm["tokens_per_second"] = round(tps, 1)
         telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages if isinstance(m["content"], str)) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
+        # If generation was interrupted, discard partial output — don't commit
+        if self._is_interrupted():
+            return AssistantResponse(
+                text="",
+                response_mode=ResponseMode.ERROR_RESPONSE.value,
+                success=False,
+                error_type="interrupted",
+                retryable=True,
+                speakable=False,
+                commit_to_history=False,
+                commit_to_memory=False,
+            )
         if not full_text.strip():
             return AssistantResponse(
                 text="Hmm, my response came out empty. That's weird.",
@@ -1182,7 +1264,7 @@ class LLMBackend:
                 )
 
             try:
-                resp = req.post(url, json=body, stream=True, timeout=120)
+                resp = req.post(url, json=body, stream=True, timeout=(10, 300))
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else None
@@ -1205,7 +1287,7 @@ class LLMBackend:
                                 )
                                 break
                     body["messages"] = messages
-                    resp = req.post(url, json=body, stream=True, timeout=120)
+                    resp = req.post(url, json=body, stream=True, timeout=(10, 300))
                     resp.raise_for_status()
                 else:
                     raise
@@ -1238,6 +1320,19 @@ class LLMBackend:
             telemetry.llm["tokens_per_second"] = round(tps, 1)
             if model_name:
                 telemetry.system["model"] = model_name
+
+            # If generation was interrupted, discard partial output — don't commit
+            if self._is_interrupted():
+                return AssistantResponse(
+                    text="",
+                    response_mode=ResponseMode.ERROR_RESPONSE.value,
+                    success=False,
+                    error_type="interrupted",
+                    retryable=True,
+                    speakable=False,
+                    commit_to_history=False,
+                    commit_to_memory=False,
+                )
 
             if not full_text:
                 detail = (
@@ -1919,7 +2014,7 @@ class EmotionNet:
             for emo in self.EMOTIONS:
                 logits[emo] += 0.45 * prev_probs.get(emo, 0.0)
 
-        history_slice = _emotion_history[-12:]
+        history_slice = _emotion_history_snapshot(limit=12)
         if history_slice:
             freq = {}
             hist_val_sum = 0.0
@@ -2175,6 +2270,7 @@ web_search_engine = WebSearchEngine()
 # ---------------------------------------------------------------------------
 
 _situational_ctx_cache: tuple[str, float] = ("", 0.0)
+_situational_ctx_lock = threading.Lock()
 _SITUATIONAL_CTX_TTL = 3.0  # seconds before the cached string is refreshed
 
 
@@ -2187,11 +2283,13 @@ def _build_situational_context() -> str:
     """
     global _situational_ctx_cache
     now = time.monotonic()
-    cached_text, cached_ts = _situational_ctx_cache
-    if cached_text and (now - cached_ts) < _SITUATIONAL_CTX_TTL:
-        return cached_text
+    with _situational_ctx_lock:
+        cached_text, cached_ts = _situational_ctx_cache
+        if cached_text and (now - cached_ts) < _SITUATIONAL_CTX_TTL:
+            return cached_text
     result = _compute_situational_context()
-    _situational_ctx_cache = (result, now)
+    with _situational_ctx_lock:
+        _situational_ctx_cache = (result, now)
     return result
 
 
@@ -2382,18 +2480,22 @@ class MemoryStore:
             self.long_term.clear()
             self._lt_file = Path(f"data/memory_{profile_name}.jsonl")
             self._lt_file.parent.mkdir(parents=True, exist_ok=True)
-            # Flush + close old handle safely before opening new one
+            # Open new handle first; only close old handle if new one succeeds
+            old_handle = self._lt_handle
             try:
-                if self._lt_handle and not self._lt_handle.closed:
-                    # flush handled by _safe_write
-                    self._lt_handle.close()
-            except Exception as exc:
-                _revia_log(f"[MemoryStore] Error closing old handle: {exc}")
-            try:
-                self._lt_handle = open(self._lt_file, "a", encoding="utf-8")
+                new_handle = open(self._lt_file, "a", encoding="utf-8")
+                self._lt_handle = new_handle
             except Exception as exc:
                 _revia_log(f"[MemoryStore] Failed to open memory file: {exc}")
                 self._lt_handle = None
+            # Now close old handle safely
+            if old_handle is not None:
+                try:
+                    if not old_handle.closed:
+                        old_handle.flush()
+                        old_handle.close()
+                except Exception as exc:
+                    _revia_log(f"[MemoryStore] Error closing old handle: {exc}")
             self._load_long_term()
 
     # ------------------------------------------------------------------
@@ -2523,6 +2625,8 @@ class MemoryStore:
                 for item in overflow:
                     self._promote_to_long_term(item)
 
+    _MAX_LONG_TERM = 10000  # Cap long-term memory to prevent OOM
+
     def _promote_to_long_term(self, entry):
         item = dict(entry or {})
         item["promoted"] = True
@@ -2530,6 +2634,9 @@ class MemoryStore:
         if item is None:
             return
         self.long_term.append(item)
+        # Evict oldest entries if we exceed the cap
+        if len(self.long_term) > self._MAX_LONG_TERM:
+            self.long_term = self.long_term[-self._MAX_LONG_TERM:]
         self._redis_push(item)
         self._safe_write(_json_dumps_compact(item) + "\n")
 
@@ -2711,7 +2818,8 @@ class MemoryStore:
         """Write to the long-term file handle. Silently no-ops if handle is None/closed."""
         if self._lt_handle and not self._lt_handle.closed:
             try:
-                self._safe_write(data)
+                self._lt_handle.write(data)
+                self._lt_handle.flush()
             except Exception as exc:
                 _revia_log(f"[MemoryStore] Write error: {exc}")
 
@@ -2781,12 +2889,12 @@ PLUGINS = [
     {"name": "Whisper-STT",     "category": "stt",    "enabled": True,  "status": "Stub", "last_error": ""},
     {"name": "Qwen3-TTS",       "category": "tts",    "enabled": True,  "status": "Stub", "last_error": ""},
     {"name": "Vision-CLIP",     "category": "vision", "enabled": True,  "status": "Stub", "last_error": ""},
-    {"name": "ChromaDB-Memory", "category": "memory", "enabled": True,  "status": "Stub", "last_error": ""},
+    {"name": "Persistent-Memory", "category": "memory", "enabled": True,  "status": "Local File", "last_error": ""},
     {"name": "LLM-Backend",     "category": "llm",    "enabled": True,  "status": "OK",   "last_error": ""},
     {"name": "System-Tools",    "category": "tools",  "enabled": False, "status": "OK",   "last_error": ""},
 ]
 
-profile = {
+profile = character_profile_manager.get_active_profile({
     "character_name": "Revia",
     "persona": (
         "A confident, intelligent, emotionally-aware digital companion who is "
@@ -2797,8 +2905,10 @@ profile = {
     "verbosity": "Normal",
     "greeting": "Hey, I'm Revia. Ready when you are.",
     "character_prompt": "",
-    "voice_id": "default", "tone": "calm", "speed": 1.0,
-}
+    "voice_id": "default",
+    "tone": "calm",
+    "speed": 1.0,
+})
 
 _PROFILE_FILE = Path(__file__).resolve().parent.parent / "profile_settings.json"
 
@@ -2809,7 +2919,9 @@ def _load_profile_from_disk():
     try:
         data = _json_loads_fast(_PROFILE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            profile.update(data)
+            normalized = character_profile_manager.get_active_profile(data)
+            profile.clear()
+            profile.update(normalized)
             # Feed the full profile into ProfileEngine so behavioral params resolve
             profile_engine.load(profile)
             print(f"[REVIA Core] Loaded profile settings from {_PROFILE_FILE.name}")
@@ -2845,6 +2957,8 @@ def _save_profile_to_disk():
 
 _load_profile_from_disk()
 _sync_memory_profile_from_profile(clear_conversation=True)
+# Sync RL engine with profile defaults (only affects unlearned parameters)
+rl_engine.sync_from_profile(profile)
 conversation_manager.mark_initializing("Loading profile, memory, and services")
 telemetry.state = conversation_manager.current_state
 
@@ -3178,6 +3292,69 @@ def _build_profile_greeting_reply(startup: bool = False) -> AssistantResponse:
     )
 
 
+_VISIBLE_ERROR_FALLBACK_TEXT = "Uh... something's wrong. Someone tell my operator he messed up."
+
+
+def _get_error_fallback_text(profile: dict | None = None) -> str:
+    """Read fallback_msg from profile, or use hardcoded default.
+
+    Args:
+        profile: The current profile dict (passed from the pipeline).
+                 Falls back to the global character_profile_manager if not provided.
+    """
+    # Try the passed-in profile first
+    if isinstance(profile, dict):
+        msg = profile.get("fallback_msg", "")
+        if msg:
+            return msg
+    # Try the global profile manager
+    try:
+        merged = character_profile_manager.get_active_profile(profile)
+        msg = (merged or {}).get("fallback_msg", "")
+        if msg:
+            return msg
+    except Exception:
+        pass
+    return _VISIBLE_ERROR_FALLBACK_TEXT
+
+
+def _ensure_visible_error_response(response: AssistantResponse,
+                                    profile: dict | None = None) -> AssistantResponse:
+    """Ensure error responses have visible text using the profile's fallback_msg."""
+    if not isinstance(response, AssistantResponse):
+        return AssistantResponse(
+            text=_get_error_fallback_text(profile),
+            response_mode=ResponseMode.ERROR_RESPONSE.value,
+            success=False,
+            error_type="invalid_error_response",
+            retryable=True,
+            speakable=True,
+            commit_to_history=False,
+            commit_to_memory=False,
+        )
+
+    if response.success or str(response.text or "").strip():
+        return response
+
+    if str(response.error_type or "").strip() == "interrupted":
+        return response
+
+    meta = dict(response.metadata or {})
+    if response.error_type:
+        meta.setdefault("fallback_error_type", response.error_type)
+    return AssistantResponse(
+        text=_get_error_fallback_text(profile),
+        response_mode=ResponseMode.ERROR_RESPONSE.value,
+        success=False,
+        error_type=response.error_type or "empty_error_response",
+        retryable=bool(response.retryable),
+        speakable=True,
+        commit_to_history=False,
+        commit_to_memory=False,
+        metadata=meta,
+    )
+
+
 def _build_duplicate_block_response(response: AssistantResponse) -> AssistantResponse:
     _revia_log(
         f"Fallback blocked | mode={response.response_mode} | error_type={response.error_type or 'none'}"
@@ -3209,6 +3386,32 @@ def _build_duplicate_block_response(response: AssistantResponse) -> AssistantRes
 # Pipeline
 # ---------------------------------------------------------------------------
 
+def _set_turn_stage(
+    turn,
+    lifecycle_state,
+    stage,
+    *,
+    runtime_state=None,
+    runtime_reason="",
+):
+    request_id = str(getattr(turn, "request_id", "") or "")
+    if not request_id:
+        return False
+    if not turn_manager.mark_state(request_id, lifecycle_state, stage):
+        return False
+    if runtime_state is not None:
+        _set_runtime_state(runtime_state, runtime_reason or stage, broadcast=True)
+    else:
+        _broadcast_runtime_status()
+    return True
+
+
+class _PipelineInterrupted(Exception):
+    """Sentinel raised inside process_pipeline when an interrupt is detected
+    mid-flight.  Caught by the pipeline's own except clause — never escapes."""
+    pass
+
+
 def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, turn=None):
     trigger = trigger or TriggerRequest(
         source=TriggerSource.USER_MESSAGE.value,
@@ -3228,8 +3431,13 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         f"| source={trigger.source} | reason={trigger.reason}"
     )
     _mark_user_activity()
-    turn_manager.mark_state(turn.request_id, RequestLifecycleState.THINKING, trigger.reason)
-    _set_runtime_state(ReviaState.THINKING, f"{trigger.source}: {trigger.reason}", broadcast=True)
+    _set_turn_stage(
+        turn,
+        RequestLifecycleState.THINKING,
+        "request_prepare",
+        runtime_state=ReviaState.THINKING,
+        runtime_reason=f"{trigger.source}: {trigger.reason}",
+    )
 
     vision_context = str(vision_context or "").strip()
     if vision_context:
@@ -3254,12 +3462,13 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         if out.get("type") == "chat_token":
             if not token_started:
                 token_started = True
-                turn_manager.mark_state(
-                    turn.request_id,
+                _set_turn_stage(
+                    turn,
                     RequestLifecycleState.SPEAKING,
-                    "first token emitted",
+                    "first_token_emitted",
+                    runtime_state=ReviaState.SPEAKING,
+                    runtime_reason=f"{trigger.source}: first token",
                 )
-                _set_runtime_state(ReviaState.SPEAKING, f"{trigger.source}: first token", broadcast=True)
             # Buffer tokens and emit sentence-level events for TTS streaming
             tok = out.get("token", "")
             _sentence_buffer.append(tok)
@@ -3277,6 +3486,13 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         broadcast_json(out)
 
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
+
+    # ── Interrupt-awareness: check early and after every major stage ──────
+    def _pipeline_interrupted() -> bool:
+        """Return True if an interrupt was requested since this turn started."""
+        return llm_backend._is_interrupted() or not turn_manager.is_current(turn.request_id)
+
+    _set_turn_stage(turn, RequestLifecycleState.THINKING, "emotion_analysis")
     s = telemetry.begin_span("emotion_analysis")
     with telemetry._lock:
         prev_emotion = dict(telemetry.emotion)
@@ -3292,12 +3508,28 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     _record_emotion(emo)
     telemetry.end_span(s)
 
+    # Interrupt gate: abort early if an interrupt arrived during emotion analysis
+    if _pipeline_interrupted():
+        _revia_log(f"Pipeline interrupted after emotion_analysis | request_id={turn.request_id}")
+        turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted_early")
+        _set_runtime_state(ReviaState.IDLE, "interrupted during pipeline", force=True, broadcast=True)
+        return ""
+
+    _set_turn_stage(turn, RequestLifecycleState.THINKING, "router_classify")
     s = telemetry.begin_span("router_classify")
     route = router_cls.classify(text)
     with telemetry._lock:
         telemetry.router = route
     telemetry.end_span(s)
 
+    # Interrupt gate: abort early if an interrupt arrived during routing
+    if _pipeline_interrupted():
+        _revia_log(f"Pipeline interrupted after router_classify | request_id={turn.request_id}")
+        turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted_early")
+        _set_runtime_state(ReviaState.IDLE, "interrupted during pipeline", force=True, broadcast=True)
+        return ""
+
+    _set_turn_stage(turn, RequestLifecycleState.THINKING, "memory_update")
     meta = {"emotion": emo.get("label", "")}
     if image_b64:
         meta["has_image"] = True
@@ -3323,6 +3555,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
 
     try:
         if runtime_status_manager.is_status_question(text):
+            _set_turn_stage(turn, RequestLifecycleState.THINKING, "status_reply")
             response = AssistantResponse(
                 text=runtime_status_manager.build_status_reply(text),
                 response_mode=ResponseMode.SYSTEM_STATUS_RESPONSE.value,
@@ -3332,6 +3565,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 commit_to_memory=True,
             )
         elif route.get("suggested_tool") == "web_search" and not web_search_engine.enabled:
+            _set_turn_stage(turn, RequestLifecycleState.THINKING, "tool_unavailable")
             response = AssistantResponse(
                 text="Online lookup is disabled in current settings, so I cannot search the web right now.",
                 response_mode=ResponseMode.TOOL_UNAVAILABLE_RESPONSE.value,
@@ -3340,13 +3574,15 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 commit_to_history=True,
                 commit_to_memory=True,
             )
-        elif not llm_backend.conversation and _is_explicit_greeting_turn(text):
+        elif not list(llm_backend.conversation) and _is_explicit_greeting_turn(text):
+            _set_turn_stage(turn, RequestLifecycleState.THINKING, "greeting_reply")
             response = _build_profile_greeting_reply(startup=False)
         else:
             pref_q = _detect_revia_preference_question(text)
             if pref_q:
                 choice, new_saved = _resolve_revia_preference(pref_q, source_text=text)
                 full_text = _build_revia_preference_reply(pref_q, choice, newly_saved=new_saved)
+                _set_turn_stage(turn, RequestLifecycleState.THINKING, "preference_direct_answer")
                 s_pref = telemetry.begin_span("preference_direct_answer", device=_device)
                 telemetry.end_span(s_pref)
                 token_count = len((full_text or "").split())
@@ -3370,6 +3606,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                         "Use this visual context when relevant, especially when the user asks what you can see."
                     )
                 if web_search_engine.enabled and route.get("suggested_tool") == "web_search":
+                    _set_turn_stage(turn, RequestLifecycleState.THINKING, "web_search")
                     s_ws = telemetry.begin_span("web_search")
                     search_results = web_search_engine.search(text)
                     telemetry.end_span(s_ws)
@@ -3389,12 +3626,37 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     elif search_results:
                         broadcast_json({"type": "log_entry", "text": f"[Search] {search_results}"})
 
-                turn_manager.mark_state(
-                    turn.request_id,
+                # Interrupt gate: skip the expensive LLM call if already interrupted
+                if _pipeline_interrupted():
+                    _revia_log(f"Pipeline interrupted before llm_decode | request_id={turn.request_id}")
+                    response = AssistantResponse(
+                        text="",
+                        response_mode=ResponseMode.ERROR_RESPONSE.value,
+                        success=False,
+                        error_type="interrupted",
+                        retryable=True,
+                        speakable=False,
+                        commit_to_history=False,
+                        commit_to_memory=False,
+                    )
+                    # Skip directly to post-pipeline cleanup
+                    raise _PipelineInterrupted()
+
+                _set_turn_stage(
+                    turn,
                     RequestLifecycleState.GENERATING,
-                    "llm request started",
+                    "llm_decode",
+                    runtime_state=ReviaState.THINKING,
+                    runtime_reason=f"{trigger.source}: llm decode",
                 )
-                _revia_log(f"Model call started | request_id={turn.request_id} | source={trigger.source}")
+                # Apply RL-adjusted temperature before generation
+                _rl_params = rl_engine.get_params()
+                _rl_temp = _rl_params.get("temperature")
+                _original_temp = llm_backend.temperature
+                if _rl_temp is not None and rl_engine.enabled:
+                    llm_backend.temperature = _rl_temp
+
+                _revia_log(f"Model call started | request_id={turn.request_id} | source={trigger.source} | rl_temp={llm_backend.temperature:.3f}")
                 s = telemetry.begin_span("llm_decode", device=_device)
                 response = llm_backend.generate_response(
                     llm_input,
@@ -3403,19 +3665,36 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     response_mode=ResponseMode.NORMAL_RESPONSE.value,
                 )
                 telemetry.end_span(s)
+                # Restore original temperature
+                llm_backend.temperature = _original_temp
                 _revia_log(
                     f"Model call completed | request_id={turn.request_id} | success={response.success} "
                     f"| mode={response.response_mode} | error_type={response.error_type or 'none'}"
                 )
+    except _PipelineInterrupted:
+        # Clean exit — response was already set to an interrupted AssistantResponse
+        _revia_log(f"Pipeline interrupted cleanly | request_id={turn.request_id}")
+        turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted")
+        _set_runtime_state(ReviaState.IDLE, "pipeline interrupted", force=True, broadcast=True)
+        _broadcast_runtime_status()
+        return ""
     except Exception as e:
         _revia_log(f"Unhandled pipeline error | request_id={turn.request_id} | error={e}")
+        try:
+            _active_profile = globals().get("profile") or {}
+            _error_text = prompt_assembly_manager._personality_error(
+                _active_profile.get("character_name", "Revia"), "generation_failed",
+                profile=_active_profile,
+            )
+        except Exception:
+            _error_text = "Something went wrong on my end. Try again?"
         response = AssistantResponse(
-            text="Something went wrong in my head. Not the first time, won't be the last.",
+            text=_error_text,
             response_mode=ResponseMode.ERROR_RESPONSE.value,
             success=False,
             error_type="pipeline_error",
             retryable=True,
-            speakable=False,
+            speakable=True,
             commit_to_history=False,
             commit_to_memory=False,
         )
@@ -3424,6 +3703,13 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     if not turn_manager.is_current(turn.request_id):
         _revia_log(f"Stale response discarded before completion | request_id={turn.request_id}")
         _sentence_buffer.clear()
+        turn_manager.finish_turn(
+            turn.request_id,
+            lifecycle_state=RequestLifecycleState.IDLE,
+            reason="stale_discarded",
+        )
+        _set_runtime_state(ReviaState.IDLE, "stale response discarded", broadcast=True)
+        _broadcast_runtime_status()
         return ""
 
     # Flush any remaining sentence buffer for TTS (last sentence may not end with punctuation)
@@ -3444,6 +3730,8 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     if turn_manager.should_block_duplicate_output(text, response.text, response.response_mode):
         response = _build_duplicate_block_response(response)
 
+    response = _ensure_visible_error_response(response, profile=profile)
+    _set_turn_stage(turn, RequestLifecycleState.GENERATING, "response_filter")
     filtered = conversation_manager.response_filter.apply(
         response.text,
         trigger,
@@ -3454,6 +3742,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     response.speakable = bool(response.speakable and filtered.speakable and final_text)
 
     if response.commit_to_history and response.text:
+        _set_turn_stage(turn, RequestLifecycleState.GENERATING, "history_commit")
         llm_backend.commit_turn_to_history(text, response.text)
         turn_manager.remember_committed_output(text, response.text, response.response_mode)
         _revia_log(
@@ -3467,24 +3756,35 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         )
 
     if response.commit_to_memory and response.text:
+        _set_turn_stage(turn, RequestLifecycleState.GENERATING, "memory_commit")
         memory_store.add_short_term("assistant", response.text)
 
-    if response.commit_to_memory and response.text and len(memory_store.short_term) % 20 == 0 and len(memory_store.short_term) > 0:
-        summary = f"Conversation exchange: User said '{text[:100]}', "
-        summary += f"Assistant replied '{response.text[:100]}'"
-        memory_store.save_to_long_term(
-            summary,
-            category="auto_conversation",
-            metadata={"emotion": emo.get("label", "")},
-        )
+    if response.commit_to_memory and response.text:
+        with memory_store._lock:
+            _st_len = len(memory_store.short_term)
+        if _st_len > 0 and _st_len % 20 == 0:
+            _set_turn_stage(turn, RequestLifecycleState.GENERATING, "memory_commit")
+            summary = f"Conversation exchange: User said '{text[:100]}', "
+            summary += f"Assistant replied '{response.text[:100]}'"
+            memory_store.save_to_long_term(
+                summary,
+                category="auto_conversation",
+                metadata={"emotion": emo.get("label", "")},
+            )
 
     if response.text and not token_started:
-        turn_manager.mark_state(turn.request_id, RequestLifecycleState.SPEAKING, "response delivered")
-        _set_runtime_state(ReviaState.SPEAKING, f"{trigger.source}: response deliver", broadcast=True)
+        _set_turn_stage(
+            turn,
+            RequestLifecycleState.SPEAKING,
+            "output_deliver",
+            runtime_state=ReviaState.SPEAKING,
+            runtime_reason=f"{trigger.source}: response deliver",
+        )
+    else:
+        _set_turn_stage(turn, RequestLifecycleState.SPEAKING, "output_deliver")
 
     s = telemetry.begin_span("output_deliver")
-    if response.text:
-        _pipeline_broadcast(response.to_payload(turn.request_id, turn.turn_id))
+    _pipeline_broadcast(response.to_payload(turn.request_id, turn.turn_id))
     telemetry.end_span(s)
 
     cooldown_name = "response" if trigger.kind == TriggerKind.RESPONSE.value else "autonomous"
@@ -3503,7 +3803,76 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     telemetry.state = conversation_manager.current_state
     if conversation_manager.current_state == ReviaState.IDLE.value:
         _broadcast_runtime_status()
+
+    # ── Reinforcement Learning: record reward signal for this interaction ─
+    try:
+        _avs_composite = conversation_manager.state_machine.answer_confidence_last
+        _loop_risk = conversation_manager.state_machine.loop_risk_score
+        _was_interrupted = str(response.error_type or "") == "interrupted"
+        _was_corrected = bool(
+            route and route.get("suggested_tool") == "correction"
+        ) if 'route' in dir() else False
+        _rl_signal = RewardSignal(
+            avs_composite=_avs_composite,
+            user_msg_length=len(text.split()),
+            user_followed_up=False,  # updated retroactively on next message
+            emotion_delta=0.0,       # computed below if possible
+            was_interrupted=_was_interrupted,
+            loop_detected=_loop_risk > 0.6,
+            was_corrected=_was_corrected,
+            context_emotion=emo.get("label", "neutral"),
+            context_topic=route.get("primary_route", "general") if route else "general",
+        )
+        # Compute emotion delta from prev_emotion
+        try:
+            _prev_valence = float(prev_emotion.get("valence", 0.0))
+            _cur_valence = float(emo.get("valence", 0.0))
+            _rl_signal.emotion_delta = _cur_valence - _prev_valence
+        except (ValueError, TypeError):
+            pass
+        rl_engine.record_reward(_rl_signal)
+    except Exception as _rl_exc:
+        _revia_log(f"[RL] Reward recording failed (non-fatal): {_rl_exc}")
+
     return response.text
+
+
+def _handle_pipeline_crash(turn, trigger, exc):
+    request_id = getattr(turn, "request_id", "") or "unknown"
+    turn_id = getattr(turn, "turn_id", 0) or 0
+    source = getattr(trigger, "source", TriggerSource.USER_MESSAGE.value)
+    _revia_log(f"Fatal pipeline crash | request_id={request_id} | error={exc}")
+    if not request_id or not turn_manager.is_current(request_id):
+        return
+    _crash_text = prompt_assembly_manager._personality_error(
+        (profile or {}).get("character_name", "Revia"), "generation_failed",
+        profile=profile,
+    )
+    response = AssistantResponse(
+        text=_crash_text,
+        response_mode=ResponseMode.ERROR_RESPONSE.value,
+        success=False,
+        error_type="pipeline_crash",
+        retryable=True,
+        speakable=True,
+        commit_to_history=False,
+        commit_to_memory=False,
+    )
+    turn_manager.finish_turn(
+        request_id,
+        lifecycle_state=RequestLifecycleState.ERROR,
+        reason="pipeline_crash",
+    )
+    _set_runtime_state(ReviaState.IDLE, f"{source}: pipeline crash recovered", force=True, broadcast=True)
+    broadcast_json(response.to_payload(request_id, turn_id))
+    broadcast_json({"type": "telemetry_update", "data": _build_status_payload()})
+
+
+def _run_pipeline_safe(text, image_b64=None, vision_context=None, trigger=None, turn=None):
+    try:
+        process_pipeline(text, image_b64, vision_context, trigger, turn)
+    except Exception as exc:
+        _handle_pipeline_crash(turn, trigger, exc)
 
 
 def process_pipeline_integration(text: str) -> str:
@@ -3537,7 +3906,9 @@ def process_pipeline_integration(text: str) -> str:
     memory_store.add_short_term("assistant", full_text, {"platform": platform or "unknown"})
 
     # Auto-save summary every 20 messages (same policy as main pipeline)
-    if len(memory_store.short_term) % 20 == 0 and len(memory_store.short_term) > 0:
+    with memory_store._lock:
+        _st_len = len(memory_store.short_term)
+    if _st_len > 0 and _st_len % 20 == 0:
         summary = (
             f"Platform exchange ({platform or 'unknown'}): "
             f"User said '{text[:100]}', Assistant replied '{full_text[:100]}'"
@@ -3774,6 +4145,11 @@ def _build_status_payload():
         "architecture": architecture,
         "runtime_status": runtime_status,
         "request_lifecycle": turn_manager.snapshot(),
+        "rl": {
+            "enabled": rl_engine.enabled,
+            "interaction_count": rl_engine.get_stats().get("interaction_count", 0),
+            "average_reward": rl_engine.get_stats().get("average_reward", 0.0),
+        },
     }
 
 
@@ -3815,9 +4191,64 @@ def api_runtime_config_post():
 def api_interrupt():
     """Signal the LLM to stop generating tokens and cancel queued TTS."""
     llm_backend.request_interrupt()
+    turn_snapshot = turn_manager.snapshot()
+    active_request_id = str(turn_snapshot.get("active_request_id", "") or "")
+    active_turn = turn_snapshot.get("active_turn", {}) or {}
+    if active_request_id:
+        turn_manager.finish_turn(
+            active_request_id,
+            lifecycle_state=RequestLifecycleState.IDLE,
+            reason="interrupt_requested",
+        )
+        _set_runtime_state(ReviaState.IDLE, "interrupt requested", force=True, broadcast=True)
+        interrupted_payload = AssistantResponse(
+            text="",
+            response_mode=ResponseMode.ERROR_RESPONSE.value,
+            success=False,
+            error_type="interrupted",
+            retryable=True,
+            speakable=False,
+            commit_to_history=False,
+            commit_to_memory=False,
+        ).to_payload(active_request_id, int(active_turn.get("turn_id", 0) or 0))
+        broadcast_json(interrupted_payload)
+        broadcast_json({"type": "telemetry_update", "data": _build_status_payload()})
     broadcast_json({"type": "interrupt_ack", "interrupted": True})
     _revia_log("LLM generation interrupted via /api/interrupt")
     return jsonify({"ok": True, "interrupted": True})
+
+
+# ---------------------------------------------------------------------------
+# Reinforcement Learning API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/rl/stats", methods=["GET"])
+def api_rl_stats():
+    """Return RL engine statistics and current parameter values."""
+    stats = rl_engine.get_stats()
+    stats["reward_trend"] = rl_engine.get_reward_trend()
+    return jsonify(stats)
+
+
+@app.route("/api/rl/history", methods=["GET"])
+def api_rl_history():
+    """Return recent reward signals for debugging."""
+    n = request.args.get("n", 20, type=int)
+    return jsonify({"rewards": rl_engine.recent_rewards(n)})
+
+
+@app.route("/api/rl/config", methods=["POST"])
+def api_rl_config():
+    """Enable/disable RL or reset learned parameters."""
+    data = request.get_json(silent=True) or {}
+    if "enabled" in data:
+        rl_engine.enabled = bool(data["enabled"])
+    if data.get("reset"):
+        rl_engine.reset()
+    if data.get("save"):
+        rl_engine.save()
+    return jsonify({"ok": True, "stats": rl_engine.get_stats()})
+
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -3859,11 +4290,11 @@ def api_chat():
         source=source,
         user_text=text,
         response_mode=requested_mode,
-        metadata={"reason": reason},
+        metadata={"trigger_reason": reason},
     )
     _mark_user_activity()
     threading.Thread(
-        target=process_pipeline,
+        target=_run_pipeline_safe,
         args=(text, image_b64, vision_context, trigger, turn),
         daemon=True,
     ).start()
@@ -3928,6 +4359,15 @@ def api_vllm_invalidate():
 
 @app.route("/api/plugins", methods=["GET"])
 def api_plugins():
+    for plugin in PLUGINS:
+        if plugin.get("category") != "memory":
+            continue
+        if memory_store.redis_available:
+            plugin["status"] = "Redis"
+            plugin["last_error"] = ""
+        else:
+            plugin["status"] = "Local File"
+            plugin["last_error"] = "Redis unavailable - using JSONL fallback"
     return jsonify(PLUGINS)
 
 @app.route("/api/plugins/<name>/enable", methods=["POST"])
@@ -3981,10 +4421,41 @@ def api_neural_disable(name):
 def api_profile_get():
     return jsonify(profile)
 
+_ALLOWED_PROFILE_KEYS = frozenset({
+    "character_name", "persona", "traits", "response_style",
+    "verbosity", "greeting", "character_prompt", "voice_id",
+    "tone", "speed", "mood_baseline", "system_prompt",
+    "humor", "sarcasm", "emotional_intensity", "empathy",
+    "curiosity", "question_propensity", "minimum_answer_threshold",
+    "regen_patience", "trait_weights", "speech_quirks",
+    "quirk_frequency", "emotional_volatility", "reply_type_weights",
+    "behavior", "emotion", "timing", "vision", "memory", "identity",
+    "neural", "voice_path", "voice_tone", "language",
+    "verbosity_label", "fallback_msg", "version",
+    "name", "id", "description", "avatar",
+    "persona_preset", "persona_definition",
+    "_schema_version", "_note",
+})
+_MAX_PROFILE_PAYLOAD_BYTES = 64 * 1024
+
+
 @app.route("/api/profile", methods=["POST"])
 def api_profile_save():
-    data = request.get_json(silent=True) or {}
-    profile.update(data)
+    content_length = request.content_length
+    if content_length is not None and content_length > _MAX_PROFILE_PAYLOAD_BYTES:
+        return jsonify({"error": "payload too large (max 64 KB)"}), 413
+    raw = request.get_data(cache=True) or b""
+    if len(raw) > _MAX_PROFILE_PAYLOAD_BYTES:
+        return jsonify({"error": "payload too large (max 64 KB)"}), 413
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "profile must be a JSON object"}), 400
+    filtered = {k: v for k, v in data.items() if k in _ALLOWED_PROFILE_KEYS}
+    next_profile = dict(profile)
+    next_profile.update(filtered)
+    normalized = character_profile_manager.get_active_profile(next_profile)
+    profile.clear()
+    profile.update(normalized)
     # Keep ProfileEngine in sync so behavioral params update immediately
     profile_engine.load(profile)
     _save_profile_to_disk()
@@ -4085,8 +4556,7 @@ def api_memory_docker_status():
 def api_emotions_history():
     """Return the recent emotion history ring buffer."""
     limit = request.args.get("limit", 50, type=int)
-    with _emotion_history_lock:
-        return jsonify(_emotion_history[-limit:])
+    return jsonify(_emotion_history_snapshot(limit=limit))
 
 @app.route("/api/emotions/current", methods=["GET"])
 def api_emotions_current():
@@ -4165,20 +4635,39 @@ def _run_proactive_pipeline(trigger):
         out.setdefault("turn_id", turn.turn_id)
         if payload.get("type") == "chat_token" and not token_started:
             token_started = True
-            turn_manager.mark_state(turn.request_id, RequestLifecycleState.SPEAKING, "first proactive token")
-            _set_runtime_state(ReviaState.SPEAKING, f"{trigger.source}: first token", broadcast=True)
+            _set_turn_stage(
+                turn,
+                RequestLifecycleState.SPEAKING,
+                "first_token_emitted",
+                runtime_state=ReviaState.SPEAKING,
+                runtime_reason=f"{trigger.source}: first token",
+            )
         broadcast_json(out)
 
-    _set_runtime_state(ReviaState.THINKING, f"{trigger.source}: {trigger.reason}", broadcast=True)
+    _set_turn_stage(
+        turn,
+        RequestLifecycleState.THINKING,
+        "proactive_prepare",
+        runtime_state=ReviaState.THINKING,
+        runtime_reason=f"{trigger.source}: {trigger.reason}",
+    )
     broadcast_json({"type": "proactive_start"})
 
     try:
         if str(trigger.source) == TriggerSource.STARTUP.value:
+            _set_turn_stage(turn, RequestLifecycleState.THINKING, "startup_greeting")
             response = _build_profile_greeting_reply(startup=True)
         else:
             with llm_backend._lock:
                 source = llm_backend.source
             _revia_log(f"Model call started | request_id={turn.request_id} | source={trigger.source}")
+            _set_turn_stage(
+                turn,
+                RequestLifecycleState.GENERATING,
+                "llm_decode",
+                runtime_state=ReviaState.THINKING,
+                runtime_reason=f"{trigger.source}: llm decode",
+            )
             if source == "online" and llm_backend.api_key:
                 pending_conversation = llm_backend._trim_conversation(
                     list(llm_backend.conversation) + [{"role": "user", "content": prompt}]
@@ -4212,6 +4701,8 @@ def _run_proactive_pipeline(trigger):
     if turn_manager.should_block_duplicate_output("", response.text, response.response_mode):
         response = _build_duplicate_block_response(response)
 
+    response = _ensure_visible_error_response(response, profile=profile)
+    _set_turn_stage(turn, RequestLifecycleState.GENERATING, "response_filter")
     filtered = conversation_manager.response_filter.apply(
         response.text,
         trigger,
@@ -4227,13 +4718,20 @@ def _run_proactive_pipeline(trigger):
         turn_manager.remember_committed_output("", response.text, response.response_mode)
 
     if response.commit_to_memory and response.text:
+        _set_turn_stage(turn, RequestLifecycleState.GENERATING, "memory_commit")
         memory_store.add_short_term("assistant", response.text)
 
-    if response.text:
-        if not token_started:
-            turn_manager.mark_state(turn.request_id, RequestLifecycleState.SPEAKING, "proactive response deliver")
-            _set_runtime_state(ReviaState.SPEAKING, f"{trigger.source}: response deliver", broadcast=True)
-        _pipeline_broadcast(response.to_payload(turn.request_id, turn.turn_id))
+    if response.text and not token_started:
+        _set_turn_stage(
+            turn,
+            RequestLifecycleState.SPEAKING,
+            "output_deliver",
+            runtime_state=ReviaState.SPEAKING,
+            runtime_reason=f"{trigger.source}: response deliver",
+        )
+    else:
+        _set_turn_stage(turn, RequestLifecycleState.SPEAKING, "output_deliver")
+    _pipeline_broadcast(response.to_payload(turn.request_id, turn.turn_id))
 
     conversation_manager.behavior.start_cooldown("autonomous")
     _set_runtime_state(ReviaState.COOLDOWN, f"{trigger.source}: output delivered", force=True, broadcast=True)
@@ -4417,6 +4915,8 @@ def main():
     print(f"[REVIA Core] REST server on http://0.0.0.0:{REST_PORT}")
     print(f"[REVIA Core] Ready. Open the controller and click 'Connect'.")
     print()
+    import atexit
+    atexit.register(rl_engine.save)
     app.run(host="0.0.0.0", port=REST_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":

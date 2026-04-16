@@ -98,28 +98,29 @@ class RuntimeStatusManager:
     def update_runtime_config(self, data: dict | None):
         if not isinstance(data, dict):
             return
+        changed_keys: list[str] = []
         with self._lock:
             for key, value in data.items():
                 if key in self._ALLOWED_CONFIG_KEYS:
+                    if self._controller_state.get(key) != value:
+                        changed_keys.append(key)
                     self._controller_state[key] = value
-        self._log(
-            "Runtime config updated | "
-            + ", ".join(
-                f"{key}={value}"
-                for key, value in sorted((data or {}).items())
-                if key in (
-                    "online_enabled",
-                    "web_search_enabled",
-                    "safety_filter_enabled",
-                    "tool_access_enabled",
-                    "voice_output_enabled",
-                    "memory_enabled",
-                    "emotion_mode_enabled",
-                    "active_persona_profile_name",
-                    "ui_state",
+        # Only log when something actually changed — prevents log spam from
+        # identical config pushes during startup signal bursts.
+        _LOG_KEYS = {
+            "online_enabled", "web_search_enabled", "safety_filter_enabled",
+            "tool_access_enabled", "voice_output_enabled", "memory_enabled",
+            "emotion_mode_enabled", "active_persona_profile_name", "ui_state",
+        }
+        if changed_keys:
+            self._log(
+                "Runtime config updated | "
+                + ", ".join(
+                    f"{key}={data[key]}"
+                    for key in sorted(changed_keys)
+                    if key in _LOG_KEYS
                 )
             )
-        )
 
     def get_runtime_status(self) -> dict:
         llm = dict(self._llm_status_getter() or {})

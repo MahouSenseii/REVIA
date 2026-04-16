@@ -12,7 +12,23 @@ from .twitch_bot import REVIATwitchBot
 
 logger = logging.getLogger("revia.integrations")
 
-_CONFIG_PATH = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, "integrations_config.json")))
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CONFIG_PATH = _REPO_ROOT / "data" / "integrations_config.json"
+_LEGACY_CONFIG_PATH = Path(
+    os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            os.pardir,
+            os.pardir,
+            os.pardir,
+            "integrations_config.json",
+        )
+    )
+)
+_SECRET_ENV_KEYS = {
+    "discord": {"bot_token": "REVIA_DISCORD_BOT_TOKEN"},
+    "twitch": {"oauth_token": "REVIA_TWITCH_OAUTH_TOKEN"},
+}
 
 _DEFAULT_BOT_STATUS: dict = {
     "running": False, "status": "stopped",
@@ -61,6 +77,10 @@ class IntegrationManager:
         self._config = _load_config()
         self.discord_bot: REVIADiscordBot | None = None
         self.twitch_bot: REVIATwitchBot | None = None
+        self._sing_command_handler = None
+
+    def _effective_config(self) -> dict:
+        return _apply_env_secrets(self._config)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -68,16 +88,30 @@ class IntegrationManager:
 
     def start_enabled(self):
         """Start any integrations that are marked enabled in config."""
-        if self._config["discord"].get("enabled"):
+        effective = self._effective_config()
+        if effective["discord"].get("enabled"):
             self.start_discord()
-        if self._config["twitch"].get("enabled"):
+        if effective["twitch"].get("enabled"):
             self.start_twitch()
+
+    def set_sing_command_handler(self, handler):
+        """Wire the sing command handler so !sing works in chat."""
+        self._sing_command_handler = handler
+        if self.discord_bot:
+            self.discord_bot.sing_command_handler = handler
+        if self.twitch_bot:
+            self.twitch_bot.sing_command_handler = handler
 
     def start_discord(self):
         if self.discord_bot and self.discord_bot.running:
             logger.info("[Integrations] Discord bot already running")
             return
-        self.discord_bot = REVIADiscordBot(self.pipeline_fn, self._config["discord"])
+        effective = self._effective_config()
+        self.discord_bot = REVIADiscordBot(
+            self.pipeline_fn, effective["discord"]
+        )
+        if self._sing_command_handler:
+            self.discord_bot.sing_command_handler = self._sing_command_handler
         self.discord_bot.start()
         logger.info("[Integrations] Discord bot starting…")
 
@@ -90,7 +124,12 @@ class IntegrationManager:
         if self.twitch_bot and self.twitch_bot.running:
             logger.info("[Integrations] Twitch bot already running")
             return
-        self.twitch_bot = REVIATwitchBot(self.pipeline_fn, self._config["twitch"])
+        effective = self._effective_config()
+        self.twitch_bot = REVIATwitchBot(
+            self.pipeline_fn, effective["twitch"]
+        )
+        if self._sing_command_handler:
+            self.twitch_bot.sing_command_handler = self._sing_command_handler
         self.twitch_bot.start()
         logger.info("[Integrations] Twitch bot starting…")
 
@@ -108,13 +147,16 @@ class IntegrationManager:
     # ------------------------------------------------------------------
 
     def get_config(self) -> dict:
-        return {k: dict(v) for k, v in self._config.items()}
+        return _public_config(self._effective_config())
 
     def update_config(self, new_cfg: dict):
         """Merge partial config update and persist to disk."""
         for platform in ("discord", "twitch"):
             if platform in new_cfg and isinstance(new_cfg[platform], dict):
-                self._config[platform].update(new_cfg[platform])
+                for key, value in new_cfg[platform].items():
+                    if key in _SECRET_ENV_KEYS.get(platform, {}) and not str(value).strip():
+                        continue
+                    self._config[platform][key] = value
         _save_config(self._config)
 
     # ------------------------------------------------------------------
@@ -133,13 +175,17 @@ class IntegrationManager:
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    if _CONFIG_PATH.exists():
+    for path in (_CONFIG_PATH, _LEGACY_CONFIG_PATH):
+        if not path.exists():
+            continue
         try:
-            with open(_CONFIG_PATH) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             cfg: dict = {}
             for k in ("discord", "twitch"):
                 cfg[k] = {**_DEFAULT_CONFIG[k], **data.get(k, {})}
+            if path == _LEGACY_CONFIG_PATH and not _CONFIG_PATH.exists():
+                _save_config(cfg)
             return cfg
         except json.JSONDecodeError as exc:
             logger.warning(f"[Integrations] Invalid JSON in config: {exc}; using defaults")
@@ -151,9 +197,46 @@ def _load_config() -> dict:
 def _save_config(cfg: dict):
     try:
         _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(_CONFIG_PATH, "w") as f:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
     except PermissionError as exc:
         logger.error(f"[Integrations] Permission denied saving config: {exc}")
     except OSError as exc:
         logger.error(f"[Integrations] OS error saving config: {exc}")
+
+
+def _mask_secret(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return raw[:2] + "..." if len(raw) > 2 else "***"
+    return raw[:4] + "..." + raw[-4:]
+
+
+def _apply_env_secrets(cfg: dict) -> dict:
+    effective = {k: dict(v) for k, v in cfg.items()}
+    for platform, mapping in _SECRET_ENV_KEYS.items():
+        target = effective.setdefault(platform, {})
+        for field, env_name in mapping.items():
+            env_value = os.environ.get(env_name, "").strip()
+            if env_value:
+                target[field] = env_value
+    return effective
+
+
+def _public_config(cfg: dict) -> dict:
+    public_cfg = {k: dict(v) for k, v in cfg.items()}
+    for platform, mapping in _SECRET_ENV_KEYS.items():
+        target = public_cfg.setdefault(platform, {})
+        for field, env_name in mapping.items():
+            raw = str(target.get(field, "")).strip()
+            target[field] = ""
+            target[f"{field}_set"] = bool(raw)
+            target[f"{field}_source"] = (
+                "environment"
+                if os.environ.get(env_name, "").strip()
+                else ("file" if raw else "")
+            )
+            target[f"{field}_preview"] = _mask_secret(raw)
+    return public_cfg

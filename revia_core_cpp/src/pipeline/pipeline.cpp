@@ -199,12 +199,18 @@ void Pipeline::stage_llm_generate(const PipelineRequest& req, const std::string&
     cli.set_read_timeout(120, 0);
 
     std::string sse_buffer;
+    static constexpr size_t kMaxSSEBuffer = 256 * 1024;  // 256 KB safety cap
     auto result = cli.Post(
         "/v1/chat/completions",
         httplib::Headers{},
         body.dump(),
         "application/json",
         [&](const char* data, size_t len) -> bool {
+            if (sse_buffer.size() + len > kMaxSSEBuffer) {
+                std::cerr << "[Pipeline] SSE buffer exceeded " << kMaxSSEBuffer
+                          << " bytes — dropping excess data\n";
+                sse_buffer.clear();
+            }
             sse_buffer.append(data, len);
             size_t pos;
             while ((pos = sse_buffer.find('\n')) != std::string::npos) {
@@ -254,9 +260,13 @@ void Pipeline::stage_tts_synthesize(const std::string&) {
     telemetry_.end_span(span);
 }
 
-void Pipeline::stage_memory_write(const std::string&, const std::string&) {
+void Pipeline::stage_memory_write(const std::string& user_text, const std::string& assistant_text) {
     auto span = telemetry_.begin_span("memory_write");
-    // REMOVED: artificial latency
+    // TODO: Persist this turn to the memory/RAG backend once one is integrated.
+    // For now, log the turn so data is not silently discarded and can be recovered
+    // from the telemetry JSONL if needed.
+    span.extra["user_turn"]      = user_text;
+    span.extra["assistant_turn"] = assistant_text;
     telemetry_.end_span(span);
 }
 

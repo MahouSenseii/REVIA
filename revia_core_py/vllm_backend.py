@@ -485,6 +485,7 @@ class VLLMEnhancer:
                     try:
                         chunk = json.loads(payload)
                     except json.JSONDecodeError:
+                        _log.debug("[vLLM] Dropped malformed SSE chunk: %s", payload[:120])
                         continue
 
                     choices = chunk.get("choices", [])
@@ -546,12 +547,13 @@ class VLLMEnhancer:
 
         # Compute average logprob for confidence scoring
         if all_logprobs:
-            total_lp = sum(
+            valid_lps = [
                 lp_entry.get("logprob", 0.0)
                 for lp_entry in all_logprobs
                 if isinstance(lp_entry, dict) and "logprob" in lp_entry
-            )
-            result.avg_logprob = total_lp / len(all_logprobs)
+            ]
+            if valid_lps:
+                result.avg_logprob = sum(valid_lps) / len(valid_lps)
 
         with self._lock:
             self._last_metrics = result.metrics

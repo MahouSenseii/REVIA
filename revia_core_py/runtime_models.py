@@ -33,6 +33,7 @@ class TurnRecord:
     user_text: str
     response_mode: str
     lifecycle_state: str = RequestLifecycleState.IDLE.value
+    lifecycle_reason: str = ""
     started_at: float = field(default_factory=time.monotonic)
     metadata: dict = field(default_factory=dict)
 
@@ -87,6 +88,7 @@ class TurnManager:
         started_at = time.monotonic()
         normalized_user = self._signature(user_text)
         request_id = self._make_request_id(source, normalized_user, started_at)
+        metadata_dict = dict(metadata or {})
         with self._lock:
             record = TurnRecord(
                 request_id=request_id,
@@ -95,8 +97,9 @@ class TurnManager:
                 user_text=str(user_text or ""),
                 response_mode=str(response_mode),
                 lifecycle_state=RequestLifecycleState.THINKING.value,
+                lifecycle_reason=str(metadata_dict.get("trigger_reason") or "request_received"),
                 started_at=started_at,
-                metadata=dict(metadata or {}),
+                metadata=metadata_dict,
             )
             self._next_turn_id += 1
             self._current_request_id = request_id
@@ -117,6 +120,7 @@ class TurnManager:
                 else str(lifecycle_state)
             )
             self._active_turn.lifecycle_state = state_value
+            self._active_turn.lifecycle_reason = str(reason or "")
         self._log(
             f"Turn state | request_id={request_id} | state={state_value}"
             + (f" | reason={reason}" if reason else "")
@@ -181,6 +185,7 @@ class TurnManager:
                     "source": active.source,
                     "response_mode": active.response_mode,
                     "lifecycle_state": active.lifecycle_state,
+                    "lifecycle_reason": active.lifecycle_reason,
                     "started_at_monotonic": round(active.started_at, 3),
                 },
                 "last_response_mode": self._last_committed_mode,

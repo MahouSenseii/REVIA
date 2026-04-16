@@ -40,8 +40,12 @@ void WsServer::stop() {
 }
 
 void WsServer::broadcast(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(clients_mtx_);
-    for (auto& client : server_.getClients()) {
+    // getClients() returns a snapshot copy under IXWebSocket's own internal lock,
+    // so iterating the returned container is safe even if clients connect/disconnect
+    // concurrently.  Holding clients_mtx_ here would not protect the IXWebSocket-
+    // internal list; copying first is the correct fix.
+    auto clients = server_.getClients();
+    for (auto& client : clients) {
         client->send(msg);
     }
 }
@@ -59,8 +63,8 @@ void WsServer::flush_broadcasts() {
         messages.swap(broadcast_queue_);
     }
     if (messages.empty()) return;
-    std::lock_guard<std::mutex> lk(clients_mtx_);
-    for (auto& client : server_.getClients()) {
+    auto clients = server_.getClients();
+    for (auto& client : clients) {
         for (auto& msg : messages) {
             client->send(msg);
         }

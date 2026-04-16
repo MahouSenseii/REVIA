@@ -1,5 +1,6 @@
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel, QWidget,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -10,7 +11,9 @@ class InferencePanel(QFrame):
         super().__init__(parent)
         self.event_bus = event_bus
         self.setObjectName("inferencePanel")
-        self.setFixedHeight(170)
+        self.setMinimumHeight(140)
+        self.setMaximumHeight(220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -51,7 +54,8 @@ class InferencePanel(QFrame):
 
         cam_frame = QFrame()
         cam_frame.setObjectName("webcamFrame")
-        cam_frame.setMinimumWidth(200)
+        cam_frame.setMinimumWidth(160)
+        cam_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cam_layout = QVBoxLayout(cam_frame)
         cam_layout.setAlignment(Qt.AlignCenter)
 

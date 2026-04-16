@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from enum import Enum
 
@@ -64,14 +65,22 @@ class AssistantStatusManager(QObject):
         self.profile_tab = profile_tab
         self.chat_panel = chat_panel
         self.audio_service = audio_service
-        self._last_telemetry = {}
+        self._last_telemetry: dict = {}
+        self._telemetry_lock = threading.Lock()
         self._pending_runtime_emit = False
         self._last_runtime_signature = ""
         self._last_ui_signature = ""
         self._assistant_state = EAssistantState.IDLE
         self._request_state = EAssistantState.IDLE
         self._request_id = ""
+        self._request_stage = ""
         self._assistant_error = ""
+        self._request_started_at = None
+        self._request_generation_started_at = None
+        self._request_last_thinking_duration = 0.0
+        self._request_last_generation_duration = 0.0
+        self._request_last_total_duration = 0.0
+        self._request_current_elapsed = 0.0
         self._stt_state = (
             ESTTState.IDLE
             if self.audio_service and self.audio_service.is_stt_available()
@@ -176,14 +185,18 @@ class AssistantStatusManager(QObject):
 
     def _on_telemetry(self, data):
         if isinstance(data, dict):
-            self._last_telemetry = dict(data)
+            with self._telemetry_lock:
+                self._last_telemetry = dict(data)
+            self._sync_request_state_from_telemetry(data)
         self.refresh_status(emit_runtime=True)
 
     def _on_request_accepted(self, payload):
         if not isinstance(payload, dict):
             return
+        self._reset_request_timing()
         self._request_id = str(payload.get("request_id", "") or "")
         self._request_state = EAssistantState.THINKING
+        self._request_stage = "request_accepted"
         self._assistant_error = ""
         self._log(
             f"Request queued | request_id={self._request_id or 'unknown'} | state=Thinking"
@@ -198,8 +211,10 @@ class AssistantStatusManager(QObject):
             return
         if request_id:
             self._request_id = request_id
+        self._mark_request_generation_started()
         if self._request_state != EAssistantState.GENERATING:
             self._request_state = EAssistantState.GENERATING
+            self._request_stage = "llm_decode"
             self._assistant_error = ""
             self._log(
                 f"Generation started | request_id={self._request_id or 'unknown'}"
@@ -217,8 +232,10 @@ class AssistantStatusManager(QObject):
         speakable = bool(payload.get("speakable", True))
         text = str(payload.get("text", "") or "")
         error_type = str(payload.get("error_type", "") or "")
+        self._finish_request_timing()
         self._request_state = EAssistantState.IDLE
         self._request_id = ""
+        self._request_stage = ""
 
         if not success:
             self._assistant_error = error_type or "generation_error"
@@ -230,6 +247,91 @@ class AssistantStatusManager(QObject):
             self._assistant_error = ""
 
         self.refresh_status(emit_runtime=True)
+
+    def _sync_request_state_from_telemetry(self, data):
+        if not isinstance(data, dict):
+            return
+        request_lifecycle = data.get("request_lifecycle", {}) or {}
+        active_request_id = str(request_lifecycle.get("active_request_id", "") or "")
+        active_turn = request_lifecycle.get("active_turn", {}) or {}
+        lifecycle_state = str(active_turn.get("lifecycle_state", "") or "").upper()
+        lifecycle_reason = self._extract_request_stage(active_turn)
+        mapped_state = {
+            "THINKING": EAssistantState.THINKING,
+            "GENERATING": EAssistantState.GENERATING,
+            "SPEAKING": EAssistantState.GENERATING,
+            "ERROR": EAssistantState.ERROR,
+        }.get(lifecycle_state)
+
+        if active_request_id:
+            self._ensure_request_timing_started()
+            if self._request_id != active_request_id:
+                self._request_id = active_request_id
+            self._request_stage = lifecycle_reason
+            if mapped_state is not None:
+                if mapped_state == EAssistantState.GENERATING:
+                    self._mark_request_generation_started()
+                self._request_state = mapped_state
+                if mapped_state == EAssistantState.ERROR:
+                    self._assistant_error = lifecycle_reason or self._assistant_error or "generation_error"
+                else:
+                    self._assistant_error = ""
+        elif self._request_state != EAssistantState.IDLE:
+            self._finish_request_timing()
+            self._request_state = EAssistantState.IDLE
+            self._request_id = ""
+            self._request_stage = ""
+        else:
+            self._request_stage = ""
+
+    def _reset_request_timing(self):
+        now = time.perf_counter()
+        self._request_started_at = now
+        self._request_generation_started_at = None
+        self._request_last_thinking_duration = 0.0
+        self._request_last_generation_duration = 0.0
+        self._request_last_total_duration = 0.0
+        self._request_current_elapsed = 0.0
+
+    def _ensure_request_timing_started(self):
+        if self._request_started_at is None:
+            self._reset_request_timing()
+
+    def _mark_request_generation_started(self):
+        now = time.perf_counter()
+        if self._request_started_at is None:
+            self._request_started_at = now
+        if self._request_generation_started_at is None:
+            self._request_last_thinking_duration = max(
+                0.0,
+                now - self._request_started_at,
+            )
+            self._request_generation_started_at = now
+        self._request_current_elapsed = 0.0
+
+    def _finish_request_timing(self):
+        if self._request_started_at is None:
+            self._request_current_elapsed = 0.0
+            return
+        now = time.perf_counter()
+        if self._request_generation_started_at is not None:
+            self._request_last_generation_duration = max(
+                0.0,
+                now - self._request_generation_started_at,
+            )
+        else:
+            self._request_last_thinking_duration = max(
+                self._request_last_thinking_duration,
+                now - self._request_started_at,
+            )
+            self._request_last_generation_duration = 0.0
+        self._request_last_total_duration = max(
+            0.0,
+            now - self._request_started_at,
+        )
+        self._request_started_at = None
+        self._request_generation_started_at = None
+        self._request_current_elapsed = 0.0
 
     def _on_stt_listening_started(self):
         now = time.perf_counter()
@@ -479,6 +581,7 @@ class AssistantStatusManager(QObject):
         self._assistant_error = ""
         self._request_state = EAssistantState.IDLE
         self._request_id = ""
+        self._request_stage = ""
         self._log("Assistant output interrupted")
         self._on_tts_playback_interrupted()
         self._on_tts_session_finished(True)
@@ -492,6 +595,19 @@ class AssistantStatusManager(QObject):
         self._on_tts_session_finished(False)
 
     def _on_live_timer(self):
+        if self._request_state == EAssistantState.THINKING and self._request_started_at is not None:
+            self._request_current_elapsed = max(
+                0.0,
+                time.perf_counter() - self._request_started_at,
+            )
+        elif self._request_state == EAssistantState.GENERATING and self._request_generation_started_at is not None:
+            self._request_current_elapsed = max(
+                0.0,
+                time.perf_counter() - self._request_generation_started_at,
+            )
+        else:
+            self._request_current_elapsed = 0.0
+
         if self._stt_state == ESTTState.LISTENING and self._stt_listen_started_at is not None:
             self._stt_current_elapsed = max(
                 0.0,
@@ -560,7 +676,7 @@ class AssistantStatusManager(QObject):
             self._pending_runtime_emit = True
             self._log(
                 "Assistant status refresh | "
-                f"assistant={snapshot['assistant_state']} | "
+                f"assistant={snapshot['assistant_state_display']} | "
                 f"model={snapshot['current_model_name']} | "
                 f"stt={snapshot['stt_state']} | "
                 f"tts={snapshot['tts_state']}"
@@ -573,7 +689,8 @@ class AssistantStatusManager(QObject):
         self._update_live_timer_state()
 
     def get_assistant_status_snapshot(self) -> dict:
-        telemetry = dict(self._last_telemetry or {})
+        with self._telemetry_lock:
+            telemetry = dict(self._last_telemetry or {})
         emotion = telemetry.get("emotion", {}) or {}
         llm = telemetry.get("llm_connection", {}) or {}
         runtime = telemetry.get("runtime_status", {}) or {}
@@ -635,12 +752,20 @@ class AssistantStatusManager(QObject):
         vision_enabled = self._is_vision_enabled()
         vision_model = self._get_vision_model()
         vision_state = self._derive_vision_state(vision_enabled)
+        thinking_timer = self._get_thinking_timer()
         stt_timer = self._get_stt_timer()
         tts_timer = self._get_tts_timer()
+        tts_generation_timer = self._get_tts_generation_timer()
 
         self._assistant_state = self._derive_assistant_state()
+        assistant_state_detail = self._get_assistant_state_detail()
         snapshot = {
             "assistant_state": self._assistant_state.value,
+            "assistant_state_detail": assistant_state_detail,
+            "assistant_state_display": self._format_assistant_state_display(
+                self._assistant_state.value,
+                assistant_state_detail,
+            ),
             "model_name": model_name,
             "model_ready": str(llm.get("state", "Disconnected")) == "Ready",
             "model_state": str(llm.get("state", "Disconnected")),
@@ -655,6 +780,16 @@ class AssistantStatusManager(QObject):
             "vision_state": vision_state,
             "current_emotion": current_emotion,
             "current_persona": current_persona,
+            "thinking_timer": round(thinking_timer, 3),
+            "thinking_last_duration": round(self._request_last_thinking_duration, 3),
+            "thinking_current_elapsed": round(
+                self._request_current_elapsed
+                if self._request_state == EAssistantState.THINKING
+                else 0.0,
+                3,
+            ),
+            "request_last_generation_duration": round(self._request_last_generation_duration, 3),
+            "request_last_total_duration": round(self._request_last_total_duration, 3),
             "stt_enabled": self._is_stt_enabled(),
             "stt_state": self._stt_state.value,
             "stt_timer": round(stt_timer, 3),
@@ -666,12 +801,14 @@ class AssistantStatusManager(QObject):
             "tts_enabled": self._is_tts_enabled(),
             "tts_state": self._tts_state.value,
             "tts_timer": round(tts_timer, 3),
+            "tts_generation_timer": round(tts_generation_timer, 3),
             "tts_last_generation_duration": round(self._tts_last_generation_duration, 3),
             "tts_last_playback_duration": round(self._tts_last_playback_duration, 3),
             "tts_last_total_duration": round(self._tts_last_total_duration, 3),
             "tts_current_elapsed": round(self._tts_current_elapsed, 3),
             "tts_error": self._tts_error,
             "last_error": self._assistant_error,
+            "active_request_id": self._request_id,
             "current_model_name": model_name,
             "active_persona_profile_name": current_persona,
             "content_filter_level": filter_level,
@@ -685,9 +822,11 @@ class AssistantStatusManager(QObject):
             "tool_access_enabled": self.system_tab.websearch_toggle.isChecked(),
             "ui_state": self._assistant_state.value,
         }
+        snapshot["thinking_time_text"] = self._format_thinking_time(snapshot)
         snapshot["stt_status_text"] = self.get_formatted_stt_status(snapshot)
         snapshot["stt_time_text"] = self._format_stt_time(snapshot)
         snapshot["tts_status_text"] = self.get_formatted_tts_status(snapshot)
+        snapshot["tts_generation_time_text"] = self._format_tts_generation_time(snapshot)
         snapshot["tts_time_text"] = self._format_tts_time(snapshot)
         return snapshot
 
@@ -738,6 +877,8 @@ class AssistantStatusManager(QObject):
             "safe_mode_enabled": snapshot["filters_enabled"],
             "moderation_mode": snapshot["content_filter_level"],
             "ui_state": snapshot["assistant_state"],
+            "assistant_state_detail": snapshot["assistant_state_detail"],
+            "assistant_state_display": snapshot["assistant_state_display"],
             "tts_engine": snapshot["tts_engine"],
             "stt_mode": snapshot["stt_mode"],
             "assistant_state": snapshot["assistant_state"],
@@ -778,6 +919,12 @@ class AssistantStatusManager(QObject):
     def _format_stt_time(self, snapshot: dict) -> str:
         return f"{float(snapshot.get('stt_timer', 0.0) or 0.0):.2f}s"
 
+    def _format_thinking_time(self, snapshot: dict) -> str:
+        return f"{float(snapshot.get('thinking_timer', 0.0) or 0.0):.2f}s"
+
+    def _format_tts_generation_time(self, snapshot: dict) -> str:
+        return f"{float(snapshot.get('tts_generation_timer', 0.0) or 0.0):.2f}s"
+
     def _format_tts_time(self, snapshot: dict) -> str:
         return f"{float(snapshot.get('tts_timer', 0.0) or 0.0):.2f}s"
 
@@ -786,6 +933,8 @@ class AssistantStatusManager(QObject):
             return EAssistantState.SPEAKING
         if self._tts_state == ETTSState.GENERATING:
             return EAssistantState.GENERATING
+        if self._request_state == EAssistantState.ERROR:
+            return EAssistantState.ERROR
         if self._request_state in (EAssistantState.THINKING, EAssistantState.GENERATING):
             return self._request_state
         if self._stt_state in (ESTTState.LISTENING, ESTTState.PROCESSING):
@@ -798,9 +947,15 @@ class AssistantStatusManager(QObject):
             return EAssistantState.ERROR
         return EAssistantState.IDLE
 
+    def _get_assistant_state_detail(self) -> str:
+        if self._assistant_state not in (EAssistantState.THINKING, EAssistantState.GENERATING):
+            return ""
+        return str(self._request_stage or "").strip()
+
     def _update_live_timer_state(self):
         active = (
-            self._stt_state in (ESTTState.LISTENING, ESTTState.PROCESSING)
+            self._request_state in (EAssistantState.THINKING, EAssistantState.GENERATING)
+            or self._stt_state in (ESTTState.LISTENING, ESTTState.PROCESSING)
             or self._tts_state in (ETTSState.GENERATING, ETTSState.SPEAKING)
         )
         if active and not self._live_timer.isActive():
@@ -840,14 +995,25 @@ class AssistantStatusManager(QObject):
             return max(0.0, float(self._stt_current_elapsed or 0.0))
         return 0.0
 
+    def _get_thinking_timer(self) -> float:
+        if self._request_state == EAssistantState.THINKING:
+            return max(0.0, float(self._request_current_elapsed or 0.0))
+        return max(0.0, float(self._request_last_thinking_duration or 0.0))
+
     def _get_tts_timer(self) -> float:
         if self._tts_state in (ETTSState.GENERATING, ETTSState.SPEAKING):
             return max(0.0, float(self._tts_current_elapsed or 0.0))
         return 0.0
 
+    def _get_tts_generation_timer(self) -> float:
+        if self._tts_state == ETTSState.GENERATING:
+            return max(0.0, float(self._tts_current_elapsed or 0.0))
+        return max(0.0, float(self._tts_last_generation_duration or 0.0))
+
     def _signature(self, snapshot: dict, *, include_elapsed: bool) -> str:
         parts = [
             str(snapshot.get("assistant_state", "")),
+            str(snapshot.get("assistant_state_detail", "")),
             str(snapshot.get("model_name", "")),
             str(snapshot.get("model_state", "")),
             str(snapshot.get("online_enabled", False)),
@@ -860,6 +1026,7 @@ class AssistantStatusManager(QObject):
             str(snapshot.get("vision_state", "")),
             str(snapshot.get("current_emotion", "")),
             str(snapshot.get("current_persona", "")),
+            f"{float(snapshot.get('thinking_last_duration', 0.0) or 0.0):.3f}",
             str(snapshot.get("stt_enabled", False)),
             str(snapshot.get("stt_state", "")),
             str(snapshot.get("stt_error", "")),
@@ -874,11 +1041,26 @@ class AssistantStatusManager(QObject):
         if include_elapsed:
             parts.extend(
                 (
+                    f"{float(snapshot.get('thinking_current_elapsed', 0.0) or 0.0):.2f}",
                     f"{float(snapshot.get('stt_current_elapsed', 0.0) or 0.0):.2f}",
                     f"{float(snapshot.get('tts_current_elapsed', 0.0) or 0.0):.2f}",
                 )
             )
         return "|".join(parts)
+
+    @staticmethod
+    def _extract_request_stage(active_turn: dict) -> str:
+        if not isinstance(active_turn, dict):
+            return ""
+        return str(active_turn.get("lifecycle_reason", "") or "").strip()
+
+    @staticmethod
+    def _format_assistant_state_display(state: str, detail: str) -> str:
+        state_text = str(state or "Unknown").strip() or "Unknown"
+        detail_text = str(detail or "").strip()
+        if detail_text:
+            return f"{state_text} | {detail_text}"
+        return state_text
 
     def cleanup(self):
         """Stop all timers and clean up resources."""

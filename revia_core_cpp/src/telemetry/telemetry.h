@@ -103,6 +103,7 @@ private:
     std::string state_ = "Idle";
     Clock::time_point epoch_;
     std::ofstream log_file_;
+    int write_count_ = 0;  // Counts unflushed JSONL writes; flush every 50 entries
     ~TelemetryEngine();  // Destructor to flush and close log file
 };
 

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.revia_states import (
+    STATE_IDLE,
+    STATE_THINKING,
+    INTERRUPTIBLE_STATES,
+)
+
 
 @dataclass
 class BehaviorDecision:
@@ -75,7 +81,7 @@ class ConversationBehaviorController:
         status = self._status_provider() or {}
         if not self._is_assistant_speaking():
             return self._blocked(source, "nothing is speaking")
-        if status.get("state") not in ("Speaking", "Thinking"):
+        if status.get("state") not in INTERRUPTIBLE_STATES:
             return self._blocked(source, "assistant is not interruptible right now")
         return self._allowed(source, reason)
 
@@ -129,19 +135,23 @@ class ConversationBehaviorController:
                 return self._blocked(source, "user is speaking")
             if self._is_assistant_speaking():
                 return self._blocked(source, "assistant is already speaking")
-            if runtime_state != "Idle":
+            if runtime_state != STATE_IDLE:
                 return self._blocked(source, f"state={runtime_state}")
             remaining = float(cooldowns.get("autonomous", 0.0) or 0.0)
             if remaining > 0.0 and not force:
                 return self._blocked(source, f"autonomous cooldown active ({remaining:.1f}s)")
         else:
-            if self._is_assistant_speaking():
-                return self._blocked(source, "assistant is already speaking")
-            if runtime_state in ("Thinking", "Speaking", "Cooldown"):
+            # User-initiated messages should feel like a real conversation:
+            # the user can always send, can interrupt Revia mid-sentence,
+            # and is never gated by pacing cooldowns (those exist to pace
+            # Revia's autonomous speech, not the human on the other end).
+            #
+            # The only legitimate block is THINKING — a request is already
+            # in-flight and we'd race with it. SPEAKING is handled by the
+            # chat panel (it interrupts before sending). COOLDOWN is
+            # explicitly non-blocking here.
+            if runtime_state == STATE_THINKING:
                 return self._blocked(source, f"state={runtime_state}")
-            remaining = float(cooldowns.get("response", 0.0) or 0.0)
-            if remaining > 0.0 and not force:
-                return self._blocked(source, f"response cooldown active ({remaining:.1f}s)")
 
         return self._allowed(source, reason)
 

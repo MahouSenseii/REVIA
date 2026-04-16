@@ -37,6 +37,9 @@ class REVIATwitchBot:
         self.messages_processed = 0
         self._counter_lock = threading.Lock()
 
+        # Sing command handler (set externally by IntegrationManager)
+        self.sing_command_handler = None
+
         # Cache frequently-read config values at init time
         self._cooldown_s: float = config.get("user_cooldown_s", 3)  # Reduced from 8 to 3 seconds
         self._cache_ttl_s: float = config.get("cache_ttl_s", 300)
@@ -67,12 +70,19 @@ class REVIATwitchBot:
         """Record response time. Must be called under _cooldown_lock."""
         now = time.monotonic()
         self._cooldowns[username] = now
-        # Evict expired cooldown entries to prevent unbounded growth
+        # Evict expired cooldown entries to prevent unbounded growth.
+        # If no entries are expired (all users were very recently active), fall back
+        # to removing the oldest entry so the dict never exceeds the cap.
         if len(self._cooldowns) > 500:
             cutoff = now - max(self._cooldown_s * 10, 300)
             expired = [u for u, ts in self._cooldowns.items() if ts < cutoff]
-            for u in expired:
-                del self._cooldowns[u]
+            if expired:
+                for u in expired:
+                    del self._cooldowns[u]
+            else:
+                # All entries are fresh — remove the single oldest to stay under cap
+                oldest = min(self._cooldowns, key=self._cooldowns.__getitem__)
+                del self._cooldowns[oldest]
 
     def _record_response_locked(self, username: str):
         """Record response time with lock acquisition."""
@@ -271,6 +281,32 @@ class REVIATwitchBot:
                 loop, author, text,
                 lambda r: ctx.send(f"@{author} {r}"),
             )
+
+        # !sing command — routes to SingCommandHandler
+        @_Bot.command(name="sing")
+        async def _cmd_sing(ctx: twitchio_commands.Context):
+            raw = ctx.message.content
+            parts = raw.split(maxsplit=1)
+            args = parts[1].strip() if len(parts) > 1 else ""
+            author = ctx.author.name
+
+            handler = parent.sing_command_handler
+            if not handler:
+                await ctx.send(f"@{author} Sing mode is not enabled yet!")
+                return
+
+            # Run command handler in executor to avoid blocking
+            loop = asyncio.get_running_loop()
+            try:
+                reply = await loop.run_in_executor(
+                    parent._executor, handler.handle, args, author
+                )
+                if reply:
+                    max_len = parent.config.get("max_response_len", 450)
+                    await ctx.send(f"@{author} {_truncate(reply, max_len)}")
+            except Exception as exc:
+                logger.error("[Twitch] !sing command error: %s", exc)
+                await ctx.send(f"@{author} Something went wrong with !sing.")
 
         return _Bot()
 

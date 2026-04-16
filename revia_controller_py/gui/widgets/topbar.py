@@ -1,6 +1,8 @@
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
+
+from app.ui_status import apply_status_style, clear_status_role
 
 
 class PillLabel(QLabel):
@@ -8,8 +10,9 @@ class PillLabel(QLabel):
         super().__init__(text, parent)
         self.setObjectName(object_name)
         self.setAlignment(Qt.AlignCenter)
-        self.setFixedHeight(28)
+        self.setMinimumHeight(28)
         self.setMinimumWidth(80)
+        self.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self.setFont(QFont("Segoe UI", 9))
 
 
@@ -18,7 +21,8 @@ class TopBar(QFrame):
         super().__init__(parent)
         self.event_bus = event_bus
         self.setObjectName("topBar")
-        self.setFixedHeight(44)
+        self.setMinimumHeight(44)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 6, 12, 6)
@@ -102,14 +106,15 @@ class TopBar(QFrame):
         self.health_pill.setText(f"Health: {status}")
         if status in ("Online", "Ready"):
             self.health_pill.setObjectName("healthPillOnline")
+            apply_status_style(self.health_pill, role="success")
         elif status == "Error":
             self.health_pill.setObjectName("healthPill")
-            self.health_pill.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.health_pill, role="error")
         elif status == "Connecting":
             self.health_pill.setObjectName("healthPill")
-            self.health_pill.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.health_pill, role="warning")
         else:
             self.health_pill.setObjectName("healthPill")
-            self.health_pill.setStyleSheet("")
+            clear_status_role(self.health_pill)
         self.health_pill.style().unpolish(self.health_pill)
         self.health_pill.style().polish(self.health_pill)

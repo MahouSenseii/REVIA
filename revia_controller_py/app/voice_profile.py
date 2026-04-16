@@ -1,9 +1,12 @@
 """Voice profile data model and persistence."""
 import json
 import enum
+import logging
 import sys
 from pathlib import Path
 from datetime import datetime
+
+logger = logging.getLogger("revia.voice_profile")
 
 # Voices root: <repo>/voices/  (two parents above this file's package dir)
 _VOICES_ROOT = Path(__file__).resolve().parents[2] / "voices"
@@ -31,12 +34,25 @@ def _resolve_wav_path(stored_path: str) -> str:
         candidate = _VOICES_ROOT / filename
         if candidate.exists():
             return str(candidate)
-        # Search one level deep (profile subdirectories)
+        # Search one level deep (profile subdirectories); warn if the filename
+        # exists in multiple subdirectories — the first match wins but the result
+        # is ambiguous and may be wrong.
+        matches = []
         for subdir in _VOICES_ROOT.iterdir():
             if subdir.is_dir():
                 candidate = subdir / filename
                 if candidate.exists():
-                    return str(candidate)
+                    matches.append(candidate)
+        if len(matches) > 1:
+            logger.warning(
+                "[VoiceProfile] Ambiguous WAV resolution: '%s' found in multiple "
+                "subdirectories (%s). Using first match. Store the full path in the "
+                "profile to resolve this.",
+                filename,
+                ", ".join(str(m) for m in matches),
+            )
+        if matches:
+            return str(matches[0])
     return stored_path
 
 

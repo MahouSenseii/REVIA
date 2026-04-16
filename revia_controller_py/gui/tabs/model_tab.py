@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QProcess, QTimer
 
+from app.ui_status import apply_status_style, clear_status_role
+
 logger = logging.getLogger(__name__)
 
 # Persisted model settings live alongside the top-level config.json
@@ -283,13 +285,11 @@ class ModelTab(QScrollArea):
         self.batch_size.setRange(1, 2048)
         self.batch_size.setValue(512)
         gg.addRow("Batch Size:", self.batch_size)
-        self.batch_size.setVisible(False)  # Internal: auto-configured
 
         self.threads = QSpinBox()
         self.threads.setRange(1, 128)
         self.threads.setValue(4)
         gg.addRow("Threads:", self.threads)
-        self.threads.setVisible(False)  # Internal: auto-configured
 
         self.quant = QComboBox()
         self.quant.addItems([
@@ -297,7 +297,6 @@ class ModelTab(QScrollArea):
             "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
         ])
         gg.addRow("Quantization:", self.quant)
-        self.quant.setVisible(False)  # Internal: auto-configured
 
         layout.addWidget(self.gpu_group)
 
@@ -520,18 +519,18 @@ class ModelTab(QScrollArea):
     def _start_llm_server(self):
         if self._llm_process and self._llm_process.state() == QProcess.Running:
             self.llm_server_status.setText("Server: Already running")
-            self.llm_server_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.llm_server_status, "color: #ccaa00;")
             return
 
         server = self.local_server.currentText()
         exe = self.llm_exe_path.text().strip()
         if not exe:
             self.llm_server_status.setText("Server: Set executable path first")
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
         if not Path(exe).exists():
             self.llm_server_status.setText("Server: Executable path not found")
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
 
         model_file = self.local_path.text().strip()
@@ -547,16 +546,16 @@ class ModelTab(QScrollArea):
                 f"Server: Auto-launch unsupported for {server}. "
                 "Use Ollama/llama.cpp or start externally."
             )
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
 
         if requires_model and not model_file:
             self.llm_server_status.setText("Server: Set model file path first")
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
         if requires_model and not Path(model_file).exists():
             self.llm_server_status.setText("Server: Model file path not found")
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
 
         self._kill_port_listener(port)
@@ -579,7 +578,7 @@ class ModelTab(QScrollArea):
         self._llm_process.start(exe, args)
 
         self.llm_server_status.setText("Server: Starting...")
-        self.llm_server_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.llm_server_status, "color: #ccaa00;")
         self.start_llm_btn.setEnabled(False)
         self.stop_llm_btn.setEnabled(True)
         self._llm_server_kind = server_kind
@@ -598,7 +597,7 @@ class ModelTab(QScrollArea):
         self._llm_ready_attempts = getattr(self, '_llm_ready_attempts', 0) + 1
         if self._llm_ready_attempts > 20:
             self.llm_server_status.setText("Server: Timeout waiting for ready")
-            self.llm_server_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
         ready, models = self._probe_local_server(self.local_server_url.text())
         if ready:
@@ -617,7 +616,7 @@ class ModelTab(QScrollArea):
                     self.llm_server_status.setText(
                         "Server: Running (waiting for model load)"
                     )
-            self.llm_server_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.llm_server_status, "color: #00aa40;")
             return
         self.llm_server_status.setText(
             f"Server: Starting ({self._llm_ready_attempts * 3}s...)"
@@ -641,7 +640,7 @@ class ModelTab(QScrollArea):
             self._llm_process.waitForFinished(3000)
             self._llm_process = None
         self.llm_server_status.setText("Server: Stopped")
-        self.llm_server_status.setStyleSheet("")
+        clear_status_role(self.llm_server_status)
         self.start_llm_btn.setEnabled(True)
         self.stop_llm_btn.setEnabled(False)
         self._llm_server_kind = ""
@@ -668,7 +667,7 @@ class ModelTab(QScrollArea):
         self.llm_server_status.setText(
             f"Server: Exited (code {exit_code})"
         )
-        self.llm_server_status.setStyleSheet("color: #cc3040;")
+        apply_status_style(self.llm_server_status, "color: #cc3040;")
         self.start_llm_btn.setEnabled(True)
         self.stop_llm_btn.setEnabled(False)
         self._llm_server_kind = ""
@@ -923,7 +922,7 @@ class ModelTab(QScrollArea):
         reachable, _ = self._probe_local_server(self.local_server_url.text())
         if reachable:
             self.llm_server_status.setText("Server: Running externally")
-            self.llm_server_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.llm_server_status, "color: #00aa40;")
             self.event_bus.log_entry.emit("[LLM] Found existing local LLM server.")
             return
 
@@ -936,7 +935,7 @@ class ModelTab(QScrollArea):
 
     def _test_connection(self):
         self.conn_status.setText("Status: Connecting...")
-        self.conn_status.setStyleSheet("color: #ccaa00;")
+        apply_status_style(self.conn_status, "color: #ccaa00;")
         self.connect_btn.setEnabled(False)
         from PySide6.QtCore import QTimer
         QTimer.singleShot(100, self._do_test)
@@ -1000,7 +999,7 @@ class ModelTab(QScrollArea):
 
         if not server_url:
             self.conn_status.setText("Status: No server URL specified")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
             return
 
         llm_ok, models = self._probe_local_server(server_url)
@@ -1031,13 +1030,13 @@ class ModelTab(QScrollArea):
                 f"Status: {server} OK ({llm_detail}){file_info} | "
                 f"Core: {'Online' if core_ok else 'Offline'}"
             )
-            self.conn_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.conn_status, "color: #00aa40;")
             self.disconnect_btn.setEnabled(True)
         else:
             self.conn_status.setText(
-                f"Status: {server} at {server_url} — {llm_detail}"
+                f"Status: {server} at {server_url} â€” {llm_detail}"
             )
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
 
     def _test_online(self):
         endpoint = self.api_endpoint.text().strip()
@@ -1047,11 +1046,11 @@ class ModelTab(QScrollArea):
 
         if not endpoint:
             self.conn_status.setText("Status: No endpoint specified")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
             return
         if not key:
             self.conn_status.setText("Status: No API key provided")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
             return
 
         try:
@@ -1093,34 +1092,34 @@ class ModelTab(QScrollArea):
                 self.conn_status.setText(
                     f"Status: Connected to {provider} | Model: {model}"
                 )
-                self.conn_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.conn_status, "color: #00aa40;")
                 self.disconnect_btn.setEnabled(True)
             elif r.status_code == 401:
                 self.conn_status.setText("Status: Invalid API key (401)")
-                self.conn_status.setStyleSheet("color: #cc3040;")
+                apply_status_style(self.conn_status, "color: #cc3040;")
             elif r.status_code == 403:
                 self.conn_status.setText(
-                    "Status: Access denied (403) — check key permissions"
+                    "Status: Access denied (403) â€” check key permissions"
                 )
-                self.conn_status.setStyleSheet("color: #cc3040;")
+                apply_status_style(self.conn_status, "color: #cc3040;")
             else:
                 self.conn_status.setText(
                     f"Status: API returned {r.status_code}"
                 )
-                self.conn_status.setStyleSheet("color: #cc8800;")
+                apply_status_style(self.conn_status, "color: #cc8800;")
         except requests.exceptions.Timeout:
             self.conn_status.setText("Status: Connection timed out")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
         except requests.exceptions.ConnectionError:
             self.conn_status.setText("Status: Cannot reach endpoint")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
         except Exception as e:
-            self.conn_status.setText(f"Status: Error — {e}")
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            self.conn_status.setText(f"Status: Error â€” {e}")
+            apply_status_style(self.conn_status, "color: #cc3040;")
 
     def _disconnect(self):
         self.conn_status.setText("Status: Not connected")
-        self.conn_status.setStyleSheet("")
+        clear_status_role(self.conn_status)
         self.disconnect_btn.setEnabled(False)
 
     def _on_core_connection(self, connected):
@@ -1130,14 +1129,14 @@ class ModelTab(QScrollArea):
                 self.conn_status.setText(
                     "Status: Core online (via WebSocket)"
                 )
-                self.conn_status.setStyleSheet("color: #00aa40;")
+                apply_status_style(self.conn_status, "color: #00aa40;")
                 self.disconnect_btn.setEnabled(True)
             if self._pending_source:
                 self._push_config_to_core(self._pending_source)
                 self._pending_source = None
         else:
             self.conn_status.setText("Status: Waiting for core status...")
-            self.conn_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.conn_status, "color: #ccaa00;")
             self.disconnect_btn.setEnabled(False)
 
     def _on_runtime_status(self, data):
@@ -1156,14 +1155,14 @@ class ModelTab(QScrollArea):
             text += f" | Model: {model}"
         self.conn_status.setText(text)
         if state == "Ready":
-            self.conn_status.setStyleSheet("color: #00aa40;")
+            apply_status_style(self.conn_status, "color: #00aa40;")
             self.disconnect_btn.setEnabled(True)
         elif state == "Connecting":
-            self.conn_status.setStyleSheet("color: #ccaa00;")
+            apply_status_style(self.conn_status, "color: #ccaa00;")
             self.disconnect_btn.setEnabled(True)
         elif state == "Error":
-            self.conn_status.setStyleSheet("color: #cc3040;")
+            apply_status_style(self.conn_status, "color: #cc3040;")
             self.disconnect_btn.setEnabled(True)
         else:
-            self.conn_status.setStyleSheet("color: #808898;")
+            apply_status_style(self.conn_status, "color: #808898;")
             self.disconnect_btn.setEnabled(False)

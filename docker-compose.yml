@@ -38,10 +38,12 @@ services:
       - "8123:8123"
       - "8124:8124"
     environment:
-      - REDIS_HOST=revia-redis
-      - REDIS_PORT=6379
-      - REVIA_REST_PORT=8123
-      - REVIA_WS_PORT=8124
+      - REDIS_HOST=${REDIS_HOST:-revia-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REVIA_REST_PORT=${REVIA_REST_PORT:-8123}
+      - REVIA_WS_PORT=${REVIA_WS_PORT:-8124}
+      - REVIA_DISCORD_BOT_TOKEN=${REVIA_DISCORD_BOT_TOKEN:-}
+      - REVIA_TWITCH_OAUTH_TOKEN=${REVIA_TWITCH_OAUTH_TOKEN:-}
     depends_on:
       revia-redis:
         condition: service_healthy

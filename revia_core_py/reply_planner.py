@@ -258,8 +258,8 @@ class ReplyPlanner:
             plan.notes.append("Fallback accept after all regen attempts exhausted")
             plan = self._finalise(plan, best.reply, resolved_emotion, t0)
         elif plan.candidates:
-            # ALE kept triggering; use last candidate
-            plan = self._finalise(plan, plan.candidates[-1], resolved_emotion, t0)
+            # ALE kept triggering; use FIRST candidate (most diverse from prior outputs)
+            plan = self._finalise(plan, plan.candidates[0], resolved_emotion, t0)
             plan.fallback_accept = True
         else:
             plan.final_reply      = ""

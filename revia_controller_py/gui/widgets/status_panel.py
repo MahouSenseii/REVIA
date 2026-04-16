@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.ui_status import apply_status_style, clear_status_role
+
 
 class StatusField(QWidget):
     def __init__(self, label_text, parent=None):
@@ -22,7 +24,8 @@ class StatusField(QWidget):
 
         self.label = QLabel(f"{label_text}:")
         self.label.setFont(QFont("Segoe UI", 9))
-        self.label.setFixedWidth(68)
+        self.label.setMinimumWidth(64)
+        self.label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         self.value = QLabel("---")
@@ -39,7 +42,10 @@ class StatusField(QWidget):
         text = str(value or "---")
         self.value.setText(text)
         self.value.setToolTip(text)
-        self.value.setStyleSheet(style)
+        if style:
+            apply_status_style(self.value, style)
+        else:
+            clear_status_role(self.value)
 
 
 class StatusPanel(QFrame):
@@ -69,6 +75,8 @@ class StatusPanel(QFrame):
 
         self.state_field = StatusField("State")
         self.model_field = StatusField("Model")
+        self.think_time_field = StatusField("Think Time")
+        self.tts_gen_field = StatusField("TTS Gen")
         self.online_field = StatusField("Online")
         self.filter_field = StatusField("Filter")
         self.voice_field = StatusField("Voice")
@@ -82,6 +90,7 @@ class StatusPanel(QFrame):
 
         rows = (
             (self.state_field, self.model_field),
+            (self.think_time_field, self.tts_gen_field),
             (self.online_field, self.filter_field),
             (self.voice_field, self.vision_field),
             (self.stt_field, self.stt_time_field),
@@ -107,6 +116,8 @@ class StatusPanel(QFrame):
             return
         runtime = data.get("runtime_status", {}) or {}
         architecture = (data.get("architecture", {}) or {}).get("modules", {}) or {}
+        request_lifecycle = data.get("request_lifecycle", {}) or {}
+        active_turn = request_lifecycle.get("active_turn", {}) or {}
         if not runtime:
             return
         vision_enabled = bool(
@@ -119,6 +130,7 @@ class StatusPanel(QFrame):
         self._apply_snapshot(
             {
                 "assistant_state": str(data.get("state", "Unknown") or "Unknown"),
+                "assistant_state_detail": str(active_turn.get("lifecycle_reason", "") or ""),
                 "model_name": str(runtime.get("current_model_name") or "---"),
                 "model_ready": bool(runtime.get("model_ready", False)),
                 "model_state": str((data.get("llm_connection", {}) or {}).get("state", "Disconnected")),
@@ -159,6 +171,10 @@ class StatusPanel(QFrame):
 
     def _apply_snapshot(self, snapshot):
         state = str(snapshot.get("assistant_state", "Unknown") or "Unknown")
+        state_display = str(
+            snapshot.get("assistant_state_display")
+            or self._format_state_display(state, snapshot.get("assistant_state_detail"))
+        )
         model_name = str(snapshot.get("model_name", snapshot.get("current_model_name", "---")) or "---")
         model_state = str(snapshot.get("model_state", "Disconnected") or "Disconnected")
         online_enabled = bool(snapshot.get("online_enabled"))
@@ -168,29 +184,39 @@ class StatusPanel(QFrame):
         vision_model = str(snapshot.get("vision_model", "") or "")
         stt_status = str(snapshot.get("stt_status_text", snapshot.get("stt_state", "Disabled")) or "Disabled")
         tts_status = str(snapshot.get("tts_status_text", snapshot.get("tts_state", "Disabled")) or "Disabled")
+        thinking_time = str(snapshot.get("thinking_time_text", "0.00s"))
+        tts_generation_time = str(snapshot.get("tts_generation_time_text", "0.00s"))
 
-        self.state_field.set_status(state, self._state_style(state))
+        self.state_field.set_status(state_display, self._state_style(state))
         self.model_field.set_status(
             f"{model_name} | {model_state}",
             self._state_style(model_state),
         )
+        self.think_time_field.set_status(
+            thinking_time,
+            "color: #6b5d8a;",
+        )
+        self.tts_gen_field.set_status(
+            tts_generation_time,
+            "color: #6b5d8a;",
+        )
         self.online_field.set_status(
             "On" if online_enabled else "Off",
-            self._binary_style(online_enabled, on_style="color: #00aa40;"),
+            self._binary_style(online_enabled, on_style="color: #2dd4bf;"),
         )
         self.filter_field.set_status(
             self._format_toggle_detail(
                 filters_enabled,
                 snapshot.get("filter_level", "standard"),
             ),
-            self._binary_style(filters_enabled, on_style="color: #ccaa00;"),
+            self._binary_style(filters_enabled, on_style="color: #f59e0b;"),
         )
         self.voice_field.set_status(
             self._format_toggle_detail(
                 voice_enabled,
                 snapshot.get("voice_name") or "none",
             ),
-            self._binary_style(voice_enabled, on_style="color: #00aa40;"),
+            self._binary_style(voice_enabled, on_style="color: #2dd4bf;"),
         )
         self.vision_field.set_status(
             self._format_vision_value(vision_state, vision_model),
@@ -199,20 +225,20 @@ class StatusPanel(QFrame):
         self.stt_field.set_status(stt_status, self._state_style(stt_status))
         self.stt_time_field.set_status(
             str(snapshot.get("stt_time_text", "0.00s")),
-            "color: #808898;",
+            "color: #6b5d8a;",
         )
         self.tts_field.set_status(tts_status, self._state_style(tts_status))
         self.tts_time_field.set_status(
             str(snapshot.get("tts_time_text", "0.00s")),
-            "color: #808898;",
+            "color: #6b5d8a;",
         )
         self.emotion_field.set_status(
             snapshot.get("current_emotion", "Neutral"),
-            "color: #808898;",
+            "color: #c084fc;",
         )
         self.persona_field.set_status(
             snapshot.get("current_persona", snapshot.get("active_persona_profile_name", "Revia")),
-            "color: #808898;",
+            "color: #f9a8d4;",
         )
 
     @staticmethod
@@ -231,6 +257,14 @@ class StatusPanel(QFrame):
         return normalized_state or "Off"
 
     @staticmethod
+    def _format_state_display(state, detail):
+        state_text = str(state or "Unknown").strip() or "Unknown"
+        detail_text = str(detail or "").strip()
+        if detail_text:
+            return f"{state_text} | {detail_text}"
+        return state_text
+
+    @staticmethod
     def _fallback_timer_text(runtime, *, timer_key, current_key, state_key, active_states):
         timer_value = runtime.get(timer_key)
         if timer_value is not None:
@@ -246,17 +280,18 @@ class StatusPanel(QFrame):
 
     @staticmethod
     def _binary_style(enabled, *, on_style):
-        return on_style if enabled else "color: #808898;"
+        return on_style if enabled else "color: #6b5d8a;"
 
     @staticmethod
     def _state_style(state):
-        state = str(state or "").lower()
+        state = str(state or "").split("|", 1)[0].strip().lower()
         if state in ("ready", "idle", "complete", "speaking", "listening", "on"):
-            return "color: #00aa40;"
-        if state in ("booting", "initializing", "connecting", "cooldown", "thinking", "generating", "processing", "interrupted"):
-            return "color: #ccaa00;"
+            return "color: #2dd4bf;"          # teal — active / ready
+        if state in ("booting", "initializing", "connecting", "cooldown",
+                     "thinking", "generating", "processing", "interrupted"):
+            return "color: #f59e0b;"          # amber — in-progress
         if state in ("error", "disconnected", "offline"):
-            return "color: #cc3040;"
+            return "color: #f43f5e;"          # red — error
         if state in ("disabled", "off"):
-            return "color: #808898;"
-        return "color: #808898;"
+            return "color: #4a3a6a;"          # muted purple — off
+        return "color: #8b7ab8;"              # muted — unknown
