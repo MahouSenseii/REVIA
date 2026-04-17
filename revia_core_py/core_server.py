@@ -237,9 +237,14 @@ from vllm_backend import VLLMEnhancer, classify_prompt_complexity
 
 _redis_client = None
 _redis_lock = threading.Lock()
+# Tracks last Redis reachability so we only log on state *changes*, not on
+# every retry. Without this, every /api/status poll re-runs _init_redis() and
+# floods the log tab with the same "Redis unavailable" message.
+_redis_last_state = None  # None = unknown, True = up, False = down
+_redis_last_error = ""
 
 def _init_redis():
-    global _redis_client
+    global _redis_client, _redis_last_state, _redis_last_error
     with _redis_lock:
         if _redis_client is not None:
             return  # Already initialized
@@ -255,9 +260,25 @@ def _init_redis():
             )
             c.ping()
             _redis_client = c
-            print(f"[REVIA Core] Redis connected at {host}:{port} -- long-term memory backed by Docker.")
+            if _redis_last_state is not True:
+                print(
+                    f"[REVIA Core] Redis connected at {host}:{port} -- "
+                    f"long-term memory backed by Docker."
+                )
+            _redis_last_state = True
+            _redis_last_error = ""
         except Exception as e:
-            print(f"[REVIA Core] Redis unavailable ({e}). Using local .jsonl files for long-term memory.")
+            err = f"{type(e).__name__}: {e}"
+            # Only print on transition (unknown->down or up->down) or when the
+            # error message itself changes (e.g. module missing vs. connection
+            # refused). Subsequent identical failures are silent.
+            if _redis_last_state is not False or err != _redis_last_error:
+                print(
+                    f"[REVIA Core] Redis unavailable ({err}). "
+                    f"Using local .jsonl files for long-term memory."
+                )
+            _redis_last_state = False
+            _redis_last_error = err
             _redis_client = None
 
 def _get_redis():
@@ -504,10 +525,51 @@ telemetry = TelemetryEngine()
 def _revia_log(message):
     line = f"[Revia] {message}"
     print(line)
+    broadcaster = globals().get("broadcast_json")
+    if not callable(broadcaster):
+        return
     try:
-        broadcast_json({"type": "log_entry", "text": line})
-    except Exception:
-        pass
+        broadcaster({"type": "log_entry", "text": line})
+    except Exception as _e:
+        # WS broadcast failed -- surface it to stdout so it isn't silent.
+        # Do NOT call broadcast_json here (would recurse indefinitely).
+        print(f"[Revia] (log broadcast failed: {type(_e).__name__}: {_e})")
+
+
+# Throttled logger: emits the first occurrence of a given (key) immediately,
+# then suppresses repeats for `cooldown_s` seconds and emits a one-line
+# "(N suppressed)" summary when the next unique-enough event fires.
+# Purpose: stop spamming log tabs with "Blocked: Startup (state=Thinking)"
+# or "Redis unavailable" on every poll. Each caller picks a stable key that
+# identifies the "category" of the message (e.g. "blocked:startup").
+_throttle_lock = threading.Lock()
+_throttle_last_ts: dict[str, float] = {}
+_throttle_suppressed: dict[str, int] = {}
+
+
+def _revia_log_throttled(key: str, message: str, cooldown_s: float = 30.0):
+    """Log ``message`` but collapse repeats within ``cooldown_s`` per ``key``.
+
+    On the first call per key, logs immediately. On subsequent calls within
+    the cooldown window, increments a per-key counter silently. When the
+    cooldown expires and another call arrives, logs the new message prefixed
+    with ``(N repeats suppressed in last Ns)``.
+    """
+    now = time.monotonic()
+    with _throttle_lock:
+        last = _throttle_last_ts.get(key, 0.0)
+        elapsed = now - last
+        if last > 0.0 and elapsed < cooldown_s:
+            _throttle_suppressed[key] = _throttle_suppressed.get(key, 0) + 1
+            return
+        suppressed = _throttle_suppressed.pop(key, 0)
+        _throttle_last_ts[key] = now
+    if suppressed > 0:
+        _revia_log(
+            f"{message} (+{suppressed} repeats suppressed in last {int(cooldown_s)}s)"
+        )
+    else:
+        _revia_log(message)
 
 
 conversation_manager = ConversationManager(log_fn=_revia_log)
@@ -521,7 +583,7 @@ prompt_assembly_manager = PromptAssemblyManager(
 turn_manager = TurnManager(log_fn=_revia_log)
 
 # ---------------------------------------------------------------------------
-# Reinforcement Learning Engine — adaptive behavioral parameter tuning
+# Reinforcement Learning Engine - adaptive behavioral parameter tuning
 # ---------------------------------------------------------------------------
 rl_engine = ReinforcementLearner(
     data_dir=Path(__file__).parent / "data",
@@ -530,7 +592,7 @@ rl_engine = ReinforcementLearner(
 rl_engine.load()
 
 # ---------------------------------------------------------------------------
-# PRD §4 -- Profile Engine (canonical source for all behavioral parameters)
+# PRD section 4 -- Profile Engine (canonical source for all behavioral parameters)
 # ---------------------------------------------------------------------------
 profile_engine = ProfileEngine(log_fn=_revia_log)
 
@@ -597,7 +659,10 @@ class LLMBackend:
         # Per-platform conversation isolation -- Discord and Twitch get their own
         # history so their chat context never bleeds into each other or the GUI.
         self._interrupted = False
-        # vLLM enhanced inference (PRD §18)
+        self._interrupt_reason = ""
+        self._generation_started_monotonic = 0.0
+        self._last_generation_activity_monotonic = 0.0
+        # vLLM enhanced inference (PRD section 18)
         self._vllm = VLLMEnhancer(
             session=self._session,
             log_fn=_revia_log,
@@ -623,20 +688,47 @@ class LLMBackend:
             ),
         }
 
-    def request_interrupt(self):
+    def request_interrupt(self, reason="user"):
         """Signal the LLM to stop generating tokens immediately. Thread-safe."""
         with self._lock:
             self._interrupted = True
+            self._interrupt_reason = str(reason or "user")
 
     def clear_interrupt(self):
         """Reset the interrupt flag before a new generation. Thread-safe."""
         with self._lock:
             self._interrupted = False
+            self._interrupt_reason = ""
 
     def _is_interrupted(self):
         """Check if interrupt has been requested. Thread-safe."""
         with self._lock:
             return self._interrupted
+
+    def _get_interrupt_reason(self):
+        with self._lock:
+            return self._interrupt_reason or "user"
+
+    def _mark_generation_activity(self, started=False):
+        now = time.monotonic()
+        with self._lock:
+            if started:
+                self._generation_started_monotonic = now
+            self._last_generation_activity_monotonic = now
+
+    def generation_idle_seconds(self):
+        with self._lock:
+            last = self._last_generation_activity_monotonic
+        if last <= 0.0:
+            return None
+        return time.monotonic() - last
+
+    def _stream_read_timeout_s(self, env_name, default_s=80.0):
+        try:
+            value = float(os.environ.get(env_name, str(default_s)))
+        except (TypeError, ValueError):
+            value = float(default_s)
+        return max(5.0, min(value, 95.0))
 
     def configure(self, cfg):
         with self._lock:
@@ -668,7 +760,7 @@ class LLMBackend:
                 self.system_prompt = sp
             self._local_health_cache = {"ok": False, "ts": 0.0}
 
-            # vLLM enhanced inference options (PRD §18)
+            # vLLM enhanced inference options (PRD section 18)
             self._vllm_enabled = bool(cfg.get("vllm_enhanced", self._vllm_enabled))
             self._vllm_logprobs = int(cfg.get("vllm_logprobs", self._vllm_logprobs))
             self._vllm_best_of = int(cfg.get("vllm_best_of", self._vllm_best_of))
@@ -727,7 +819,7 @@ class LLMBackend:
                 "api_endpoint": self.api_endpoint,
                 "temperature": self.temperature, "max_tokens": self.max_tokens,
                 "fast_mode": self.fast_mode,
-                # vLLM enhanced options (PRD §18)
+                # vLLM enhanced options (PRD section 18)
                 "vllm_enhanced": self._vllm_enabled,
                 "vllm_logprobs": self._vllm_logprobs,
                 "vllm_best_of": self._vllm_best_of,
@@ -909,7 +1001,7 @@ class LLMBackend:
         if hasattr(self, '_vision_context') and self._vision_context:
             vision_context = f"[Visual context: {self._vision_context}]"
 
-        # PRD §4 -- Pull behavioral parameters from ProfileEngine so the LLM
+        # PRD section 4 -- Pull behavioral parameters from ProfileEngine so the LLM
         # gets verbosity, humor, sarcasm, emotion intensity, mood, etc.
         _pe_profile = profile_engine.current()
         behavior_params = {
@@ -1078,13 +1170,20 @@ class LLMBackend:
         url = endpoint + "/chat/completions"
         full_text = ""
         t0 = time.perf_counter()
+        read_timeout = self._stream_read_timeout_s("REVIA_ONLINE_LLM_READ_TIMEOUT_S", 80.0)
+        last_token_t = t0
+        self._mark_generation_activity(started=True)
 
-        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, 180)) as resp:
+        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, read_timeout)) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                if time.perf_counter() - last_token_t > read_timeout:
+                    raise requests.exceptions.Timeout(
+                        f"OpenAI-compatible stream produced no tokens for {read_timeout:.0f}s"
+                    )
                 # Check for interrupt before processing each token
                 if self._is_interrupted():
-                    _revia_log("LLM generation interrupted by user")
+                    _revia_log(f"LLM generation interrupted by {self._get_interrupt_reason()}")
                     break
                 if not line or not line.startswith(b"data: "):
                     continue
@@ -1096,6 +1195,8 @@ class LLMBackend:
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     tok = delta.get("content", "")
                     if tok:
+                        last_token_t = time.perf_counter()
+                        self._mark_generation_activity()
                         full_text += tok
                         broadcast_fn({"type": "chat_token", "token": tok})
                 except (json.JSONDecodeError, IndexError, KeyError):
@@ -1112,7 +1213,7 @@ class LLMBackend:
             return len(content.split())
         telemetry.llm["context_length"] = sum(_count_words(m["content"]) for m in messages) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
-        # If generation was interrupted, discard partial output — don't commit
+        # If generation was interrupted, discard partial output - don't commit
         if self._is_interrupted():
             return AssistantResponse(
                 text="",
@@ -1165,13 +1266,20 @@ class LLMBackend:
         url = endpoint + "/messages"
         full_text = ""
         t0 = time.perf_counter()
+        read_timeout = self._stream_read_timeout_s("REVIA_ONLINE_LLM_READ_TIMEOUT_S", 80.0)
+        last_token_t = t0
+        self._mark_generation_activity(started=True)
 
-        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, 180)) as resp:
+        with req.post(url, headers=headers, json=body, stream=True, timeout=(10, read_timeout)) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                if time.perf_counter() - last_token_t > read_timeout:
+                    raise requests.exceptions.Timeout(
+                        f"Anthropic stream produced no tokens for {read_timeout:.0f}s"
+                    )
                 # Check for interrupt before processing each token (thread-safe)
                 if self._is_interrupted():
-                    _revia_log("Anthropic generation interrupted by user")
+                    _revia_log(f"Anthropic generation interrupted by {self._get_interrupt_reason()}")
                     break
                 if not line or not line.startswith(b"data: "):
                     continue
@@ -1180,6 +1288,8 @@ class LLMBackend:
                     if chunk.get("type") == "content_block_delta":
                         tok = chunk.get("delta", {}).get("text", "")
                         if tok:
+                            last_token_t = time.perf_counter()
+                            self._mark_generation_activity()
                             full_text += tok
                             broadcast_fn({"type": "chat_token", "token": tok})
                 except (json.JSONDecodeError, KeyError):
@@ -1192,7 +1302,7 @@ class LLMBackend:
         telemetry.llm["tokens_per_second"] = round(tps, 1)
         telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages if isinstance(m["content"], str)) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
-        # If generation was interrupted, discard partial output — don't commit
+        # If generation was interrupted, discard partial output - don't commit
         if self._is_interrupted():
             return AssistantResponse(
                 text="",
@@ -1266,7 +1376,7 @@ class LLMBackend:
                             )
                         break
 
-            # ── vLLM Enhanced Path (PRD §18) ─────────────────────────────
+            # vLLM Enhanced Path (PRD section 18)
             # vLLM is only engaged when ALL conditions are met:
             #   1. vLLM enhanced mode is enabled
             #   2. CUDA is the active backend (vLLM requires GPU)
@@ -1294,10 +1404,20 @@ class LLMBackend:
                 classification = None
 
             if _vllm_candidate and classification and classification.should_use_vllm:
+                self._mark_generation_activity(started=True)
+
+                def _vllm_broadcast(packet):
+                    try:
+                        if isinstance(packet, dict) and packet.get("type") == "chat_token":
+                            self._mark_generation_activity()
+                    except Exception:
+                        pass
+                    broadcast_fn(packet)
+
                 vr = self._vllm.generate(
                     base_url,
                     messages,
-                    broadcast_fn,
+                    _vllm_broadcast,
                     model=model_name or "default",
                     temperature=self.temperature,
                     max_tokens=int(self.max_tokens),
@@ -1333,7 +1453,7 @@ class LLMBackend:
                     # vLLM call failed -- fall through to standard path
                     _revia_log(f"[vLLM] Enhanced path failed: {vr.error}; falling back to standard")
 
-            # ── Standard OpenAI-compat Path ──────────────────────────────
+            # Standard OpenAI-compat Path
             body = {
                 "model": model_name or "default",
                 "messages": messages,
@@ -1348,6 +1468,9 @@ class LLMBackend:
 
             full_text = ""
             t0 = time.perf_counter()
+            read_timeout = self._stream_read_timeout_s("REVIA_LOCAL_LLM_READ_TIMEOUT_S", 80.0)
+            last_token_t = t0
+            self._mark_generation_activity(started=True)
 
             def _response_detail(resp_obj):
                 if resp_obj is None:
@@ -1374,7 +1497,7 @@ class LLMBackend:
                 )
 
             try:
-                resp = req.post(url, json=body, stream=True, timeout=(10, 300))
+                resp = req.post(url, json=body, stream=True, timeout=(10, read_timeout))
                 resp.raise_for_status()
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else None
@@ -1397,16 +1520,22 @@ class LLMBackend:
                                 )
                                 break
                     body["messages"] = messages
-                    resp = req.post(url, json=body, stream=True, timeout=(10, 300))
+                    resp = req.post(url, json=body, stream=True, timeout=(10, read_timeout))
                     resp.raise_for_status()
                 else:
                     raise
 
             with resp:
                 for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                    if time.perf_counter() - last_token_t > read_timeout:
+                        raise requests.exceptions.Timeout(
+                            f"Local LLM stream produced no tokens for {read_timeout:.0f}s"
+                        )
                     # Check for interrupt before processing each token (thread-safe)
                     if self._is_interrupted():
-                        _revia_log("Local LLM generation interrupted by user")
+                        _revia_log(
+                            f"Local LLM generation interrupted by {self._get_interrupt_reason()}"
+                        )
                         break
                     if not line or not line.startswith(b"data: "):
                         continue
@@ -1418,6 +1547,8 @@ class LLMBackend:
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         tok = delta.get("content", "")
                         if tok:
+                            last_token_t = time.perf_counter()
+                            self._mark_generation_activity()
                             full_text += tok
                             broadcast_fn({"type": "chat_token", "token": tok})
                     except (json.JSONDecodeError, IndexError, KeyError):
@@ -1431,7 +1562,7 @@ class LLMBackend:
             if model_name:
                 telemetry.system["model"] = model_name
 
-            # If generation was interrupted, discard partial output — don't commit
+            # If generation was interrupted, discard partial output - don't commit
             if self._is_interrupted():
                 return AssistantResponse(
                     text="",
@@ -2609,7 +2740,7 @@ class MemoryStore:
             self._load_long_term()
 
     # ------------------------------------------------------------------
-    # Load from Redis â†' fallback to local file
+    # Load from Redis ' fallback to local file
     # ------------------------------------------------------------------
 
     def _load_long_term(self):
@@ -3090,8 +3221,13 @@ async def ws_handler(websocket):
                 "state": conversation_manager.current_state,
                 "status": _build_status_payload(),
             }))
-        except Exception:
-            pass
+        except Exception as _e:
+            # Initial status push failed -- client likely disconnected during
+            # handshake. Log once so the failure isn't invisible.
+            print(
+                f"[Core] WS initial status push failed: "
+                f"{type(_e).__name__}: {_e}"
+            )
         async for msg in websocket:
             try:
                 data = _json_loads_fast(msg)
@@ -3099,8 +3235,14 @@ async def ws_handler(websocket):
                     llm_backend.configure(data.get("config", {}))
                     print(f"[Core] Model config updated: {llm_backend.source} / {llm_backend.api_model or llm_backend.local_path}")
                     _broadcast_runtime_status()
-            except Exception:
-                pass
+            except Exception as _e:
+                # Malformed inbound WS message or configure() failed. Don't
+                # silently drop -- operators need to know config updates fail.
+                _msg_preview = str(msg)[:120] if msg is not None else ""
+                _revia_log(
+                    f"WS inbound message handling failed: "
+                    f"{type(_e).__name__}: {_e} | payload_preview={_msg_preview!r}"
+                )
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -3594,7 +3736,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
 
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
 
-    # ── Interrupt-awareness: check early and after every major stage ──────
+    # Interrupt-awareness: check early and after every major stage
     def _pipeline_interrupted() -> bool:
         """Return True if an interrupt was requested since this turn started."""
         return llm_backend._is_interrupted() or not turn_manager.is_current(turn.request_id)
@@ -3779,14 +3921,25 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     f"| mode={response.response_mode} | error_type={response.error_type or 'none'}"
                 )
     except _PipelineInterrupted:
-        # Clean exit — response was already set to an interrupted AssistantResponse
+        # Clean exit - response was already set to an interrupted AssistantResponse
         _revia_log(f"Pipeline interrupted cleanly | request_id={turn.request_id}")
         turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted")
         _set_runtime_state(ReviaState.IDLE, "pipeline interrupted", force=True, broadcast=True)
         _broadcast_runtime_status()
         return ""
     except Exception as e:
-        _revia_log(f"Unhandled pipeline error | request_id={turn.request_id} | error={e}")
+        import traceback as _tb
+        _tb_text = "".join(_tb.format_exception(type(e), e, e.__traceback__))
+        # Keep the log entry short enough to fit in the UI log tab but still
+        # useful: exception type, message, and the deepest 2 frames.
+        _tb_tail = "".join(_tb.format_list(_tb.extract_tb(e.__traceback__)[-2:])).strip()
+        _revia_log(
+            f"Unhandled pipeline error | request_id={turn.request_id} "
+            f"| type={type(e).__name__} | error={e}"
+            + (f" | at={_tb_tail!r}" if _tb_tail else "")
+        )
+        # Full traceback goes to stdout (console) for operators who want more.
+        print(f"[Revia] Unhandled pipeline error traceback:\n{_tb_text}")
         try:
             _active_profile = globals().get("profile") or {}
             _error_text = prompt_assembly_manager._personality_error(
@@ -3912,7 +4065,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     if conversation_manager.current_state == ReviaState.IDLE.value:
         _broadcast_runtime_status()
 
-    # ── Reinforcement Learning: record reward signal for this interaction ─
+    # Reinforcement Learning: record reward signal for this interaction
     try:
         _avs_composite = conversation_manager.state_machine.answer_confidence_last
         _loop_risk = conversation_manager.state_machine.loop_risk_score
@@ -3949,7 +4102,16 @@ def _handle_pipeline_crash(turn, trigger, exc):
     request_id = getattr(turn, "request_id", "") or "unknown"
     turn_id = getattr(turn, "turn_id", 0) or 0
     source = getattr(trigger, "source", TriggerSource.USER_MESSAGE.value)
-    _revia_log(f"Fatal pipeline crash | request_id={request_id} | error={exc}")
+    import traceback as _tb
+    _tb_text = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    _tb_tail = "".join(_tb.format_list(_tb.extract_tb(exc.__traceback__)[-2:])).strip()
+    _revia_log(
+        f"Fatal pipeline crash | request_id={request_id} "
+        f"| type={type(exc).__name__} | error={exc}"
+        + (f" | at={_tb_tail!r}" if _tb_tail else "")
+    )
+    # Traceback to stdout for full post-mortem visibility.
+    print(f"[Revia] Fatal pipeline crash traceback:\n{_tb_text}")
     if not request_id or not turn_manager.is_current(request_id):
         return
     _crash_text = prompt_assembly_manager._personality_error(
@@ -4298,7 +4460,7 @@ def api_runtime_config_post():
 @app.route("/api/interrupt", methods=["POST"])
 def api_interrupt():
     """Signal the LLM to stop generating tokens and cancel queued TTS."""
-    llm_backend.request_interrupt()
+    llm_backend.request_interrupt(reason="user")
     turn_snapshot = turn_manager.snapshot()
     active_request_id = str(turn_snapshot.get("active_request_id", "") or "")
     active_turn = turn_snapshot.get("active_turn", {}) or {}
@@ -4426,7 +4588,7 @@ def api_model_config_set():
     return jsonify({"ok": True, "config": llm_backend.get_config()})
 
 # ---------------------------------------------------------------------------
-# vLLM enhanced inference endpoints (PRD §18)
+# vLLM enhanced inference endpoints (PRD section 18)
 # ---------------------------------------------------------------------------
 
 @app.route("/api/vllm/status", methods=["GET"])
@@ -4542,6 +4704,7 @@ _ALLOWED_PROFILE_KEYS = frozenset({
     "verbosity_label", "fallback_msg", "version",
     "name", "id", "description", "avatar",
     "persona_preset", "persona_definition",
+    "tts_output_device",
     "_schema_version", "_note",
 })
 _MAX_PROFILE_PAYLOAD_BYTES = 64 * 1024
@@ -4576,6 +4739,56 @@ def api_profile_save():
 
     _broadcast_runtime_status()
     return jsonify({"ok": True})
+
+
+@app.route("/api/tts/output", methods=["GET"])
+def api_tts_output_get():
+    """Return the currently-persisted TTS output device routing.
+
+    The controller reads this on startup so the output device picker in the
+    Voice tab reflects whatever the user selected last session. The payload
+    is always shaped ``{"device": <int|str|None>, "label": <str>}`` even if
+    the user has never set one — ``device: null`` means "use OS default".
+    """
+    stored = profile.get("tts_output_device") or {}
+    if not isinstance(stored, dict):
+        stored = {}
+    return jsonify({
+        "device": stored.get("device"),
+        "label": str(stored.get("label") or ""),
+    })
+
+
+@app.route("/api/tts/output", methods=["POST"])
+def api_tts_output_set():
+    """Persist the controller's TTS output device choice.
+
+    Accepts ``{"device": <int|str|null>, "label": <str>}``. An int is a
+    PortAudio device index; a string is a substring name match (both are
+    what ``sounddevice.play(..., device=...)`` understands). ``null`` or
+    empty string resets to the OS default.
+
+    Persistence only — the core does not play audio itself, so there's
+    nothing to reconfigure on the server side. The controller's
+    ``QwenTTSBackend.set_output_device(...)`` is the runtime half of
+    this setting.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "payload must be a JSON object"}), 400
+    device = data.get("device")
+    label = str(data.get("label") or "")
+    if device == "":
+        device = None
+    if device is not None and not isinstance(device, (int, str)):
+        return jsonify({"error": "device must be null, int, or string"}), 400
+    profile["tts_output_device"] = {"device": device, "label": label}
+    try:
+        _save_profile_to_disk()
+    except Exception as exc:
+        return jsonify({"error": f"failed to persist: {exc}"}), 500
+    _broadcast_runtime_status()
+    return jsonify({"ok": True, "device": device, "label": label})
 
 
 def _build_system_prompt(prof):
@@ -5004,6 +5217,192 @@ async def start_ws_server():
 def run_ws():
     asyncio.run(start_ws_server())
 
+
+# ---------------------------------------------------------------------------
+# TurnWatchdog -- force-stops turns stuck in THINKING/GENERATING past a timeout
+# ---------------------------------------------------------------------------
+# Failure mode this guards against: if the LLM hangs, a pipeline stage raises
+# without unwinding state, or any code path transitions runtime_state into
+# THINKING and never transitions back, the conversation state machine gets
+# pinned. The controller-side autonomous gate (see conversation_policy.py)
+# then rejects every startup / autonomous trigger with "state=Thinking",
+# producing the infinite "Blocked: Startup (state=Thinking)" loop.
+#
+# The watchdog polls the turn manager and, if a turn has been active longer
+# than TURN_WATCHDOG_TIMEOUT_S, it (1) logs full diagnostic context, (2)
+# interrupts the LLM, (3) finishes the turn as ERROR, and (4) force-resets
+# runtime_state to IDLE so the next trigger can run.
+# ---------------------------------------------------------------------------
+
+TURN_WATCHDOG_TIMEOUT_S = float(os.environ.get("REVIA_TURN_WATCHDOG_TIMEOUT_S", "100.0"))
+TURN_WATCHDOG_INTERVAL_S = float(os.environ.get("REVIA_TURN_WATCHDOG_INTERVAL_S", "5.0"))
+
+
+class TurnWatchdog:
+    """Background thread that force-stops turns stuck past a timeout."""
+
+    def __init__(self, *, timeout_s: float = 100.0, check_interval_s: float = 5.0):
+        self._timeout_s = float(timeout_s)
+        self._check_interval_s = float(check_interval_s)
+        self._stop_event = threading.Event()
+        self._last_fired_request_id = ""
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="TurnWatchdog", daemon=True
+        )
+        self._thread.start()
+        _revia_log(
+            f"TurnWatchdog started | timeout={self._timeout_s:.0f}s "
+            f"| check_interval={self._check_interval_s:.1f}s"
+        )
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _loop(self):
+        # Wait returns True when stop_event is set, False on timeout.
+        while not self._stop_event.wait(self._check_interval_s):
+            try:
+                self._check_once()
+            except Exception as e:
+                _revia_log(
+                    f"TurnWatchdog: check failed with {type(e).__name__}: {e}"
+                )
+
+    def _check_once(self):
+        snapshot = turn_manager.snapshot()
+        active = snapshot.get("active_turn") or {}
+        request_id = str(snapshot.get("active_request_id") or "")
+        if not request_id or not active:
+            # Turn already finished -- clear re-fire guard so a future stuck
+            # turn with the same request_id (unlikely, but safe) can fire.
+            self._last_fired_request_id = ""
+            return
+
+        started_at = float(active.get("started_at_monotonic", 0.0) or 0.0)
+        if started_at <= 0.0:
+            return
+
+        elapsed = time.monotonic() - started_at
+        if elapsed < self._timeout_s:
+            return
+
+        lifecycle_state = active.get("lifecycle_state", "unknown")
+        lifecycle_reason = active.get("lifecycle_reason", "") or "no_reason"
+        if lifecycle_reason == "llm_decode":
+            try:
+                llm_idle_s = llm_backend.generation_idle_seconds()
+            except Exception:
+                llm_idle_s = None
+            if llm_idle_s is not None and llm_idle_s < self._timeout_s:
+                # Long local generations are okay if tokens are still flowing.
+                return
+
+        # Don't re-fire for the same turn every check interval.
+        if request_id == self._last_fired_request_id:
+            return
+        self._last_fired_request_id = request_id
+
+        # Gather diagnostics BEFORE we tear things down.
+        source = active.get("source", "unknown")
+        response_mode = active.get("response_mode", "unknown")
+        turn_id = int(active.get("turn_id", 0) or 0)
+        runtime_state = conversation_manager.current_state
+        llm_state = "unknown"
+        llm_detail = ""
+        try:
+            llm_snap = llm_backend.connection_snapshot() or {}
+            llm_state = str(llm_snap.get("state", "unknown"))
+            llm_detail = str(llm_snap.get("detail", ""))
+        except Exception:
+            pass
+
+        _revia_log(
+            "TurnWatchdog: force-stopping stuck turn "
+            f"| request_id={request_id} | turn_id={turn_id} "
+            f"| elapsed={elapsed:.1f}s (> {self._timeout_s:.0f}s) "
+            f"| source={source} | response_mode={response_mode} "
+            f"| lifecycle={lifecycle_state} ({lifecycle_reason}) "
+            f"| runtime_state={runtime_state} "
+            f"| llm={llm_state}"
+            + (f" ({llm_detail})" if llm_detail else "")
+        )
+
+        # 1. Signal the LLM to stop generating tokens.
+        try:
+            llm_backend.request_interrupt(reason="watchdog_timeout")
+        except Exception as e:
+            _revia_log(
+                f"TurnWatchdog: LLM interrupt failed: {type(e).__name__}: {e}"
+            )
+
+        # 2. Finish the turn in ERROR so the turn manager releases the slot.
+        try:
+            turn_manager.finish_turn(
+                request_id,
+                lifecycle_state=RequestLifecycleState.ERROR,
+                reason=f"watchdog_timeout_{int(self._timeout_s)}s",
+            )
+        except Exception as e:
+            _revia_log(
+                f"TurnWatchdog: finish_turn failed: {type(e).__name__}: {e}"
+            )
+
+        # 3. Force runtime state back to IDLE so new triggers can actually fire.
+        try:
+            _set_runtime_state(
+                ReviaState.IDLE,
+                f"watchdog timeout after {int(self._timeout_s)}s "
+                f"(was {runtime_state}, lifecycle={lifecycle_state})",
+                force=True,
+                broadcast=True,
+            )
+        except Exception as e:
+            _revia_log(
+                f"TurnWatchdog: runtime state reset failed: {type(e).__name__}: {e}"
+            )
+
+        # 4. Notify the UI that the request errored out with full context.
+        try:
+            error_payload = AssistantResponse(
+                text="",
+                response_mode=ResponseMode.ERROR_RESPONSE.value,
+                success=False,
+                error_type="watchdog_timeout",
+                retryable=True,
+                speakable=False,
+                commit_to_history=False,
+                commit_to_memory=False,
+                metadata={
+                    "elapsed_s": round(elapsed, 2),
+                    "timeout_s": self._timeout_s,
+                    "lifecycle_state_at_timeout": lifecycle_state,
+                    "lifecycle_reason_at_timeout": lifecycle_reason,
+                    "runtime_state_before_reset": runtime_state,
+                    "llm_state": llm_state,
+                    "source": source,
+                },
+            ).to_payload(request_id, turn_id)
+            broadcast_json(error_payload)
+            broadcast_json(
+                {"type": "telemetry_update", "data": _build_status_payload()}
+            )
+        except Exception as e:
+            _revia_log(
+                f"TurnWatchdog: broadcast failed: {type(e).__name__}: {e}"
+            )
+
+
+turn_watchdog = TurnWatchdog(
+    timeout_s=TURN_WATCHDOG_TIMEOUT_S,
+    check_interval_s=TURN_WATCHDOG_INTERVAL_S,
+)
+
+
 def main():
     print("=" * 50)
     print("  REVIA Core (Python)  v1.2.0")
@@ -5013,6 +5412,12 @@ def main():
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
     time.sleep(0.3)
+
+    # Watchdog: force-stops any turn stuck in THINKING/GENERATING > timeout.
+    # Without this, a hung LLM call pins conversation_manager.current_state
+    # in THINKING, which causes the controller to reject every subsequent
+    # autonomous trigger with "Blocked: Startup (state=Thinking)".
+    turn_watchdog.start()
 
     # Start any enabled platform integrations (Discord / Twitch)
     if integration_manager is not None:

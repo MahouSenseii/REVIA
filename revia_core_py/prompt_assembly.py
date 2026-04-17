@@ -150,6 +150,7 @@ class PromptAssemblyManager:
     def __init__(self, log_fn, profile_manager: CharacterProfileManager):
         self._log = log_fn
         self._profile_manager = profile_manager
+        self._warned_generic_assistant = False
 
     def _personality_error(self, profile_name, error_type, profile: dict | None = None):
         """Generate in-character error response.
@@ -209,9 +210,9 @@ class PromptAssemblyManager:
         memory_context: str,
         emotion_context: str,
         response_mode: str,
-        # PRD §13 — HFL prosody / behavioral hints (optional)
+        # PRD section 13 - HFL prosody / behavioral hints (optional)
         hfl_prosody_hints: dict | None = None,
-        # PRD §4 — profile behavioral parameters (optional; sourced from ProfileEngine)
+        # PRD section 4 - profile behavioral parameters (optional; sourced from ProfileEngine)
         behavior_params: dict | None = None,
         # Vision context from camera/YOLO pipeline (optional)
         vision_context: str = "",
@@ -246,7 +247,7 @@ class PromptAssemblyManager:
         if memory_context:
             parts.append("--- Memory Context ---\n" + memory_context)
 
-        # PRD §4 / §13 — inject behavioral parameters so the LLM respects profile settings
+        # PRD section 4 / section 13 - inject behavioral parameters so the LLM respects profile settings
         behavioral_section = self._build_behavioral_context(
             prof, behavior_params, hfl_prosody_hints
         )
@@ -275,7 +276,11 @@ class PromptAssemblyManager:
             )
             return False
         if "generic assistant" in str(system_text or "").lower():
-            self._log("Prompt validation warning: generic assistant wording detected in prompt context")
+            if not self._warned_generic_assistant:
+                self._warned_generic_assistant = True
+                self._log(
+                    "Prompt validation warning: generic assistant wording detected in prompt context"
+                )
         return True
 
     def _build_behavioral_context(
@@ -293,7 +298,7 @@ class PromptAssemblyManager:
         """
         lines: list[str] = []
 
-        # ── Behavioral parameters (PRD §4) ────────────────────────────────
+        # Behavioral parameters (PRD section 4)
         bp = behavior_params or {}
 
         verbosity_raw = bp.get(
@@ -367,7 +372,7 @@ class PromptAssemblyManager:
         if sarcasm is not None and _safe_float(sarcasm, 0.0) > 0.15:
             lines.append("Sarcasm is okay in moderation when context calls for it.")
 
-        # ── Speech quirks and catchphrases ──────────────────────────────
+        # Speech quirks and catchphrases
         quirks = prof.get("speech_quirks", [])
         if quirks:
             quirk_list = ", ".join(f'"{q}"' for q in quirks[:8])
@@ -379,14 +384,14 @@ class PromptAssemblyManager:
                 f"organically, not mechanically."
             )
 
-        # ── Reply type tendencies ────────────────────────────────────────
+        # Reply type tendencies
         reply_weights = prof.get("reply_type_weights", {})
         if reply_weights:
             dominant = sorted(reply_weights.items(), key=lambda x: x[1], reverse=True)[:3]
             style_hints = ", ".join(f"{k} ({v:.0%})" for k, v in dominant)
             lines.append(f"Response style mix: lean toward {style_hints}.")
 
-        # ── HFL prosody hints (PRD §13) ───────────────────────────────────
+        # HFL prosody hints (PRD section 13)
         if hfl_prosody_hints:
             affect_mode = hfl_prosody_hints.get("affect_mode", "natural")
             rate        = hfl_prosody_hints.get("rate_multiplier", 1.0)

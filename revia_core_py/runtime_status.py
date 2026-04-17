@@ -105,7 +105,7 @@ class RuntimeStatusManager:
                     if self._controller_state.get(key) != value:
                         changed_keys.append(key)
                     self._controller_state[key] = value
-        # Only log when something actually changed — prevents log spam from
+        # Only log when something actually changed - prevents log spam from
         # identical config pushes during startup signal bursts.
         _LOG_KEYS = {
             "online_enabled", "web_search_enabled", "safety_filter_enabled",

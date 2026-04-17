@@ -117,6 +117,13 @@ class QwenTTSBackend(QObject):
         self._playback_lock = threading.Lock()
         self._interrupt_requested = False
         self._playback_active = False
+        # Output device routing. ``None`` means the OS default device.
+        # A non-None value is passed to ``sd.play(..., device=...)`` which
+        # accepts an int index (from ``sd.query_devices()``) or a substring
+        # name match. Stored as whatever the UI gave us so the reverse
+        # lookup for display stays stable.
+        self._output_device = None
+        self._output_device_label = ""
 
     @property
     def engine_name(self):
@@ -127,6 +134,36 @@ class QwenTTSBackend(QObject):
 
     def set_qwen_server(self, url):
         self._qwen_url = url.rstrip("/") if url else ""
+
+    def set_output_device(self, device, label: str = ""):
+        """Route TTS playback to a specific output device.
+
+        ``device`` can be:
+          - ``None`` or ``""`` — use the OS default output device
+          - an ``int`` — PortAudio device index (as reported by sounddevice)
+          - a ``str`` — substring name match (sounddevice resolves this)
+
+        ``label`` is an optional human-readable name used only for logs.
+        """
+        if device in (None, "", -1):
+            with self._lock:
+                self._output_device = None
+                self._output_device_label = ""
+            _log.info("[TTS] Output device reset to system default")
+            return
+        try:
+            resolved = int(device)
+        except (TypeError, ValueError):
+            resolved = str(device)
+        with self._lock:
+            self._output_device = resolved
+            self._output_device_label = str(label or resolved)
+        _log.info("[TTS] Output device set to %r (label=%s)", resolved, self._output_device_label)
+
+    def get_output_device(self):
+        """Return ``(device, label)`` for the currently selected output device."""
+        with self._lock:
+            return self._output_device, self._output_device_label
 
     def _get_emotion_style(self, emotion: str) -> str:
         """Get TTS style instruction based on current emotion."""
@@ -196,7 +233,7 @@ class QwenTTSBackend(QObject):
             _log.debug("[TTS] Failed to list system voices: %s", exc)
             return []
 
-    # ── Voice Design ──
+    # Voice Design
     def generate_voice_design(self, text, voice_description, language="Auto",
                               output_path=None):
         """Generate speech from natural language voice description.
@@ -206,7 +243,7 @@ class QwenTTSBackend(QObject):
 
         return self._qwen_design(text, voice_description, language, output_path)
 
-    # ── Voice Clone ──
+    # Voice Clone
     def generate_voice_clone(self, target_text, ref_audio_path, ref_text="",
                              language="Auto", x_vector_only=False,
                              output_path=None):
@@ -219,7 +256,7 @@ class QwenTTSBackend(QObject):
         return self._qwen_clone(target_text, ref_audio_path, ref_text,
                                 language, x_vector_only, output_path)
 
-    # ── CustomVoice (TTS with predefined speakers) ──
+    # CustomVoice (TTS with predefined speakers)
     def generate_custom_voice(self, text, language="Auto", speaker="Ryan",
                               style_instruction="", model_size="1.7B",
                               output_path=None):
@@ -232,7 +269,7 @@ class QwenTTSBackend(QObject):
         return self._qwen_custom(text, language, speaker, style_instruction,
                                  model_size, output_path)
 
-    # ── Streaming synthesis ──
+    # Streaming synthesis
     def synthesize_streaming(self, text: str, emotion="neutral", on_chunk_ready=None):
         """Synthesize text sentence-by-sentence for lower latency.
 
@@ -278,9 +315,9 @@ class QwenTTSBackend(QObject):
             _log.debug("[TTS] Single sentence synthesis failed: %s", exc)
         return None
 
-    # ── Play WAV file ──
+    # Play WAV file
     def play_wav(self, wav_path):
-        """Play a WAV file through the default audio device."""
+        """Play a WAV file through the selected audio device (or OS default)."""
         def _do():
             started = False
             try:
@@ -289,9 +326,14 @@ class QwenTTSBackend(QObject):
                 data, sr = sf.read(str(wav_path))
                 self._begin_playback()
                 started = True
-                sd.play(data, sr)
+                with self._lock:
+                    out_device = self._output_device
+                if out_device is None:
+                    sd.play(data, sr)
+                else:
+                    sd.play(data, sr, device=out_device)
                 # Poll for interrupt instead of blocking on sd.wait().
-                # Guard sd.get_stream() — it raises PortAudioError if playback
+                # Guard sd.get_stream() - it raises PortAudioError if playback
                 # already finished between the loop condition check and the call.
                 while True:
                     try:
@@ -338,6 +380,10 @@ class QwenTTSBackend(QObject):
         if self._engine_name == "pyttsx3" or not self._has_gradio_client():
             return self._fallback_generate(text, output_path)
 
+        if not self.is_ready():
+            _log.info("[TTS] Qwen3-TTS not ready; using pyttsx3 fallback for profile synthesis")
+            return self._fallback_generate(text, output_path)
+
         if not voice_profile or not voice_profile.has_wav():
             return self._fallback_generate(text, output_path)
 
@@ -374,6 +420,12 @@ class QwenTTSBackend(QObject):
             return
 
         if self._engine_name == "pyttsx3":
+            mods = voice_profile.get_modulated(emotion)
+            self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
+            return
+
+        if not self.is_ready():
+            _log.info("[TTS] Qwen3-TTS not ready; using pyttsx3 fallback for speech")
             mods = voice_profile.get_modulated(emotion)
             self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
             return
@@ -416,9 +468,14 @@ class QwenTTSBackend(QObject):
             data, sr = sf.read(str(wav_path))
             self._begin_playback()
             started = True
-            sd.play(data, sr)
+            with self._lock:
+                out_device = self._output_device
+            if out_device is None:
+                sd.play(data, sr)
+            else:
+                sd.play(data, sr, device=out_device)
             # Poll for interrupt instead of blocking on sd.wait().
-            # Guard sd.get_stream() — it raises PortAudioError if playback
+            # Guard sd.get_stream() - it raises PortAudioError if playback
             # already finished between the loop condition check and the call.
             while True:
                 try:
@@ -442,7 +499,7 @@ class QwenTTSBackend(QObject):
             if started:
                 self._finish_playback()
 
-    # ── Qwen3-TTS gradio_client calls ──
+    # Qwen3-TTS gradio_client calls
 
     def _has_gradio_client(self):
         try:
@@ -643,7 +700,7 @@ class QwenTTSBackend(QObject):
         self.last_metrics = m
         return m
 
-    # ── pyttsx3 fallback ──
+    # pyttsx3 fallback
 
     def _fallback_generate(self, text, output_path=None):
         text = _strip_leading_style_directives(text)
@@ -684,6 +741,17 @@ class QwenTTSBackend(QObject):
         text = _strip_leading_style_directives(text)
         if not text:
             return
+
+        # pyttsx3's ``engine.say()`` always plays through the OS default
+        # device - there's no public API to pick another sink. If the user
+        # has selected a specific output device, render to a temp WAV and
+        # route it through ``_play_wav_blocking`` which honors ``device=``.
+        with self._lock:
+            out_device = self._output_device
+        if out_device is not None:
+            self._speak_pyttsx3_to_device(text, speed, pitch)
+            return
+
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
@@ -719,7 +787,53 @@ class QwenTTSBackend(QObject):
                 if started:
                     self._finish_playback()
 
-    # ── Sing Mode ──
+    def _speak_pyttsx3_to_device(self, text, speed=1.0, pitch=1.0):
+        """pyttsx3 path that synthesises to a WAV and plays via sounddevice.
+
+        Only used when a specific output device has been selected; the
+        default path (``_speak_pyttsx3``) is faster because it avoids the
+        save-to-file round trip but can only hit the OS default device.
+        """
+        tmp_path = None
+        try:
+            import pyttsx3
+            t0 = time.perf_counter()
+            self.synthesis_started.emit()
+            # Use a fresh engine so we don't race with any in-flight
+            # ``engine.say()`` queued on the cached engine.
+            engine = pyttsx3.init()
+            voices = engine.getProperty("voices")
+            if self._pyttsx3_voice_id:
+                engine.setProperty("voice", self._pyttsx3_voice_id)
+            elif voices:
+                engine.setProperty("voice", voices[0].id)
+            engine.setProperty("rate", int(205 * speed))
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            tmp_path = tmp.name
+            engine.save_to_file(text, tmp_path)
+            engine.runAndWait()
+            try:
+                engine.stop()
+            except Exception:
+                pass
+
+            m = self._build_metrics(t0, tmp_path)
+            self.last_metrics = m
+            self.synthesis_finished.emit(m)
+            self._play_wav_blocking(tmp_path)
+        except Exception as exc:
+            _log.error("[TTS] pyttsx3 device-routed speak error: %s", exc)
+            self.error_occurred.emit(str(exc))
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    # Sing Mode
 
     def get_sing_mode(self):
         """Get or create a SingMode instance backed by this TTS engine.

@@ -111,6 +111,7 @@ class TurnManager:
         return record
 
     def mark_state(self, request_id: str, lifecycle_state: RequestLifecycleState | str, reason: str = ""):
+        elapsed_s = -1.0
         with self._lock:
             if self._current_request_id != request_id or self._active_turn is None:
                 return False
@@ -121,8 +122,13 @@ class TurnManager:
             )
             self._active_turn.lifecycle_state = state_value
             self._active_turn.lifecycle_reason = str(reason or "")
+            elapsed_s = time.monotonic() - self._active_turn.started_at
+        # Elapsed time surfaces "which stage is slow?" without needing the
+        # watchdog -- you can eyeball a pipeline where router_classify took
+        # 0.2s but llm_decode has been running 45s.
         self._log(
-            f"Turn state | request_id={request_id} | state={state_value}"
+            f"Turn state | request_id={request_id} | state={state_value} "
+            f"| elapsed={elapsed_s:.2f}s"
             + (f" | reason={reason}" if reason else "")
         )
         return True
@@ -137,15 +143,18 @@ class TurnManager:
             if isinstance(lifecycle_state, RequestLifecycleState)
             else str(lifecycle_state)
         )
+        total_elapsed_s = -1.0
         with self._lock:
             if self._current_request_id != request_id:
                 return False
             self._current_request_id = ""
             if self._active_turn is not None:
+                total_elapsed_s = time.monotonic() - self._active_turn.started_at
                 self._active_turn.lifecycle_state = state_value
                 self._active_turn = None
         self._log(
-            f"Turn finished | request_id={request_id} | state={state_value}"
+            f"Turn finished | request_id={request_id} | state={state_value} "
+            f"| total_elapsed={total_elapsed_s:.2f}s"
             + (f" | reason={reason}" if reason else "")
         )
         return True

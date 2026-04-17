@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 
 from app.revia_states import (
@@ -43,6 +45,12 @@ class ConversationBehaviorController:
         self._is_tts_enabled = is_tts_enabled or (lambda: False)
         self._is_tts_ready = is_tts_ready or (lambda: True)
         self._is_stt_ready = is_stt_ready or (lambda: True)
+        # Throttle state for _blocked: prevents "Blocked: Startup (state=Thinking)"
+        # from spamming the log tab every telemetry tick when the FSM is pinned.
+        self._block_log_lock = threading.Lock()
+        self._block_log_last_ts: dict[tuple[str, str], float] = {}
+        self._block_log_suppressed: dict[tuple[str, str], int] = {}
+        self._block_log_cooldown_s = 30.0
 
     def should_respond(
         self,
@@ -146,7 +154,7 @@ class ConversationBehaviorController:
             # and is never gated by pacing cooldowns (those exist to pace
             # Revia's autonomous speech, not the human on the other end).
             #
-            # The only legitimate block is THINKING — a request is already
+            # The only legitimate block is THINKING - a request is already
             # in-flight and we'd race with it. SPEAKING is handled by the
             # chat panel (it interrupts before sending). COOLDOWN is
             # explicitly non-blocking here.
@@ -160,5 +168,62 @@ class ConversationBehaviorController:
         return BehaviorDecision(True, reason)
 
     def _blocked(self, source: str, reason: str) -> BehaviorDecision:
-        self._log(f"[Revia] Blocked: {source} ({reason})")
+        # Pull extra context so the first log line tells you *why* the block
+        # fired, not just "state=Thinking". If status isn't available we
+        # degrade gracefully to the old format.
+        extras = []
+        try:
+            status = self._status_provider() or {}
+            readiness = status.get("conversation_readiness", {}) or {}
+            llm = status.get("llm_connection", {}) or {}
+            behavior = status.get("behavior", {}) or {}
+            cooldowns = behavior.get("cooldowns", {}) or {}
+            blocking = list(readiness.get("blocking_reasons", []) or [])
+            runtime_state = status.get("state") or "?"
+            extras.append(f"runtime_state={runtime_state}")
+            if llm.get("state") and llm.get("state") != "Ready":
+                extras.append(f"llm={llm.get('state')}")
+            if cooldowns:
+                cd = ",".join(f"{k}={v:.1f}s" for k, v in cooldowns.items())
+                extras.append(f"cooldowns=[{cd}]")
+            if blocking:
+                extras.append(f"blocking={blocking[0]}")
+            if self._is_user_speaking():
+                extras.append("user_speaking=true")
+            if self._is_assistant_speaking():
+                extras.append("assistant_speaking=true")
+        except Exception as e:
+            extras.append(f"(context gather failed: {type(e).__name__})")
+
+        enriched = (
+            f"[Revia] Blocked: {source} ({reason})"
+            + (f" | {' | '.join(extras)}" if extras else "")
+        )
+
+        # Throttle repeats of the same (source, reason) tuple. The FSM can
+        # rearm the startup autonomous line on every telemetry update, which
+        # otherwise produces one "Blocked: Startup" per tick.
+        key = (str(source), str(reason))
+        now = time.monotonic()
+        should_log = True
+        suppressed = 0
+        with self._block_log_lock:
+            last = self._block_log_last_ts.get(key, 0.0)
+            if last > 0.0 and (now - last) < self._block_log_cooldown_s:
+                self._block_log_suppressed[key] = (
+                    self._block_log_suppressed.get(key, 0) + 1
+                )
+                should_log = False
+            else:
+                suppressed = self._block_log_suppressed.pop(key, 0)
+                self._block_log_last_ts[key] = now
+
+        if should_log:
+            if suppressed > 0:
+                self._log(
+                    f"{enriched} (+{suppressed} repeats suppressed in last "
+                    f"{int(self._block_log_cooldown_s)}s)"
+                )
+            else:
+                self._log(enriched)
         return BehaviorDecision(False, reason)

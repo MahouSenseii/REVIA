@@ -21,10 +21,10 @@ from persona_manager import normalize_profile, resolve_persona_preset_name
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# PRD §4.2  Full default profile (mirrors YAML schema)
+# PRD section 4.2 Full default profile (mirrors YAML schema)
 # ---------------------------------------------------------------------------
 PRD_DEFAULT_PROFILE: dict[str, Any] = {
-    # ── Identity ─────────────────────────────────────────────────────────────
+    # Identity
     "id": "default",
     "name": "Revia-Default",
     "version": "1.0.0",
@@ -44,7 +44,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "and remain in character across every reply."
     ),
 
-    # ── Identity sub-block ───────────────────────────────────────────────────
+    # Identity sub-block
     "identity": {
         "persona_name": "Revia",
         "voice_id": "default",
@@ -52,7 +52,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "accent_intensity": 0.0,
     },
 
-    # ── Behavioral Thresholds (PRD §4.2) ─────────────────────────────────────
+    # Behavioral Thresholds (PRD section 4.2)
     "behavior": {
         "minimum_answer_threshold":     0.72,   # AVS gate
         "interrupt_sensitivity":         0.55,   # IHS barge-in sensitivity
@@ -66,7 +66,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "loop_recovery_mode":            "rephrase",  # rephrase | topic_shift | silence
     },
 
-    # ── Emotional Parameters ──────────────────────────────────────────────────
+    # Emotional Parameters
     "emotion": {
         "emotion_intensity":     0.55,
         "baseline_valence":      0.55,
@@ -77,7 +77,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "sarcasm_ceiling":       0.20,
     },
 
-    # ── Timing & Pacing ───────────────────────────────────────────────────────
+    # Timing & Pacing
     "timing": {
         "response_onset_delay_ms":       320,
         "inter_sentence_pause_ms":       220,
@@ -86,7 +86,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "breath_insert_probability":     0.10,
     },
 
-    # ── Vision Attention ──────────────────────────────────────────────────────
+    # Vision Attention
     "vision": {
         "vision_attention_bias":         0.40,
         "scene_comment_probability":     0.12,
@@ -95,7 +95,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "scene_memory_window_s":         60,
     },
 
-    # ── Memory Preferences ────────────────────────────────────────────────────
+    # Memory Preferences
     "memory": {
         "short_term_window_turns":       20,
         "long_term_recall_probability":  0.15,
@@ -103,14 +103,14 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "forgetting_rate":               0.05,
     },
 
-    # ── Neural Conditioning ───────────────────────────────────────────────────
+    # Neural Conditioning
     "neural": {
         "embedding_dim":          128,
         "conditioning_strength":  0.70,
         "behavior_temperature":   0.30,
     },
 
-    # ── Personality / Character Voice ─────────────────────────────────────────
+    # Personality / Character Voice
     "trait_weights": {
         "confident": 0.6, "curious": 0.5, "empathetic": 0.7,
         "witty": 0.4, "helpful": 0.6, "playful": 0.4,
@@ -122,7 +122,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
     "reply_type_weights": {"explain": 0.5, "react": 0.3, "joke": 0.1, "question": 0.1},
 }
 
-# Preset archetypes — load with ProfileEngine.load_preset(name)
+# Preset archetypes - load with ProfileEngine.load_preset(name)
 PROFILE_PRESETS: dict[str, dict] = {
     "casual": {
         "name": "Revia-Casual",
@@ -221,7 +221,7 @@ class ProfileEngine:
         engine = ProfileEngine()
         engine.load(raw_profile_dict)
 
-        # Subsystems read thresholds like this — NO hardcoded values:
+        # Subsystems read thresholds like this - NO hardcoded values:
         threshold = engine.get_behavior_param("minimum_answer_threshold")
         sensitivity = engine.get_behavior_param("interrupt_sensitivity")
     """
@@ -234,7 +234,7 @@ class ProfileEngine:
         self._swap_listeners: list = []   # callables notified on hot-swap
         self._loaded_at: float = 0.0
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # Public API
 
     def load(self, raw: dict | None) -> dict:
         """
@@ -346,7 +346,7 @@ class ProfileEngine:
         with self._lock:
             return str(self._profile.get("name", "Revia-Default"))
 
-    # ── PRD §4.2 — behavioral threshold quick-access properties ──────────────
+    # PRD section 4.2 - behavioral threshold quick-access properties
 
     @property
     def minimum_answer_threshold(self) -> float:
@@ -422,7 +422,7 @@ class ProfileEngine:
         with self._lock:
             return dict(self._profile.get("reply_type_weights", {"explain": 0.5, "react": 0.5}))
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # Internal
 
     def _deep_merge(self, base: dict, override: dict) -> dict:
         """Recursively merge ``override`` into ``base``."""
@@ -460,7 +460,7 @@ class ProfileEngine:
             )
         return issues
 
-    # NOTE: _validate_profile_regen was removed — its logic is already
+    # NOTE: _validate_profile_regen was removed - its logic is already
     # inlined in _validate() (regen_patience check, lines above).
 
     def _notify_swap_listeners(self):

@@ -35,7 +35,7 @@ def _resolve_wav_path(stored_path: str) -> str:
         if candidate.exists():
             return str(candidate)
         # Search one level deep (profile subdirectories); warn if the filename
-        # exists in multiple subdirectories — the first match wins but the result
+        # exists in multiple subdirectories - the first match wins but the result
         # is ambiguous and may be wrong.
         matches = []
         for subdir in _VOICES_ROOT.iterdir():

@@ -60,7 +60,7 @@ class RecoveryAction(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Keyword banks (PRD §8.1 — classification signals)
+# Keyword banks (PRD section 8.1 - classification signals)
 # ---------------------------------------------------------------------------
 
 def _compile_patterns(patterns: list[str]) -> list["re.Pattern"]:
@@ -154,7 +154,7 @@ class InterruptionHandler:
         self._pe = profile_engine
         self._history: list[InterruptionEvent] = []
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def classify_interruption(
         self,
@@ -251,8 +251,8 @@ class InterruptionHandler:
             return RecoveryAction.RESTART
 
         # UNKNOWN: use sensitivity to decide
-        # High sensitivity + low verbosity → RESTART (don't fight it)
-        # Low sensitivity + anything        → ACKNOWLEDGE (treat like social)
+        # High sensitivity + low verbosity -> RESTART (don't fight it)
+        # Low sensitivity + anything -> ACKNOWLEDGE (treat like social)
         if sensitivity >= 0.65:
             if verbosity >= 0.60:
                 return RecoveryAction.ABSORB    # talkative profile: absorb and continue
@@ -275,7 +275,7 @@ class InterruptionHandler:
     def audit_trail(self) -> list[dict]:
         return [e.to_dict() for e in self._history[-50:]]
 
-    # ── Internal helpers ──────────────────────────────────────────────────
+    # Internal helpers
 
     @staticmethod
     def _match_score(
@@ -324,7 +324,7 @@ class InterruptionHandler:
         }
 
         # Minimum confidence required, scaled by sensitivity
-        # High sensitivity → accept lower-confidence classifications
+        # High sensitivity -> accept lower-confidence classifications
         min_confidence = max(0.20, 0.60 - sensitivity * 0.40)
 
         best_type  = InterruptionType.UNKNOWN
@@ -341,7 +341,7 @@ class InterruptionHandler:
 
         return best_type, best_score
 
-    # ── Profile parameter accessors ───────────────────────────────────────
+    # Profile parameter accessors
 
     def _get_sensitivity(self) -> float:
         if self._pe:

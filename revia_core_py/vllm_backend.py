@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -106,12 +107,12 @@ def classify_prompt_complexity(
     """
     result = PromptClassification()
 
-    # ── Gate 1: CUDA is mandatory ──────────────────────────────────
+    # Gate 1: CUDA is mandatory
     if not cuda_available:
         result.reason = "CUDA not available; vLLM requires GPU"
         return result
 
-    # ── Estimate context size ──────────────────────────────────────
+    # Estimate context size
     total_words = 0
     system_words = 0
     turn_count = 0
@@ -137,13 +138,13 @@ def classify_prompt_complexity(
     result.has_multi_turn = turn_count > 6
     result.user_text_words = len(user_text.split()) if user_text else 0
 
-    # ── Gate 2: Skip vLLM for trivially simple prompts ─────────────
+    # Gate 2: Skip vLLM for trivially simple prompts
     if _SIMPLE_INDICATORS.match(user_text.strip()):
         result.reason = "Simple conversational message; standard path faster"
         result.complexity_score = 0.05
         return result
 
-    # ── Score complexity ───────────────────────────────────────────
+    # Score complexity
     score = 0.0
 
     # Factor 1: Context length (0.0 to 0.4)
@@ -177,7 +178,7 @@ def classify_prompt_complexity(
 
     result.complexity_score = round(min(score, 1.0), 3)
 
-    # ── Decision threshold ─────────────────────────────────────────
+    # Decision threshold
     # Score >= 0.35 triggers vLLM; lower goes standard path
     VLLM_THRESHOLD = 0.35
 
@@ -215,7 +216,7 @@ class VLLMMetrics:
     tokens_per_second: float = 0.0
     time_to_first_token_ms: float = 0.0
     generation_time_ms: float = 0.0
-    # Speculative decode stats (vLLM ≥ 0.4)
+    # Speculative decode stats (vLLM >= 0.4)
     spec_decode_accepted: int = 0
     spec_decode_drafted: int = 0
     # Prefix cache hit
@@ -460,17 +461,27 @@ class VLLMEnhancer:
         full_text = ""
         all_logprobs = []
         t0 = time.perf_counter()
+        last_token_t = t0
         t_first_token = None
         token_count = 0
         finish_reason = ""
+        try:
+            read_timeout = float(os.environ.get("REVIA_VLLM_READ_TIMEOUT_S", "80"))
+        except (TypeError, ValueError):
+            read_timeout = 80.0
+        read_timeout = max(5.0, min(read_timeout, 95.0))
 
         try:
             with self._session.post(
-                url, headers=headers, json=body, stream=True, timeout=120
+                url, headers=headers, json=body, stream=True, timeout=(10, read_timeout)
             ) as resp:
                 resp.raise_for_status()
 
                 for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
+                    if time.perf_counter() - last_token_t > read_timeout:
+                        raise TimeoutError(
+                            f"vLLM stream produced no tokens for {read_timeout:.0f}s"
+                        )
                     if self._interrupt_check():
                         self._log("[vLLM] Generation interrupted by user")
                         result.finish_reason = "interrupted"
@@ -496,6 +507,7 @@ class VLLMEnhancer:
                     tok = delta.get("content", "")
 
                     if tok:
+                        last_token_t = time.perf_counter()
                         if t_first_token is None:
                             t_first_token = time.perf_counter()
                         full_text += tok

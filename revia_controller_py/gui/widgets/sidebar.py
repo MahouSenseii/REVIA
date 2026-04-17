@@ -1,9 +1,65 @@
 import math
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
+from PySide6.QtWidgets import (
+    QApplication, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy,
+)
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QRadialGradient, QFont
 
 from app.ui_status import apply_status_style
+
+
+_THEME_FALLBACK = {
+    "PrimaryBackground": "#06050f",
+    "Surface": "#13112a",
+    "SurfaceAlt": "#1c1838",
+    "PrimaryText": "#ede9fe",
+    "SecondaryText": "#8b7ab8",
+    "Accent": "#a855f7",
+    "AccentHover": "#c084fc",
+    "Success": "#2dd4bf",
+    "Error": "#f43f5e",
+    "Disabled": "#4a3a6a",
+}
+
+
+def _theme_tokens():
+    tokens = dict(_THEME_FALLBACK)
+    app = QApplication.instance()
+    raw = app.property("reviaThemeTokens") if app else None
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key in tokens and QColor(str(value)).isValid():
+                tokens[key] = str(value)
+    return tokens
+
+
+def _theme_color(tokens, key, alpha=None):
+    color = QColor(tokens.get(key, _THEME_FALLBACK.get(key, "#000000")))
+    if not color.isValid():
+        color = QColor(_THEME_FALLBACK.get(key, "#000000"))
+    if alpha is not None:
+        color.setAlpha(alpha)
+    return color
+
+
+def _with_alpha(color, alpha):
+    out = QColor(color)
+    out.setAlpha(alpha)
+    return out
+
+
+def _blend(color_a, color_b, ratio, alpha=None):
+    ratio = max(0.0, min(1.0, float(ratio)))
+    a = QColor(color_a)
+    b = QColor(color_b)
+    out = QColor(
+        int(a.red() + (b.red() - a.red()) * ratio),
+        int(a.green() + (b.green() - a.green()) * ratio),
+        int(a.blue() + (b.blue() - a.blue()) * ratio),
+    )
+    if alpha is not None:
+        out.setAlpha(alpha)
+    return out
 
 
 class AvatarWidget(QFrame):
@@ -29,40 +85,45 @@ class AvatarWidget(QFrame):
         self.update()
 
     def paintEvent(self, event):
+        tokens = _theme_tokens()
+        surface = _theme_color(tokens, "Surface")
+        surface_alt = _theme_color(tokens, "SurfaceAlt")
+        accent = _theme_color(tokens, "Accent")
+        accent_hover = _theme_color(tokens, "AccentHover")
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         cx, cy, r = self.width() // 2, self.height() // 2, 44
 
-        # — Outer violet glow (pulsing) —
+        # Outer violet glow (pulsing)
         glow_alpha = int(25 + self._pulse * 40)
         glow = QRadialGradient(cx, cy, r + 22)
-        glow.setColorAt(0.0, QColor(168, 85, 247, glow_alpha))
-        glow.setColorAt(0.5, QColor(236, 72, 153, max(glow_alpha - 10, 8)))
-        glow.setColorAt(1.0, QColor(168, 85, 247, 0))
+        glow.setColorAt(0.0, _with_alpha(accent, glow_alpha))
+        glow.setColorAt(0.5, _with_alpha(accent_hover, max(glow_alpha - 10, 8)))
+        glow.setColorAt(1.0, _with_alpha(accent, 0))
         p.setBrush(QBrush(glow))
         p.setPen(Qt.NoPen)
         p.drawEllipse(cx - r - 22, cy - r - 22, (r + 22) * 2, (r + 22) * 2)
 
-        # — Pulsing outer ring —
+        # Pulsing outer ring
         ring_alpha = int(80 + self._pulse * 120)
-        p.setPen(QPen(QColor(168, 85, 247, ring_alpha), 2))
+        p.setPen(QPen(_with_alpha(accent, ring_alpha), 2))
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(cx - r - 10, cy - r - 10, (r + 10) * 2, (r + 10) * 2)
 
-        # — Inner pink ring —
-        p.setPen(QPen(QColor(244, 114, 182, 160), 1))
+        # Inner pink ring
+        p.setPen(QPen(_with_alpha(accent_hover, 160), 1))
         p.drawEllipse(cx - r - 4, cy - r - 4, (r + 4) * 2, (r + 4) * 2)
 
-        # — Avatar face circle — dark gradient fill —
+        # Avatar face circle - dark gradient fill
         face_grad = QRadialGradient(cx - 8, cy - 8, r * 1.2)
-        face_grad.setColorAt(0.0, QColor(32, 18, 56))
-        face_grad.setColorAt(1.0, QColor(12, 7, 22))
+        face_grad.setColorAt(0.0, surface_alt)
+        face_grad.setColorAt(1.0, surface)
         p.setBrush(QBrush(face_grad))
-        p.setPen(QPen(QColor(168, 85, 247, 200), 2))
+        p.setPen(QPen(_with_alpha(accent, 200), 2))
         p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
 
-        # — "R" glyph with violet-to-pink gradient via linear gradient —
-        p.setPen(QColor(236, 72, 153))
+        # "R" glyph with violet-to-pink gradient via linear gradient
+        p.setPen(accent_hover)
         p.setFont(QFont("Segoe UI", 26, QFont.Bold))
         p.drawText(self.rect(), Qt.AlignCenter, "R")
 
@@ -90,15 +151,25 @@ class ModuleIndicator(QFrame):
         self.update()
 
     def paintEvent(self, event):
+        tokens = _theme_tokens()
+        role_colors = {
+            "active": "Success",
+            "idle": "Accent",
+            "error": "Error",
+        }
+        dot_color = _theme_color(tokens, role_colors.get(self.status, "Disabled"))
+        bg_color = _with_alpha(dot_color, 28 if self.status in ("active", "error") else 18)
+        border_color = (
+            dot_color.darker(120)
+            if _theme_color(tokens, "PrimaryBackground").lightness() > 160
+            else dot_color.lighter(130)
+        )
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        dot_color, bg_color = self._STATUS_COLORS.get(
-            self.status, (QColor(100, 90, 130), QColor(100, 90, 130, 18))
-        )
 
         # Background pill
         p.setBrush(bg_color)
-        p.setPen(QPen(dot_color.lighter(130) if self.status == "active" else dot_color, 1))
+        p.setPen(QPen(border_color, 1))
         p.drawRoundedRect(4, 3, self.width() - 8, self.height() - 6, 9, 9)
 
         # Status dot
@@ -107,7 +178,7 @@ class ModuleIndicator(QFrame):
         p.drawEllipse(11, 8, 8, 8)
 
         # Label
-        p.setPen(QColor(220, 210, 245))
+        p.setPen(_theme_color(tokens, "PrimaryText"))
         p.setFont(QFont("Segoe UI", 9))
         p.drawText(26, 16, self.label_text)
         p.end()
@@ -131,6 +202,10 @@ class ActivityMeter(QFrame):
         self.update()
 
     def paintEvent(self, event):
+        tokens = _theme_tokens()
+        accent = _theme_color(tokens, "Accent")
+        accent_hover = _theme_color(tokens, "AccentHover")
+        disabled = _theme_color(tokens, "Disabled")
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         bar_count = 15
@@ -145,12 +220,9 @@ class ActivityMeter(QFrame):
             if i < active_bars:
                 # Gradient from violet (bottom) to pink (top)
                 ratio = i / max(bar_count - 1, 1)
-                r = int(168 + ratio * (236 - 168))
-                g = int(85 - ratio * (85 - 72))
-                b = int(247 - ratio * (247 - 153))
-                color = QColor(r, g, b, alpha)
+                color = _blend(accent, accent_hover, ratio, alpha)
             else:
-                color = QColor(35, 22, 55, 50)
+                color = _with_alpha(disabled, 50)
             p.fillRect(x, y, bar_w, bar_h - 2, color)
         p.end()
 

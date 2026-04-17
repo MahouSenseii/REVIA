@@ -687,7 +687,7 @@ class SystemTab(QScrollArea):
                 err = str(ex)
 
                 def _apply_err(e=err):
-                    self.core_status.setText(f"Status: Unreachable â€” {e}")
+                    self.core_status.setText(f"Status: Unreachable - {e}")
                     apply_status_style(self.core_status, "color: #cc3040;")
                     self.core_connect_btn.setEnabled(True)
 
@@ -749,7 +749,7 @@ class SystemTab(QScrollArea):
             self._refresh_plugins()
             self._refresh_neural()
         else:
-            # Probe REST in the background â€” avoids blocking the main thread
+            # Probe REST in the background avoids blocking the main thread
             # on what could be a 1-second timeout during a WS disconnect event.
             def _check():
                 rest_ok = False

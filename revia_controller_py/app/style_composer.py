@@ -184,6 +184,14 @@ QTabBar::tab:selected {{
     border-bottom-color: {t["Accent"]};
 }}
 
+QTabBar {{
+    background-color: {t["SecondaryBackground"]};
+}}
+
+QWidget#rightPanel QTabBar {{
+    background-color: {t["SecondaryBackground"]};
+}}
+
 QScrollBar:vertical, QScrollBar:horizontal {{
     background: {t["SecondaryBackground"]};
     border: none;
@@ -196,6 +204,10 @@ QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
 
 QSplitter::handle {{
     background-color: {t["Border"]};
+}}
+
+QSplitter {{
+    background-color: {t["PrimaryBackground"]};
 }}
 
 QProgressBar {{
@@ -251,6 +263,10 @@ QWidget#rightPanel QScrollArea {{
     background: transparent;
 }}
 
+QWidget#qt_scrollarea_viewport,
+QScrollArea > QWidget,
+QWidget#rightPanel QWidget#qt_scrollarea_viewport,
+QWidget#rightPanel QScrollArea > QWidget,
 QWidget#rightPanel QScrollArea > QWidget > QWidget {{
     background: transparent;
 }}

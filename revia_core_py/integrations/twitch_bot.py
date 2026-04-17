@@ -29,7 +29,7 @@ class REVIATwitchBot:
         self._bot = None
         self._thread = None
         self._loop = None
-        # Dedicated thread pool — keeps Twitch I/O off the default asyncio executor
+        # Dedicated thread pool - keeps Twitch I/O off the default asyncio executor
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="revia-twitch-llm")
         self.running = False
         self.status = "stopped"
@@ -80,7 +80,7 @@ class REVIATwitchBot:
                 for u in expired:
                     del self._cooldowns[u]
             else:
-                # All entries are fresh — remove the single oldest to stay under cap
+                # All entries are fresh - remove the single oldest to stay under cap
                 oldest = min(self._cooldowns, key=self._cooldowns.__getitem__)
                 del self._cooldowns[oldest]
 
@@ -282,7 +282,7 @@ class REVIATwitchBot:
                 lambda r: ctx.send(f"@{author} {r}"),
             )
 
-        # !sing command — routes to SingCommandHandler
+        # !sing command - routes to SingCommandHandler
         @_Bot.command(name="sing")
         async def _cmd_sing(ctx: twitchio_commands.Context):
             raw = ctx.message.content

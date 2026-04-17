@@ -82,7 +82,7 @@ class TestBUG02_CallerFrame(unittest.TestCase):
         history = h.store.get_history()
         assert len(history) == 1
         # The decorator wraps 'boom', so the logged frame is 'boom' (the wrapped func)
-        # The error is raised inside wrapper → caught by CatchException.__call__
+        # The error is raised inside wrapper -> caught by CatchException.__call__
         # The first non-handler frame is the test method that called boom()
         assert history[0].function_name in ("boom", "test_frame_correct_through_decorator"), \
             f"Got {history[0].function_name}"

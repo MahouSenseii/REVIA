@@ -81,7 +81,7 @@ _TUNABLE_PARAMS: dict[str, tuple[float, float]] = {
     "topic_depth":           (0.20, 1.00),
 }
 
-# Default parameter values (profile-based — overridden on first load)
+# Default parameter values (profile-based - overridden on first load)
 _DEFAULT_PARAMS: dict[str, float] = {
     "temperature":           0.80,
     "verbosity":             0.55,
@@ -106,7 +106,7 @@ _REWARD_WEIGHTS: dict[str, float] = {
 # Learning rate for exponential moving average
 _LEARNING_RATE = 0.08
 
-# Exploration rate (epsilon-greedy) — chance of trying a random perturbation
+# Exploration rate (epsilon-greedy) - chance of trying a random perturbation
 _EXPLORATION_RATE = 0.12
 
 # Decay factor for old experiences (per-interaction)
@@ -252,7 +252,7 @@ class ReinforcementLearner:
                 max_val=hi,
             )
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     @property
     def enabled(self) -> bool:
@@ -410,7 +410,7 @@ class ReinforcementLearner:
             recent = list(self._history)[-n:]
             return [s.to_dict() for s in recent]
 
-    # ── Persistence ───────────────────────────────────────────────────────
+    # Persistence
 
     def load(self):
         """Load learned parameters from disk."""
@@ -471,7 +471,7 @@ class ReinforcementLearner:
         except Exception as exc:
             self._log(f"[RL] Failed to save parameters: {exc}")
 
-    # ── History analysis ──────────────────────────────────────────────────
+    # History analysis
 
     def get_reward_trend(self, window: int = 20) -> dict[str, float]:
         """Compute recent reward trend for dashboard display."""

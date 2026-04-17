@@ -35,7 +35,7 @@ _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Thinking pause candidates  (PRD §13.1)
+# Thinking pause candidates (PRD section 13.1)
 # ---------------------------------------------------------------------------
 _THINKING_PAUSES = [
     "Hmm… ",
@@ -48,7 +48,7 @@ _THINKING_PAUSES = [
     "One sec — ",
 ]
 
-# Self-correction injection phrases  (PRD §13.2)
+# Self-correction injection phrases (PRD section 13.2)
 _SELF_CORRECTIONS = [
     "actually, ", "well, ", "I mean, ", "wait, ", "okay so, ",
     "honestly, ", "here's the thing, ", "look, ", "ngl, ", "like, ",
@@ -61,8 +61,8 @@ _CLAUSE_BOUNDARY_RE = re.compile(
     r"(,|;| — | and | but | though | although | however)"
 )
 
-# Verbosity → target word-count mapping
-# verbosity 0.0 → 25 words, 1.0 → 220 words
+# Verbosity -> target word-count mapping
+# verbosity 0.0 -> 25 words, 1.0 -> 220 words
 _VERBOSITY_MIN_WORDS = 25
 _VERBOSITY_MAX_WORDS = 220
 
@@ -139,7 +139,7 @@ class HumanFeelLayer:
         self._rng = random.Random(rng_seed)
         self._rng_lock = threading.Lock()
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def process(
         self,
@@ -213,7 +213,7 @@ class HumanFeelLayer:
         """Public convenience accessor for prosody-only use."""
         return self._compute_prosody(emotion_label)
 
-    # ── Transformation steps ──────────────────────────────────────────────
+    # Transformation steps
 
     def _apply_thinking_pause(self, result: HFLResult) -> HFLResult:
         prob = self._get_thinking_pause_probability()
@@ -322,7 +322,7 @@ class HumanFeelLayer:
                     text = text[:dot+2] + f"{marker}... " + text[dot+2:]
         return text
 
-    # ── Prosody computation ───────────────────────────────────────────────
+    # Prosody computation
 
     def _compute_prosody(self, emotion_label: str) -> ProsodyHints:
         """
@@ -379,7 +379,7 @@ class HumanFeelLayer:
             affect_mode     = affect_mode,
         )
 
-    # ── Profile parameter accessors ───────────────────────────────────────
+    # Profile parameter accessors
 
     def _get_thinking_pause_probability(self) -> float:
         if self._pe:

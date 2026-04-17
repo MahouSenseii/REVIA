@@ -253,9 +253,7 @@ class ThemeTab(QScrollArea):
         validation = self._validate_draft()
         if validation["valid"] and self.live_preview.isChecked():
             try:
-                self.theme_mgr.app.setStyleSheet(
-                    self.theme_mgr.preview_theme(self._draft_theme())
-                )
+                self.theme_mgr.apply_preview(self._draft_theme())
             except ValueError:
                 pass
 

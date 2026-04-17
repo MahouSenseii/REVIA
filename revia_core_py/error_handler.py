@@ -217,7 +217,7 @@ class ErrorStore:
         self._history: deque[ErrorReport] = deque(maxlen=maxlen)
         self._counts: defaultdict[str, int] = defaultdict(int)  # BUG-05
 
-    # BUG-01 — reset for test isolation
+    # BUG-01 - reset for test isolation
     def reset(self) -> None:
         with self._lock:
             self._history.clear()

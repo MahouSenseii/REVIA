@@ -1034,7 +1034,7 @@ class ModelTab(QScrollArea):
             self.disconnect_btn.setEnabled(True)
         else:
             self.conn_status.setText(
-                f"Status: {server} at {server_url} â€” {llm_detail}"
+                f"Status: {server} at {server_url} - {llm_detail}"
             )
             apply_status_style(self.conn_status, "color: #cc3040;")
 
@@ -1099,7 +1099,7 @@ class ModelTab(QScrollArea):
                 apply_status_style(self.conn_status, "color: #cc3040;")
             elif r.status_code == 403:
                 self.conn_status.setText(
-                    "Status: Access denied (403) â€” check key permissions"
+                    "Status: Access denied (403) - check key permissions"
                 )
                 apply_status_style(self.conn_status, "color: #cc3040;")
             else:
@@ -1114,7 +1114,7 @@ class ModelTab(QScrollArea):
             self.conn_status.setText("Status: Cannot reach endpoint")
             apply_status_style(self.conn_status, "color: #cc3040;")
         except Exception as e:
-            self.conn_status.setText(f"Status: Error â€” {e}")
+            self.conn_status.setText(f"Status: Error - {e}")
             apply_status_style(self.conn_status, "color: #cc3040;")
 
     def _disconnect(self):

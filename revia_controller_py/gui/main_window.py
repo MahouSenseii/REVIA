@@ -93,7 +93,7 @@ class MainWindow(QMainWindow):
 
         self.shell_splitter.addWidget(center)
 
-        # Right panel — container gives the tab widget a fixed inset margin so
+        # Right panel - container gives the tab widget a fixed inset margin so
         # content never bleeds to the splitter edge.
         right_container = QWidget()
         right_container.setObjectName("rightPanel")

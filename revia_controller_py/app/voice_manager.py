@@ -55,7 +55,7 @@ class VoiceManager(QObject):
     def active_profile(self):
         return self._active_profile
 
-    # ── Backend ownership ──────────────────────────────────────────────────
+    # Backend ownership
 
     @property
     def active_backend_name(self) -> str:
@@ -91,7 +91,7 @@ class VoiceManager(QObject):
         """True if the active backend server is reachable / operational."""
         return self.backend.is_ready()
 
-    # ── Voice profiles ─────────────────────────────────────────────────────
+    # Voice profiles
 
     def set_active_voice(self, name):
         p = self.library.get(name)
@@ -133,7 +133,7 @@ class VoiceManager(QObject):
         label = emotion_state.get("label", "neutral").lower()
         self._current_emotion = label
 
-    # ── Generation methods (produce WAV files) ──
+    # Generation methods (produce WAV files)
 
     def generate_design(self, text, voice_description, language="Auto",
                         output_path=None):
@@ -165,7 +165,7 @@ class VoiceManager(QObject):
     def stop_output(self):
         self.backend.stop_output()
 
-    # ── Profile management ──
+    # Profile management
 
     def save_voice(self, profile):
         return self.library.save_profile(profile)

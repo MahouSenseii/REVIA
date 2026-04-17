@@ -40,7 +40,7 @@ except ImportError:
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# VAD constants (PRD §6.2)
+# VAD constants (PRD section 6.2)
 # ---------------------------------------------------------------------------
 _FRAME_MS           = 30          # ms per VAD frame
 _SAMPLE_RATE        = 16_000      # Hz
@@ -53,7 +53,7 @@ _OFFSET_HOLD_FRAMES = 8           # consecutive silence frames → fire offset
 # Silero VAD (https://github.com/snakers4/silero-vad) provides ML-based detection.
 _DEFAULT_ENERGY_THRESHOLD = 0.005
 
-# ── Barge-in anti-echo tuning ───────────────────────────────────────────────
+# Barge-in anti-echo tuning
 # Without a proper AEC (acoustic echo canceller), the microphone will pick up
 # Revia's own voice bleeding back through the speakers and trigger false
 # barge-in. These parameters make barge-in detection conservative while TTS
@@ -110,7 +110,7 @@ class ContinuousAudioPipeline(QObject):
         self._silence_hold   = 0   # consecutive silence frames
         self._partial_buffer: list[str] = []
 
-        # Ambient noise tracking — protected by _ambient_lock so that any external
+        # Ambient noise tracking - protected by _ambient_lock so that any external
         # reader (e.g. a UI diagnostics thread) never races with the VAD writer.
         self._ambient_lock    = threading.Lock()
         self._ambient_samples: list[float] = []
@@ -125,16 +125,16 @@ class ContinuousAudioPipeline(QObject):
         # a false interruption.
         self._tts_start_monotonic: float = 0.0
 
-        # STT callback — inject a callable(bytes) -> str for partial transcription
+        # STT callback - inject a callable(bytes) -> str for partial transcription
         # When None, the pipeline only emits onset/offset events without text
         self._stt_callback: Callable[[bytes], str] | None = None
 
-        # Audio source — inject a callable() -> bytes for testing
+        # Audio source - inject a callable() -> bytes for testing
         # When None, falls back to pyaudio if available
         self._audio_source: Callable[[], bytes] | None = None
         self._pa_stream   = None
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def set_stt_callback(self, fn: Callable[[bytes], str]) -> None:
         """Inject the STT function used to produce partial transcripts."""
@@ -194,7 +194,7 @@ class ContinuousAudioPipeline(QObject):
         self._close_pa_stream()
         _log.info("[ContinuousAudio] VAD pipeline stopped")
 
-    # ── VAD loop ──────────────────────────────────────────────────────────
+    # VAD loop
 
     def _vad_loop(self) -> None:
         """
@@ -252,7 +252,7 @@ class ContinuousAudioPipeline(QObject):
             self._speech_hold += 1
 
             if self._in_speech:
-                # Already in a speech run — stream any partial transcript
+                # Already in a speech run - stream any partial transcript
                 partial = self._get_partial_text(raw_frame)
                 if partial:
                     try:
@@ -311,7 +311,7 @@ class ContinuousAudioPipeline(QObject):
                     except Exception:
                         pass
 
-    # ── VAD classifier ────────────────────────────────────────────────────
+    # VAD classifier
 
     def _vad_classify(self, raw_frame: bytes) -> tuple[bool, float]:
         """
@@ -359,7 +359,7 @@ class ContinuousAudioPipeline(QObject):
             threshold *= _BARGE_IN_ENERGY_MULT
         return rms > threshold
 
-    # ── Audio I/O ─────────────────────────────────────────────────────────
+    # Audio I/O
 
     def _init_audio_source(self) -> None:
         """Initialise pyaudio stream if no custom source is injected."""
@@ -410,7 +410,7 @@ class ContinuousAudioPipeline(QObject):
                 pass
             self._pa_stream = None
 
-    # ── Partial transcription ─────────────────────────────────────────────
+    # Partial transcription
 
     def _get_partial_text(self, raw_frame: bytes) -> str:
         """
@@ -425,7 +425,7 @@ class ContinuousAudioPipeline(QObject):
             _log.debug("[ContinuousAudio] STT callback error: %s", exc)
             return ""
 
-    # ── Profile accessor ──────────────────────────────────────────────────
+    # Profile accessor
 
     def _get_energy_threshold(self) -> float:
         """
@@ -435,6 +435,6 @@ class ContinuousAudioPipeline(QObject):
         """
         if self._pe:
             sensitivity = float(self._pe.interrupt_sensitivity)
-            # Map [0.0, 1.0] sensitivity → [0.010, 0.002] threshold
+            # Map [0.0, 1.0] sensitivity -> [0.010, 0.002] threshold
             return max(0.002, 0.010 - sensitivity * 0.008)
         return _DEFAULT_ENERGY_THRESHOLD

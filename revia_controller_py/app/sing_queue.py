@@ -55,7 +55,7 @@ class QueueItem:
 
 
 # ---------------------------------------------------------------------------
-# Mood → tag mapping
+# Mood -> tag mapping
 # ---------------------------------------------------------------------------
 
 # Maps Revia's emotion states to song tags that match the vibe.
@@ -185,7 +185,7 @@ class SingQueue:
                 self._notify_changed()
                 return item
 
-        # Queue empty — auto-pick if enabled
+        # Queue empty - auto-pick if enabled
         if not self.auto_pick_enabled:
             return None
 

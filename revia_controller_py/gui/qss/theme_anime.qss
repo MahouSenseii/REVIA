@@ -236,9 +236,30 @@ QMainWindow {
     border-left: 1px solid rgba(168, 85, 247, 0.10);
 }
 
+#rightPanel {
+    background: rgba(10, 7, 22, 235);
+    border-left: 1px solid rgba(168, 85, 247, 0.10);
+}
+
+QSplitter {
+    background: #06050f;
+}
+
+QSplitter::handle {
+    background: rgba(168, 85, 247, 0.10);
+}
+
 QTabWidget::pane {
     background: rgba(10, 7, 22, 235);
     border: none;
+}
+
+QTabBar {
+    background: rgba(10, 7, 22, 235);
+}
+
+#rightPanel QTabBar {
+    background: rgba(10, 7, 22, 235);
 }
 
 QTabBar::tab {
@@ -466,6 +487,12 @@ QScrollBar::handle:horizontal {
 
 QScrollArea {
     border: none;
+    background: transparent;
+}
+
+QWidget#qt_scrollarea_viewport,
+QScrollArea > QWidget,
+QScrollArea > QWidget > QWidget {
     background: transparent;
 }
 

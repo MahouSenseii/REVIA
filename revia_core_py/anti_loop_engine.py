@@ -55,7 +55,7 @@ _REPAIR_PHRASES: dict[str, str] = {
 _PERSONALITY_WHITELIST: frozenset = frozenset()  # Atomically replaced; thread-safe
 _PERSONALITY_WHITELIST_LOCK = threading.Lock()
 
-# Default score thresholds (PRD §12 — overridden by profile in practice)
+# Default score thresholds (PRD section 12 - overridden by profile in practice)
 _DEFAULT_LOOP_RISK_TRIGGER = 0.65   # score above this → repair action
 _DEFAULT_LOOP_DETECTION_WINDOW = 80  # token lookback
 
@@ -119,11 +119,11 @@ class AntiLoopEngine:
     def set_personality_whitelist(cls, phrases: list):
         """Set phrases that are allowed to repeat (catchphrases, quirks)."""
         global _PERSONALITY_WHITELIST
-        # Atomically replace with a frozenset — safe for concurrent readers
+        # Atomically replace with a frozenset - safe for concurrent readers
         with _PERSONALITY_WHITELIST_LOCK:
             _PERSONALITY_WHITELIST = frozenset(p.lower().strip() for p in phrases)
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def check(
         self,
@@ -218,7 +218,7 @@ class AntiLoopEngine:
     def audit_trail(self) -> list[dict]:
         return [r.to_dict() for r in self._history[-50:]]
 
-    # ── Detection helpers ─────────────────────────────────────────────────
+    # Detection helpers
 
     def _check_ngram_repetition(self, reply: str) -> float:
         """
@@ -248,7 +248,7 @@ class AntiLoopEngine:
         # Normalise by number of possible n-gram positions
         total_positions = len(tokens) - n + 1
         score = repeated_start_positions / max(total_positions, 1)
-        # Only amplify for longer replies — short replies (< 20 tokens) are
+        # Only amplify for longer replies - short replies (< 20 tokens) are
         # legitimately brief and shouldn't be over-penalised as loops.
         scale = 1.5 if len(tokens) >= 20 else 1.0
         return round(min(score * scale, 1.0), 4)
@@ -335,13 +335,13 @@ class AntiLoopEngine:
             return 0.0
 
         jaccard   = len(a & b) / len(a | b)
-        # High Jaccard = low divergence = stuck → high risk score
-        # Below 0.20 divergence → risk = 1.0; above 0.80 → risk = 0.0
+        # High Jaccard = low divergence = stuck -> high risk score
+        # Below 0.20 divergence -> risk = 1.0; above 0.80 -> risk = 0.0
         divergence = 1.0 - jaccard
         stuck_score = max(0.0, 1.0 - (divergence / 0.40))
         return round(min(stuck_score, 1.0), 4)
 
-    # ── Profile parameter accessors ───────────────────────────────────────
+    # Profile parameter accessors
 
     def _get_trigger_threshold(self) -> float:
         """

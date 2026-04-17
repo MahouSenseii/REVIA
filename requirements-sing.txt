@@ -1,4 +1,4 @@
-demucs
-openai-whisper
-librosa
-scipy
+demucs>=4.0.1
+openai-whisper>=20250625
+librosa>=0.11.0
+scipy>=1.17.1

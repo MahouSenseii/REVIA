@@ -29,7 +29,7 @@ try:
     from .anti_loop_engine   import AntiLoopEngine, ALEReport
     from .human_feel_layer   import HumanFeelLayer, HFLResult
 except ImportError:
-    # Direct (non-package) execution context — used by core_server.py and tests
+    # Direct (non-package) execution context - used by core_server.py and tests
     from answer_validation import AnswerValidationSystem, AVSResult    # type: ignore[no-redef]
     from anti_loop_engine   import AntiLoopEngine, ALEReport            # type: ignore[no-redef]
     from human_feel_layer   import HumanFeelLayer, HFLResult            # type: ignore[no-redef]
@@ -151,7 +151,7 @@ class ReplyPlanner:
                 self._ale.set_personality_whitelist(quirks)
                 _log.debug(f"[RPS] Loaded {len(quirks)} personality quirks into ALE whitelist")
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def plan(
         self,
@@ -168,12 +168,12 @@ class ReplyPlanner:
         t0 = time.monotonic()
         recent_replies = recent_replies or []
 
-        # ── Stage 1: Intent Parse ─────────────────────────────────────────
+        # Stage 1: Intent Parse
         intent = self._parse_intent(user_utterance)
         reply_type = self._select_reply_type()
         _log.debug("[RPS] intent=%s sentiment=%s reply_type=%s", intent.primary_intent, intent.sentiment, reply_type)
 
-        # ── Stage 2: Emotional Routing ────────────────────────────────────
+        # Stage 2: Emotional Routing
         # Blend user-sentiment signal with the incoming emotion_label
         resolved_emotion = self._route_emotion(intent.sentiment, emotion_label)
         _log.debug("[RPS] resolved_emotion=%s", resolved_emotion)
@@ -184,7 +184,7 @@ class ReplyPlanner:
             emotion_label  = resolved_emotion,
         )
 
-        # ── Stages 3 + 4: Generate → AVS + ALE → regen loop ──────────────
+        # Stages 3 + 4: Generate -> AVS + ALE -> regen loop
         patience      = self._get_regen_patience()
         repair_hint   = ""
         prev_candidate: str | None = None
@@ -212,7 +212,7 @@ class ReplyPlanner:
                     f"ALE triggered on attempt {attempt}: mode={ale_report.recovery_mode}"
                 )
                 if ale_report.recovery_mode == "silence":
-                    # Hard stop — return empty reply immediately
+                    # Hard stop - return empty reply immediately
                     plan.final_reply      = ""
                     plan.total_elapsed_ms = (time.monotonic() - t0) * 1000
                     plan.notes.append("ALE silence mode → empty reply")
@@ -233,11 +233,11 @@ class ReplyPlanner:
             plan.avs_results.append(avs_result)
 
             if avs_result.passed:
-                # Winner — apply HFL and wrap up
+                # Winner - apply HFL and wrap up
                 plan = self._finalise(plan, candidate, resolved_emotion, t0)
                 return plan
 
-            # Not passed — check patience
+            # Not passed - check patience
             if attempt < patience:
                 plan.notes.append(
                     f"AVS fail attempt {attempt}: composite={avs_result.scores.composite:.3f} "
@@ -251,7 +251,7 @@ class ReplyPlanner:
                 )
                 prev_candidate = candidate
 
-        # All attempts exhausted — fallback accept via AVS.select_best()
+        # All attempts exhausted - fallback accept via AVS.select_best()
         if plan.avs_results:
             best = self._avs.select_best(plan.avs_results)
             plan.fallback_accept = True
@@ -267,7 +267,7 @@ class ReplyPlanner:
 
         return plan
 
-    # ── Internal helpers ──────────────────────────────────────────────────
+    # Internal helpers
 
     def _finalise(
         self,
@@ -283,7 +283,7 @@ class ReplyPlanner:
         plan.total_elapsed_ms = (time.monotonic() - t0) * 1000
         return plan
 
-    # ── Stage 1: Intent parsing ───────────────────────────────────────────
+    # Stage 1: Intent parsing
 
     def _select_reply_type(self) -> str:
         """Select a reply type strategy based on profile weights."""
@@ -356,7 +356,7 @@ class ReplyPlanner:
 
         return frame
 
-    # ── Stage 2: Emotional routing ────────────────────────────────────────
+    # Stage 2: Emotional routing
 
     @staticmethod
     def _route_emotion(user_sentiment: str, incoming_label: str) -> str:
@@ -372,7 +372,7 @@ class ReplyPlanner:
         # Otherwise trust the EmotionNet label
         return incoming_label or "neutral"
 
-    # ── Fallback stub LLM ─────────────────────────────────────────────────
+    # Fallback stub LLM
 
     @staticmethod
     def _stub_llm(system_prompt: str, user_text: str, repair_hint: str) -> str:
@@ -383,7 +383,7 @@ class ReplyPlanner:
         _log.warning("[RPS] Using stub LLM — no real LLM backend injected")
         return f"[Stub reply for: {user_text[:40]}]"
 
-    # ── Profile accessors ─────────────────────────────────────────────────
+    # Profile accessors
 
     def _get_regen_patience(self) -> int:
         if self._pe:

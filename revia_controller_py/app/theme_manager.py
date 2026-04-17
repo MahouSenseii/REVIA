@@ -38,7 +38,7 @@ except ImportError:
     from .style_composer import StyleComposer
 
 
-# ── Token names (order preserved for UI display) ─────────────────────────────
+# Token names (order preserved for UI display)
 
 THEME_TOKENS = (
     "PrimaryBackground",
@@ -65,7 +65,7 @@ _QSS_DIR = Path(__file__).resolve().parent.parent / "gui" / "qss"
 _CUSTOM_FILE = Path(__file__).resolve().parent.parent / "custom_themes.json"
 
 
-# ── ThemeDefinition ───────────────────────────────────────────────────────────
+# ThemeDefinition
 
 @dataclass
 class ThemeDefinition:
@@ -76,7 +76,7 @@ class ThemeDefinition:
     ThemeId: str = "custom"
     DisplayName: str = "Custom"
     IsBuiltIn: bool = False
-    # Token values — defaults match the Anime (Purple) palette
+    # Token values - defaults match the Anime (Purple) palette
     PrimaryBackground: str = "#06050f"
     SecondaryBackground: str = "#0d0c1e"
     Surface: str = "#13112a"
@@ -95,12 +95,12 @@ class ThemeDefinition:
     Info: str = "#60a5fa"
     Disabled: str = "#4a3a6a"
 
-    # ── Token access ──────────────────────────────────────────────────────────
+    # Token access
 
     def tokens(self) -> dict[str, str]:
         return {k: getattr(self, k) for k in THEME_TOKENS}
 
-    # ── Serialisation ─────────────────────────────────────────────────────────
+    # Serialisation
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -120,7 +120,7 @@ class ThemeDefinition:
         kwargs = {k: v for k, v in raw.items() if k in known}
         return cls(**kwargs)
 
-    # ── Validation helpers ────────────────────────────────────────────────────
+    # Validation helpers
 
     def missing_tokens(self) -> list[str]:
         return [t for t in THEME_TOKENS if not str(getattr(self, t, "") or "").strip()]
@@ -133,7 +133,7 @@ class ThemeDefinition:
         ]
 
 
-# ── Built-in theme catalog ────────────────────────────────────────────────────
+# Built-in theme catalog
 
 def _builtin(theme_id: str, display: str, **tokens) -> ThemeDefinition:
     return ThemeDefinition(ThemeId=theme_id, DisplayName=display, IsBuiltIn=True, **tokens)
@@ -200,10 +200,96 @@ _BUILTIN_THEMES: dict[str, ThemeDefinition] = {
         Info="#2563eb",
         Disabled="#a09ab8",
     ),
+    # Nord - the classic arctic palette (https://www.nordtheme.com/).
+    # Uses the official 16 Nord colors: polar night for backgrounds,
+    # snow storm for text, frost for accents, aurora for status roles.
+    "nord": _builtin(
+        "nord", "Nord",
+        PrimaryBackground="#2e3440",   # nord0
+        SecondaryBackground="#3b4252", # nord1
+        Surface="#434c5e",             # nord2
+        SurfaceAlt="#4c566a",          # nord3
+        PrimaryText="#eceff4",         # nord6
+        SecondaryText="#d8dee9",       # nord4
+        Border="#4c566a",              # nord3
+        Accent="#88c0d0",              # nord8 (frost)
+        AccentHover="#8fbcbb",         # nord7
+        AccentActive="#5e81ac",        # nord10
+        ButtonPrimary="#5e81ac",       # nord10
+        ButtonSecondary="#3b4252",     # nord1
+        Success="#a3be8c",             # nord14
+        Warning="#ebcb8b",             # nord13
+        Error="#bf616a",               # nord11
+        Info="#81a1c1",                # nord9
+        Disabled="#4c566a",            # nord3
+    ),
+    # Red (crimson) - warm dark theme centered on rose/ruby accents.
+    "red": _builtin(
+        "red", "Crimson (Red)",
+        PrimaryBackground="#140707",
+        SecondaryBackground="#1d0a0a",
+        Surface="#2a1012",
+        SurfaceAlt="#361618",
+        PrimaryText="#fce4e4",
+        SecondaryText="#c89294",
+        Border="#5a1e22",
+        Accent="#e11d48",       # rose-600
+        AccentHover="#f43f5e",  # rose-500
+        AccentActive="#be123c", # rose-700
+        ButtonPrimary="#be123c",
+        ButtonSecondary="#2a1012",
+        Success="#10b981",
+        Warning="#f59e0b",
+        Error="#dc2626",
+        Info="#60a5fa",
+        Disabled="#5a3a3a",
+    ),
+    # Sky Blue - cool azure dark theme.
+    "sky": _builtin(
+        "sky", "Sky Blue",
+        PrimaryBackground="#051220",
+        SecondaryBackground="#0a1a30",
+        Surface="#0e233f",
+        SurfaceAlt="#152e55",
+        PrimaryText="#e0f0ff",
+        SecondaryText="#90b0d0",
+        Border="#2a4a70",
+        Accent="#38bdf8",       # sky-400
+        AccentHover="#7dd3fc",  # sky-300
+        AccentActive="#0284c7", # sky-600
+        ButtonPrimary="#0284c7",
+        ButtonSecondary="#0e233f",
+        Success="#22c55e",
+        Warning="#f59e0b",
+        Error="#ef4444",
+        Info="#60a5fa",
+        Disabled="#4a6080",
+    ),
+    # Gold - warm amber dark theme.
+    "gold": _builtin(
+        "gold", "Gold",
+        PrimaryBackground="#1a1408",
+        SecondaryBackground="#251c0c",
+        Surface="#2e2410",
+        SurfaceAlt="#3a2d15",
+        PrimaryText="#fff8e0",
+        SecondaryText="#d0bc80",
+        Border="#5a4820",
+        Accent="#fbbf24",       # amber-400
+        AccentHover="#fcd34d",  # amber-300
+        AccentActive="#d97706", # amber-600
+        ButtonPrimary="#d97706",
+        ButtonSecondary="#2e2410",
+        Success="#65a30d",      # lime-600
+        Warning="#f59e0b",
+        Error="#dc2626",
+        Info="#60a5fa",
+        Disabled="#6a5830",
+    ),
 }
 
 
-# ── ThemeManager ──────────────────────────────────────────────────────────────
+# ThemeManager
 
 class ThemeManager:
     """Single owner of UI theme state for the REVIA controller.
@@ -227,7 +313,7 @@ class ThemeManager:
         )
         self._load_custom_themes()
 
-    # ── Public read API ───────────────────────────────────────────────────────
+    # Public read API
 
     @property
     def current_theme(self) -> str:
@@ -244,32 +330,83 @@ class ThemeManager:
         """Return the ThemeDefinition for *theme_id*, or the default if missing."""
         return self._themes.get(theme_id, self._themes[_DEFAULT_THEME_ID])
 
-    # ── Apply / reset ─────────────────────────────────────────────────────────
+    # Apply / reset
 
     def apply_theme(self, theme_id: str) -> str:
         """Apply theme by ID to the Qt application.
 
         Returns the ID that was actually applied (falls back to default if the
         requested ID is not registered).
+
+        Notes on the "empty setStyleSheet first + polish pass" dance:
+        Qt caches parsed QSS state per-widget. When the previous theme used
+        gradients/backgrounds on ``QScrollArea`` or ``QTabWidget::pane``,
+        switching to a sheet that styles those selectors with a plain color
+        (or doesn't style them at all) often leaves the cached brush in
+        place until the widget is next polished. Users see "half of the
+        UI didn't change colors" until they nudge something else. The
+        two-phase ``setStyleSheet("")`` → ``setStyleSheet(qss)`` plus an
+        unpolish/polish walk forces Qt to drop that cached state on every
+        widget on the spot.
         """
         if theme_id not in self._themes:
             theme_id = _DEFAULT_THEME_ID
-        qss = self._load_qss(theme_id)
-        self.app.setStyleSheet(qss)
+        theme = self._themes.get(theme_id, self._themes[_DEFAULT_THEME_ID])
+        self._apply_stylesheet(self._load_qss(theme_id), theme)
         self._current_theme = theme_id
         return theme_id
+
+    def apply_preview(self, draft: ThemeDefinition) -> str:
+        """Apply a draft theme preview without changing current_theme."""
+        qss = self.preview_theme(draft)
+        self._apply_stylesheet(qss, draft)
+        return qss
+
+    def _apply_stylesheet(self, qss: str, theme: ThemeDefinition) -> None:
+        """Apply QSS and theme tokens in one full refresh pass."""
+        try:
+            self.app.setProperty("reviaThemeId", theme.ThemeId)
+            self.app.setProperty("reviaThemeTokens", theme.tokens())
+        except Exception:
+            pass
+        self.app.setStyleSheet("")
+        self.app.setStyleSheet(qss)
+        self._repolish_all_widgets()
+
+    def _repolish_all_widgets(self) -> None:
+        """Force Qt to re-polish every live widget.
+
+        Without this, QScrollArea viewports, QTabWidget::pane, and widgets
+        that have their own ``setStyleSheet()`` applied often keep the
+        previous theme's painted background until they next get an event.
+        """
+        try:
+            widgets = list(self.app.allWidgets())
+        except Exception:
+            return
+        for widget in widgets:
+            try:
+                style = widget.style()
+                if style is not None:
+                    style.unpolish(widget)
+                    style.polish(widget)
+                widget.update()
+            except Exception:
+                # Widgets may have been deleted mid-iteration (C++ side);
+                # skip them silently - the surviving ones still refresh.
+                continue
 
     def reset_to_default(self) -> str:
         """Reset to the built-in default theme.  Returns the applied theme ID."""
         return self.apply_theme(_DEFAULT_THEME_ID)
 
-    # ── Preview ───────────────────────────────────────────────────────────────
+    # Preview
 
     def preview_theme(self, draft: ThemeDefinition) -> str:
         """Return a QSS string for a draft theme without changing the active theme."""
         return self._composer.compose(draft)
 
-    # ── Custom theme persistence ──────────────────────────────────────────────
+    # Custom theme persistence
 
     def save_custom_theme(self, draft: ThemeDefinition) -> None:
         """Register and persist a custom theme.
@@ -297,7 +434,7 @@ class ThemeManager:
             self.apply_theme(_DEFAULT_THEME_ID)
         self._persist_custom_themes()
 
-    # ── Validation ────────────────────────────────────────────────────────────
+    # Validation
 
     def validate_theme(self, draft: ThemeDefinition) -> dict:
         """Validate a ThemeDefinition and return a result dict.
@@ -340,7 +477,7 @@ class ThemeManager:
 
         return {"valid": not errors, "errors": errors, "warnings": warnings}
 
-    # ── Internal: stylesheet loading ──────────────────────────────────────────
+    # Internal: stylesheet loading
 
     def _load_qss(self, theme_id: str) -> str:
         """Return QSS for *theme_id*.
@@ -359,7 +496,7 @@ class ThemeManager:
         theme = self._themes.get(theme_id, self._themes[_DEFAULT_THEME_ID])
         return self._composer.compose(theme)
 
-    # ── Internal: persistence ─────────────────────────────────────────────────
+    # Internal: persistence
 
     def _persist_custom_themes(self) -> None:
         data = {
@@ -391,7 +528,7 @@ class ThemeManager:
         except (OSError, json.JSONDecodeError):
             pass
 
-    # ── Internal: contrast helpers ────────────────────────────────────────────
+    # Internal: contrast helpers
 
     @staticmethod
     def _hex_to_rgb(hex_color: str) -> tuple[float, float, float]:

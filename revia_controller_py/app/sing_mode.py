@@ -103,7 +103,7 @@ class SongAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# Pitch → style instruction mapping
+# Pitch -> style instruction mapping
 # ---------------------------------------------------------------------------
 
 def _pitch_to_style(pitch_hz: float, energy: float, bpm: float) -> str:
@@ -279,7 +279,7 @@ class VocalSeparator:
         data, sr = _read_audio(input_wav)
 
         if data.shape[1] >= 2:
-            # Center extraction: vocals ≈ (L+R)/2, instruments ≈ (L-R)/2
+            # Center extraction: vocals ~ (L+R)/2, instruments ~ (L-R)/2
             left, right = data[:, 0], data[:, 1]
             vocals = (left + right) / 2.0
             instruments = (left - right) / 2.0

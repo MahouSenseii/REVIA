@@ -158,7 +158,7 @@ class AnswerValidationSystem:
         self._pe = profile_engine
         self._history: list[AVSResult] = []   # audit trail
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # Public API
 
     def validate(
         self,
@@ -238,7 +238,7 @@ class AnswerValidationSystem:
     def audit_trail(self) -> list[dict]:
         return [r.to_dict() for r in self._history[-50:]]   # last 50 entries
 
-    # ── Scoring helpers ───────────────────────────────────────────────────
+    # Scoring helpers
 
     def _score_intent_coverage(self, reply: str, utterance: str) -> float:
         """
@@ -264,7 +264,7 @@ class AnswerValidationSystem:
         overlap = len(utt_kw & reply_kw)
         # Soft coverage: at least half the keywords earns full marks
         raw = overlap / len(utt_kw)
-        # Sigmoid-like curve: 50% overlap → score ~0.80
+        # Sigmoid-like curve: 50% overlap -> score ~0.80
         score = 1.0 - math.exp(-3.0 * raw)
         return round(min(score, 1.0), 4)
 
@@ -364,7 +364,7 @@ class AnswerValidationSystem:
         score = emotion_map.get(emotion_label.lower(), 0.70)
         # Apply emotion_intensity scaling from profile
         intensity = self._get_emotion_intensity()
-        # Low intensity profile → less strict about alignment
+        # Low intensity profile -> less strict about alignment
         adjusted = score * intensity + (1.0 - intensity) * 0.80
         return round(min(adjusted, 1.0), 4)
 
@@ -393,7 +393,7 @@ class AnswerValidationSystem:
             overlap  = len(reply_ng & prev_ng) / len(reply_ng | prev_ng)
             max_overlap = max(max_overlap, overlap)
 
-        # Jaccard 0 → novelty 1.0; Jaccard 1 → novelty 0.0
+        # Jaccard 0 -> novelty 1.0; Jaccard 1 -> novelty 0.0
         novelty = 1.0 - max_overlap
         return round(novelty, 4)
 
@@ -438,7 +438,7 @@ class AnswerValidationSystem:
             score += 0.2
         return min(1.0, score)
 
-    # ── Profile parameter accessors ───────────────────────────────────────
+    # Profile parameter accessors
 
     def _get_threshold(self) -> float:
         if self._pe:

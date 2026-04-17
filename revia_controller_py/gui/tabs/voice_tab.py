@@ -1,6 +1,8 @@
 """Voice Management tab for REVIA -- Qwen3-TTS integration with 3 generation modes."""
 import sys
 import re
+import json
+import os
 import shutil
 import threading
 import logging
@@ -53,7 +55,7 @@ class VoiceTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        # â”€â”€ Qwen3-TTS Server â”€â”€
+        # Qwen3-TTS Server
         srv_group = QGroupBox("Qwen3-TTS Server")
         srv_group.setObjectName("settingsGroup")
         sv = QFormLayout(srv_group)
@@ -82,7 +84,13 @@ class VoiceTab(QScrollArea):
         btn_row.addWidget(self.stop_tts_btn)
         self.engine_combo = QComboBox()
         self.engine_combo.addItems(["Qwen3-TTS", "pyttsx3"])
-        self.engine_combo.setCurrentText("pyttsx3")
+        self._tts_cuda_skip_reason = ""
+        self._tts_cuda_warning_logged = False
+        self._startup_backend = self._preferred_startup_backend()
+        self._qwen_activation_pending = self._startup_backend == "qwen3-tts"
+        self.engine_combo.setCurrentText(
+            "Qwen3-TTS" if self._startup_backend == "qwen3-tts" else "pyttsx3"
+        )
         self.engine_combo.currentTextChanged.connect(self._on_engine_changed)
         btn_row.addWidget(self.engine_combo)
         sv.addRow("", btn_row)
@@ -93,13 +101,22 @@ class VoiceTab(QScrollArea):
         self.tts_server_status.setWordWrap(True)
         sv.addRow("Server:", self.tts_server_status)
 
-        # Active backend indicator — always visible, single source of truth
-        self.active_backend_lbl = QLabel("Active: pyttsx3  |  Fallback: pyttsx3  |  Ready")
+        # Active backend indicator - always visible, single source of truth
+        startup_label = (
+            "Qwen3-TTS pending"
+            if self._qwen_activation_pending
+            else "pyttsx3"
+        )
+        startup_health = "Starting" if self._qwen_activation_pending else "Ready"
+        self.active_backend_lbl = QLabel(
+            f"Active: {startup_label}  |  Fallback: pyttsx3  |  {startup_health}"
+        )
         self.active_backend_lbl.setObjectName("metricLabel")
         self.active_backend_lbl.setFont(QFont("Consolas", 8))
         self.active_backend_lbl.setWordWrap(True)
         sv.addRow("Backend:", self.active_backend_lbl)
 
+        # Keep live speech on the fallback until the Qwen server is reachable.
         self.voice_mgr.backend.set_engine("pyttsx3")
         self.voice_mgr.backend.set_qwen_server("http://localhost:8000")
         # Wire backend_changed so the indicator stays in sync
@@ -108,16 +125,46 @@ class VoiceTab(QScrollArea):
         self._tts_ready_timer = None
         self._tts_last_lines: list[str] = []
         self._tts_launcher_tmp = None  # temp wrapper script for CPU-only builds
+        self._tts_last_device_label = ""
+        self._tts_cuda_failure_seen = False
+        self._tts_cuda_retry_attempted = False
         layout.addWidget(srv_group)
 
-        # â”€â”€ 3 Mode Tabs (matching Qwen3-TTS demo) â”€â”€
+        # TTS Output Device (Revia's voice)
+        # Placed directly under the TTS server controls so it's visible
+        # without scrolling - it's a frequent-touch setting when you have
+        # multiple outputs (speakers / headset / VB-Cable / OBS Monitor).
+        out_group = QGroupBox("TTS Output (where Revia speaks)")
+        out_group.setObjectName("settingsGroup")
+        ov = QFormLayout(out_group)
+        ov.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.output_device = QComboBox()
+        # The first entry (userData=None) means "use the OS default device".
+        self.output_device.addItem("System Default", userData=None)
+        self._populate_output_devices()
+        self.output_device.currentIndexChanged.connect(self._on_output_device_changed)
+        ov.addRow("Output Device:", self.output_device)
+        out_btn_row = QHBoxLayout()
+        self.output_test_btn = QPushButton("Test Output")
+        self.output_test_btn.setObjectName("secondaryBtn")
+        self.output_test_btn.clicked.connect(self._test_output_device)
+        out_btn_row.addWidget(self.output_test_btn)
+        self.output_refresh_btn = QPushButton("Refresh")
+        self.output_refresh_btn.setObjectName("secondaryBtn")
+        self.output_refresh_btn.clicked.connect(self._refresh_output_devices)
+        out_btn_row.addWidget(self.output_refresh_btn)
+        out_btn_row.addStretch()
+        ov.addRow("", out_btn_row)
+        layout.addWidget(out_group)
+
+        # 3 Mode Tabs (matching Qwen3-TTS demo)
         self.mode_tabs = QTabWidget()
         self.mode_tabs.addTab(self._build_design_tab(), "Voice Design")
         self.mode_tabs.addTab(self._build_clone_tab(), "Voice Clone (Base)")
         self.mode_tabs.addTab(self._build_custom_tab(), "TTS (CustomVoice)")
         layout.addWidget(self.mode_tabs)
 
-        # â”€â”€ Voice Library â”€â”€
+        # Voice Library
         lib_group = QGroupBox("Voice Library")
         lib_group.setObjectName("settingsGroup")
         lib_layout = QVBoxLayout(lib_group)
@@ -161,7 +208,7 @@ class VoiceTab(QScrollArea):
         lib_layout.addWidget(self.lib_meta)
         layout.addWidget(lib_group)
 
-        # â”€â”€ STT Input â”€â”€
+        # STT Input
         stt_group = QGroupBox("Speech-to-Text (Input)")
         stt_group.setObjectName("settingsGroup")
         stf = QFormLayout(stt_group)
@@ -178,7 +225,7 @@ class VoiceTab(QScrollArea):
         stf.addRow("Activation:", self.ptt_mode)
         layout.addWidget(stt_group)
 
-        # â”€â”€ Mic Test â”€â”€
+        # Mic Test
         mic_group = QGroupBox("Microphone Test")
         mic_group.setObjectName("settingsGroup")
         ml = QVBoxLayout(mic_group)
@@ -207,7 +254,7 @@ class VoiceTab(QScrollArea):
         ml.addLayout(mic_row)
         layout.addWidget(mic_group)
 
-        # â”€â”€ Latency Metrics â”€â”€
+        # Latency Metrics
         lat_group = QGroupBox("TTS Latency")
         lat_group.setObjectName("settingsGroup")
         ll = QHBoxLayout(lat_group)
@@ -225,7 +272,7 @@ class VoiceTab(QScrollArea):
         ll.addWidget(self.rtf_lbl)
         layout.addWidget(lat_group)
 
-        # â”€â”€ Status â”€â”€
+        # Status
         self.status_label = QLabel("Status: Ready")
         self.status_label.setFont(QFont("Consolas", 8))
         self.status_label.setObjectName("metricLabel")
@@ -242,9 +289,13 @@ class VoiceTab(QScrollArea):
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self._refresh_library()
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        # Defer the "fetch persisted TTS output device" hit to let the core
+        # come up first. If the core is already up this returns instantly;
+        # if it's still booting, get_tts_output() returns the default shape
+        # and we simply leave the combobox on "System Default".
+        QTimer.singleShot(500, self._load_saved_output_device)
+
     # Voice Design Tab
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_design_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -304,9 +355,7 @@ class VoiceTab(QScrollArea):
         self._last_design_wav = None
         return w
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Voice Clone (Base) Tab
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_clone_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -392,9 +441,7 @@ class VoiceTab(QScrollArea):
         self._last_clone_wav = None
         return w
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # TTS (CustomVoice) Tab
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     def _build_custom_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
@@ -466,9 +513,7 @@ class VoiceTab(QScrollArea):
         self._last_custom_wav = None
         return w
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Generation actions (threaded)
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _run_design(self):
         text = self.design_text.toPlainText().strip()
@@ -569,9 +614,7 @@ class VoiceTab(QScrollArea):
         if wav and Path(wav).exists():
             self.voice_mgr.play_wav(wav)
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Save to Library
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _save_design(self):
         wav = self._last_design_wav
@@ -645,9 +688,7 @@ class VoiceTab(QScrollArea):
         self._refresh_library()
         self.custom_status.setText(f"Saved: {name.strip()}")
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Voice Library actions
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _refresh_library(self):
         self.voice_mgr.library.load_all()
@@ -749,9 +790,7 @@ class VoiceTab(QScrollArea):
         else:
             self._set_status("No WAV file for this voice", role="error")
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Clone tab helpers
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _browse_ref_audio(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -793,13 +832,82 @@ class VoiceTab(QScrollArea):
             self.clone_status.setText("Recording saved")
             apply_status_style(self.clone_status, role="success")
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Engine / Devices / Metrics
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+    def _preferred_startup_backend(self) -> str:
+        """Default to Qwen3-TTS when the local model settings enable CUDA."""
+        return "qwen3-tts" if self._cuda_enabled_for_tts_default() else "pyttsx3"
+
+    def _cuda_enabled_for_tts_default(self) -> bool:
+        """Best-effort CUDA gate for startup voice defaults."""
+        self._tts_cuda_skip_reason = ""
+        try:
+            settings_path = Path(__file__).resolve().parents[3] / "model_settings.json"
+            if settings_path.is_file():
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                backend = str(data.get("local_backend", "")).strip().upper()
+                gpu_layers = int(data.get("srv_gpu_layers", data.get("gpu_layers", 0)) or 0)
+                if backend == "CUDA" and gpu_layers != 0:
+                    device, is_cpu_only = self._detect_tts_device()
+                    if device == "cuda":
+                        return True
+                    existing_reason = getattr(self, "_tts_cuda_skip_reason", "")
+                    if is_cpu_only:
+                        self._tts_cuda_skip_reason = existing_reason or (
+                            "TTS PyTorch cannot run CUDA on this GPU; install a "
+                            "compatible CUDA-enabled torch build in the project .venv "
+                            "for Qwen3-TTS GPU startup"
+                        )
+                    else:
+                        self._tts_cuda_skip_reason = existing_reason or "TTS PyTorch cannot see a CUDA GPU"
+                    if not getattr(self, "_tts_cuda_warning_logged", False):
+                        self._tts_cuda_warning_logged = True
+                        logger.warning(
+                            "Model settings enable CUDA, but Qwen3-TTS cannot use CUDA: %s",
+                            self._tts_cuda_skip_reason,
+                        )
+                    return False
+        except Exception as exc:
+            logger.debug("Error reading model_settings CUDA state: %s", exc)
+
+        try:
+            import torch
+            if not getattr(getattr(torch, "version", None), "cuda", None):
+                self._tts_cuda_skip_reason = "TTS PyTorch is CPU-only"
+                return False
+            available = bool(torch.cuda.is_available())
+            if not available:
+                self._tts_cuda_skip_reason = "TTS PyTorch cannot see a CUDA GPU"
+            return available
+        except Exception as exc:
+            logger.debug("Error probing CUDA for TTS default: %s", exc)
+            self._tts_cuda_skip_reason = str(exc)
+            return False
 
     def _on_engine_changed(self, text):
         """Route engine selection through VoiceManager (single source of truth)."""
         engine_id = "pyttsx3" if "pyttsx3" in text.lower() else "qwen3-tts"
+        if engine_id == "qwen3-tts":
+            if self._qwen_server_ready(8000):
+                self._qwen_activation_pending = False
+                self._activate_qwen_backend(8000)
+                return
+            self._qwen_activation_pending = True
+            self.voice_mgr.backend.set_qwen_server(
+                self.qwen_url.text().strip() or "http://localhost:8000"
+            )
+            self._update_active_backend_label()
+            self._set_status(
+                "Starting Qwen3-TTS; using fallback until ready",
+                role="warning",
+            )
+            if (
+                not self._tts_process
+                or self._tts_process.state() == QProcess.NotRunning
+            ):
+                self._start_tts_server()
+            return
+        self._qwen_activation_pending = False
         self.voice_mgr.set_backend(engine_id)
         self._update_active_backend_label()
 
@@ -818,6 +926,16 @@ class VoiceTab(QScrollArea):
         if hasattr(self, "active_backend_lbl"):
             label = self.voice_mgr.active_backend_label
             fallback = self.voice_mgr.fallback_backend_name
+            if (
+                getattr(self, "_qwen_activation_pending", False)
+                and self.voice_mgr.active_backend_name != "qwen3-tts"
+            ):
+                self.active_backend_lbl.setText(
+                    f"Active: {label}  |  Preferred: Qwen3-TTS  |  "
+                    f"Fallback: {fallback}  |  Starting"
+                )
+                apply_status_style(self.active_backend_lbl, role="warning")
+                return
             ready = self.voice_mgr.is_backend_ready()
             health = "Ready" if ready else "Unavailable"
             role = "success" if ready else "warning"
@@ -834,6 +952,136 @@ class VoiceTab(QScrollArea):
                     self.input_device.addItem(f"{d['name']} (#{i})", userData=i)
         except Exception as e:
             logger.warning(f"Error populating input devices: {e}")
+
+    def _populate_output_devices(self):
+        """Fill the output-device combobox with PortAudio sinks."""
+        try:
+            import sounddevice as sd
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_output_channels", 0) > 0:
+                    self.output_device.addItem(
+                        f"{d['name']} (#{i})", userData=i
+                    )
+        except Exception as e:
+            logger.warning(f"Error populating output devices: {e}")
+
+    def _refresh_output_devices(self):
+        """Re-enumerate output devices (e.g. after plugging in headphones)."""
+        # Remember the current selection so we can restore it after refresh.
+        current = self.output_device.currentData()
+        try:
+            self.output_device.blockSignals(True)
+            self.output_device.clear()
+            self.output_device.addItem("System Default", userData=None)
+            self._populate_output_devices()
+            # Restore by userData match
+            for idx in range(self.output_device.count()):
+                if self.output_device.itemData(idx) == current:
+                    self.output_device.setCurrentIndex(idx)
+                    break
+        finally:
+            self.output_device.blockSignals(False)
+
+    def _on_output_device_changed(self, _index=None):
+        """User picked a different output device - apply + persist."""
+        data = self.output_device.currentData()
+        label = self.output_device.currentText()
+        backend = getattr(self.voice_mgr, "backend", None)
+        if backend is not None and hasattr(backend, "set_output_device"):
+            try:
+                backend.set_output_device(data, label=label)
+            except Exception as e:
+                logger.warning(f"Error applying output device: {e}")
+
+        # Persist to the core via the controller client, if available.
+        client = getattr(self, "client", None)
+        if client is not None and hasattr(client, "set_tts_output"):
+            try:
+                payload = {"device": data, "label": label}
+                client.set_tts_output(payload)
+            except Exception as e:
+                logger.debug(f"Error persisting output device: {e}")
+
+    def _load_saved_output_device(self):
+        """Fetch the persisted TTS output device from the core and select it."""
+        client = getattr(self, "client", None)
+        if client is None or not hasattr(client, "get_tts_output"):
+            return
+        try:
+            saved = client.get_tts_output() or {}
+        except Exception as e:
+            logger.debug(f"Could not fetch saved TTS output device: {e}")
+            return
+        device = saved.get("device")
+        if device in (None, "", -1):
+            return  # already on "System Default"
+
+        # Find the matching combobox entry by userData. If no match (user
+        # unplugged the device or selected by name), fall back to string match
+        # on the label so we at least show *something* meaningful.
+        match_idx = -1
+        for idx in range(self.output_device.count()):
+            if self.output_device.itemData(idx) == device:
+                match_idx = idx
+                break
+        if match_idx < 0:
+            saved_label = str(saved.get("label") or "")
+            if saved_label:
+                for idx in range(self.output_device.count()):
+                    if self.output_device.itemText(idx) == saved_label:
+                        match_idx = idx
+                        break
+
+        if match_idx >= 0:
+            # Push through the backend without sending a redundant save back
+            # to the core (we're restoring what the core just told us).
+            self.output_device.blockSignals(True)
+            try:
+                self.output_device.setCurrentIndex(match_idx)
+            finally:
+                self.output_device.blockSignals(False)
+            backend = getattr(self.voice_mgr, "backend", None)
+            if backend is not None and hasattr(backend, "set_output_device"):
+                try:
+                    backend.set_output_device(
+                        self.output_device.currentData(),
+                        label=self.output_device.currentText(),
+                    )
+                except Exception as e:
+                    logger.warning(f"Error applying saved output device: {e}")
+        else:
+            logger.info(
+                f"Saved TTS output device {device!r} not present on this system"
+            )
+
+    def _test_output_device(self):
+        """Speak a short phrase through the currently selected output device."""
+        backend = getattr(self.voice_mgr, "backend", None)
+        if backend is None:
+            self._set_status("No TTS backend available for test", role="warning")
+            return
+        phrase = "Output device test. If you can hear this, Revia is routed correctly."
+        try:
+            # Prefer the profile-aware path if there is an active profile so
+            # the test actually uses Qwen3 if it's up. Otherwise fall through
+            # to the pyttsx3 rendering which also honors the device setting.
+            vp = getattr(self.voice_mgr, "active_profile", None)
+            if vp is not None and hasattr(backend, "speak_from_profile"):
+                backend.speak_from_profile(phrase, vp, emotion="neutral")
+            else:
+                import threading
+                threading.Thread(
+                    target=backend._speak_pyttsx3,
+                    args=(phrase, 1.0, 1.0),
+                    daemon=True,
+                ).start()
+            self._set_status(
+                f"Testing output: {self.output_device.currentText()}",
+                role="success",
+            )
+        except Exception as e:
+            logger.warning(f"Output test failed: {e}")
+            self._set_status(f"Output test failed: {e}", role="error")
 
     def _toggle_mic_test(self, active):
         if not self.audio_service:
@@ -913,6 +1161,12 @@ class VoiceTab(QScrollArea):
 
     def _auto_start_qwen_tts_on_launch(self):
         port = 8000
+        qwen_requested = bool(getattr(self, "_qwen_activation_pending", False))
+        if not qwen_requested and not self._cuda_enabled_for_tts_default():
+            reason = self._tts_cuda_skip_reason or "CUDA not enabled"
+            self._log_voice_startup(f"Qwen3-TTS auto-start skipped: {reason}")
+            return
+
         if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
             self._log_voice_startup("Qwen3-TTS already starting")
             return
@@ -941,6 +1195,8 @@ class VoiceTab(QScrollArea):
             self._log_voice_startup(msg)
             return
 
+        self._qwen_activation_pending = True
+        self._update_active_backend_label()
         self._set_status("Starting Qwen3-TTS on launch", role="warning")
         self._log_voice_startup("Starting Qwen3-TTS on launch")
         self._start_tts_server()
@@ -950,6 +1206,7 @@ class VoiceTab(QScrollArea):
             self.audio_service.set_input_device(self.input_device.currentData())
 
     def _activate_qwen_backend(self, port=8000):
+        self._qwen_activation_pending = False
         url = f"http://localhost:{port}"
         if self.qwen_url.text().strip().rstrip("/") != url:
             self.qwen_url.setText(url)
@@ -959,6 +1216,17 @@ class VoiceTab(QScrollArea):
             self.voice_mgr.set_backend("qwen3-tts")
         else:
             self._update_active_backend_label()
+
+    def _select_pyttsx3_backend(self):
+        self._qwen_activation_pending = False
+        if self.voice_mgr.active_backend_name != "pyttsx3":
+            self.voice_mgr.set_backend("pyttsx3")
+        else:
+            self._update_active_backend_label()
+        if hasattr(self, "engine_combo") and self.engine_combo.currentText() != "pyttsx3":
+            self.engine_combo.blockSignals(True)
+            self.engine_combo.setCurrentText("pyttsx3")
+            self.engine_combo.blockSignals(False)
 
     def _qwen_server_ready(self, port=8000):
         try:
@@ -985,18 +1253,20 @@ class VoiceTab(QScrollArea):
         except Exception:
             logger.debug("[Voice] %s", message)
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Qwen3-TTS Local Server Management
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-    def _start_tts_server(self):
+    def _start_tts_server(self, _checked=False, force_device=None):
         if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
             self.tts_server_status.setText("Already running")
             return
+        if force_device is None:
+            self._tts_cuda_retry_attempted = False
 
         model_key = self.qwen_model_combo.currentText()
         model_id = QWEN_MODELS.get(model_key, "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
         port = "8000"
+        self._tts_cuda_failure_seen = False
+        self._tts_last_lines = []
 
         self._kill_port(int(port))
 
@@ -1015,7 +1285,7 @@ class VoiceTab(QScrollArea):
             try:
                 print(f"[TTS-SRV] GUI CUDA avail: {_t.cuda.is_available()}")
             except Exception as _ce:
-                print(f"[TTS-SRV] GUI CUDA avail: ERROR â€“ {_ce}")
+                print(f"[TTS-SRV] GUI CUDA avail: ERROR - {_ce}")
         except Exception as _te:
             print(f"[TTS-SRV] GUI torch check failed: {_te}")
 
@@ -1031,6 +1301,7 @@ class VoiceTab(QScrollArea):
 
         qwen_module = self._resolve_qwen_module()
         if not qwen_module:
+            self._select_pyttsx3_backend()
             apply_status_style(self.tts_server_status, role="error")
             self.tts_server_status.setText(
                 "Qwen3-TTS module not found. Install package, then retry."
@@ -1039,14 +1310,26 @@ class VoiceTab(QScrollArea):
             self.stop_tts_btn.setEnabled(False)
             return
 
-        args, device_label = self._build_tts_server_args(qwen_module, model_id, port)
+        args, device_label = self._build_tts_server_args(
+            qwen_module,
+            model_id,
+            port,
+            force_device=force_device,
+        )
+        self._tts_last_device_label = device_label
 
         # If using CPU, hide all GPUs from the subprocess so PyTorch/CUDA
         # can't accidentally try to initialise a CUDA device and crash.
         if device_label == "CPU":
             env.insert("CUDA_VISIBLE_DEVICES", "")
+        else:
+            # Helps CUDA errors point at the real failing op in Qwen logs.
+            env.insert("CUDA_LAUNCH_BLOCKING", "1")
+            env.insert("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
         self._tts_process.setProcessEnvironment(env)
+        self._qwen_activation_pending = True
+        self._update_active_backend_label()
         self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
         apply_status_style(self.tts_server_status, role="warning")
         self.start_tts_btn.setEnabled(False)
@@ -1103,14 +1386,20 @@ class VoiceTab(QScrollArea):
                 continue
         return ""
 
-    def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str):
+    def _build_tts_server_args(self, qwen_module: str, model_id: str, port: str, force_device=None):
         """Build launch args and prefer CUDA when available."""
-        device, is_cpu_only = self._detect_tts_device()
+        override = str(force_device or "").strip().lower()
+        if not override:
+            override = str(os.environ.get("REVIA_QWEN_TTS_DEVICE", "")).strip().lower()
+        if override in ("cpu", "cuda"):
+            device, is_cpu_only = override, override == "cpu"
+        else:
+            device, is_cpu_only = self._detect_tts_device()
         model_args = [model_id, "--port", port, "--ip", "0.0.0.0", "--no-flash-attn"]
 
         if is_cpu_only:
             # PyTorch is not compiled with CUDA.  Any call to torch.cuda.*
-            # raises AssertionError unconditionally â€” CUDA_VISIBLE_DEVICES
+            # raises AssertionError unconditionally CUDA_VISIBLE_DEVICES
             # cannot help here.  Run qwen_tts via a small wrapper script
             # that monkey-patches torch.cuda.is_available() to return False
             # safely before the module is imported.
@@ -1128,25 +1417,37 @@ class VoiceTab(QScrollArea):
     def _create_tts_launcher(self, qwen_module: str) -> str:
         """Write a temp launcher that patches torch.cuda before running qwen_tts.
 
-        On CPU-only PyTorch builds torch.cuda.is_available() raises
-        AssertionError instead of returning False.  This wrapper intercepts
-        that error so qwen_tts falls back to CPU without crashing.
+        CPU-only PyTorch builds can still expose a torch.cuda namespace, but
+        any accidental CUDA touch can raise "Torch not compiled with CUDA".
+        This wrapper forces the CUDA probes used by Qwen to report CPU before
+        the demo module imports torch.
 
         Returns the path to the temp script (caller is responsible for
         deleting it via self._tts_launcher_tmp when the server stops).
         """
         import tempfile
         code = (
+            "import os\n"
             "import sys\n"
+            "os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')\n"
             "try:\n"
             "    import torch as _t\n"
-            "    _orig = _t.cuda.is_available\n"
-            "    def _safe():\n"
-            "        try:\n"
-            "            return _orig()\n"
-            "        except (AssertionError, RuntimeError):\n"
-            "            return False\n"
-            "    _t.cuda.is_available = _safe\n"
+            "    def _false(*_a, **_k):\n"
+            "        return False\n"
+            "    def _zero(*_a, **_k):\n"
+            "        return 0\n"
+            "    def _none(*_a, **_k):\n"
+            "        return None\n"
+            "    _t.cuda.is_available = _false\n"
+            "    _t.cuda.device_count = _zero\n"
+            "    _t.cuda.is_initialized = _false\n"
+            "    _t.cuda.current_device = _zero\n"
+            "    _t.cuda.empty_cache = _none\n"
+            "    _t.cuda.set_device = _none\n"
+            "    if hasattr(_t, 'Tensor'):\n"
+            "        _t.Tensor.cuda = lambda self, device=None, non_blocking=False, memory_format=None: self\n"
+            "    if hasattr(_t, 'nn') and hasattr(_t.nn, 'Module'):\n"
+            "        _t.nn.Module.cuda = lambda self, device=None: self\n"
             "except Exception:\n"
             "    pass\n"
             "import runpy\n"
@@ -1164,21 +1465,43 @@ class VoiceTab(QScrollArea):
 
         Returns:
             (device_str, is_cpu_only_build) where is_cpu_only_build=True
-            means PyTorch was not compiled with CUDA at all (as opposed to
-            simply having no GPU attached).  The distinction matters: for a
-            CPU-only build, torch.cuda.* raises AssertionError rather than
-            returning a safe False, so the subprocess needs special handling.
+            means the subprocess needs the CPU-safe launcher. That includes
+            true CPU-only torch builds and CUDA builds that cannot execute on
+            the installed GPU architecture.
         """
         try:
             import torch
+            if not getattr(getattr(torch, "version", None), "cuda", None):
+                if self is not None:
+                    self._tts_cuda_skip_reason = "TTS PyTorch is CPU-only"
+                return "cpu", True
             # torch.cuda.is_available() raises AssertionError on CPU-only
             # torch builds ("Torch not compiled with CUDA enabled"), so
             # wrap it separately to avoid that surfacing to the user.
             try:
                 if torch.cuda.is_available():
+                    try:
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            probe = torch.empty(1, device="cuda")
+                            probe.zero_()
+                            torch.cuda.synchronize()
+                    except Exception as exc:
+                        detail = str(exc).splitlines()[0]
+                        reason = (
+                            "TTS CUDA probe failed; this PyTorch build may not "
+                            f"support your GPU: {detail}"
+                        )
+                        if self is not None:
+                            self._tts_cuda_skip_reason = reason
+                        logger.debug(reason)
+                        return "cpu", True
                     return "cuda", False
                 return "cpu", False   # CUDA compiled but no GPU attached
             except (AssertionError, RuntimeError):
+                if self is not None:
+                    self._tts_cuda_skip_reason = "TTS PyTorch cannot initialize CUDA"
                 return "cpu", True    # CUDA not compiled into this torch
         except Exception as e:
             logger.debug(f"Error detecting CUDA: {e}")
@@ -1221,24 +1544,19 @@ class VoiceTab(QScrollArea):
         self.tts_server_status.setText(f"Loading {model_key}{dots}")
 
     def _stop_tts_server(self):
+        self._qwen_activation_pending = False
         if self._tts_ready_timer:
             self._tts_ready_timer.stop()
         if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
             self._tts_process.kill()
             self._tts_process.waitForFinished(3000)
         self._kill_port(8000)
-        # Clean up any temp launcher script written for CPU-only builds.
-        if self._tts_launcher_tmp:
-            try:
-                import os as _os
-                _os.unlink(self._tts_launcher_tmp)
-            except OSError:
-                pass
-            self._tts_launcher_tmp = None
+        self._cleanup_tts_launcher()
         self.tts_server_status.setText("Stopped")
         clear_status_role(self.tts_server_status)
         self.start_tts_btn.setEnabled(True)
         self.stop_tts_btn.setEnabled(False)
+        self._select_pyttsx3_backend()
 
     def _on_tts_output(self):
         if not self._tts_process:
@@ -1252,7 +1570,10 @@ class VoiceTab(QScrollArea):
                 continue
             print(f"[TTS-SRV] {line}")
             self._append_tts_log_line(line)
+            if self._is_cuda_tts_failure(line):
+                self._tts_cuda_failure_seen = True
             if "Running on" in line:
+                self._activate_qwen_backend(8000)
                 self.tts_server_status.setText("Running on :8000")
                 apply_status_style(self.tts_server_status, role="success")
                 if self._tts_ready_timer:
@@ -1269,17 +1590,39 @@ class VoiceTab(QScrollArea):
                 if line:
                     print(f"[TTS-SRV] {line}")
                     self._append_tts_log_line(line)
+                    if self._is_cuda_tts_failure(line):
+                        self._tts_cuda_failure_seen = True
 
         print(f"[TTS-SRV] Exited: code={exit_code}")
         if self._tts_ready_timer:
             self._tts_ready_timer.stop()
         self.start_tts_btn.setEnabled(True)
         self.stop_tts_btn.setEnabled(False)
+        self._cleanup_tts_launcher()
 
         if exit_code == 0:
+            self._select_pyttsx3_backend()
             self.tts_server_status.setText("Stopped")
             clear_status_role(self.tts_server_status)
         else:
+            if self._should_retry_qwen_on_cpu():
+                self._tts_cuda_retry_attempted = True
+                self._qwen_activation_pending = True
+                self._update_active_backend_label()
+                msg = "Qwen3-TTS CUDA failed; retrying on CPU"
+                self.tts_server_status.setText(msg)
+                apply_status_style(self.tts_server_status, role="warning")
+                self._set_status(msg, role="warning")
+                self._log_voice_startup(
+                    "Qwen3-TTS CUDA failed with a PyTorch device-side assert; "
+                    "retrying once on CPU"
+                )
+                QTimer.singleShot(
+                    500,
+                    lambda: self._start_tts_server(force_device="cpu"),
+                )
+                return
+            self._select_pyttsx3_backend()
             # Show the last error line in the status label so the user can
             # diagnose the crash without opening the console.
             error_hint = ""
@@ -1294,7 +1637,7 @@ class VoiceTab(QScrollArea):
                 )
             else:
                 self.tts_server_status.setText(
-                    f"Exited ({exit_code}) â€” check console for details"
+                    f"Exited ({exit_code}) - check console for details"
                 )
 
     def _clean_tts_log_line(self, line: str) -> str:
@@ -1306,6 +1649,35 @@ class VoiceTab(QScrollArea):
         self._tts_last_lines.append(line)
         if len(self._tts_last_lines) > 20:
             self._tts_last_lines.pop(0)
+
+    def _is_cuda_tts_failure(self, line: str) -> bool:
+        text = str(line or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "device-side assert",
+                "torch_use_cuda_dsa",
+                "cuda error",
+                "cublas",
+                "cudnn",
+            )
+        )
+
+    def _should_retry_qwen_on_cpu(self) -> bool:
+        return (
+            self._tts_last_device_label.upper() == "CUDA"
+            and self._tts_cuda_failure_seen
+            and not self._tts_cuda_retry_attempted
+        )
+
+    def _cleanup_tts_launcher(self):
+        if self._tts_launcher_tmp:
+            try:
+                import os as _os
+                _os.unlink(self._tts_launcher_tmp)
+            except OSError:
+                pass
+            self._tts_launcher_tmp = None
 
     def _kill_port(self, port):
         try:

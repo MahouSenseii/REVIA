@@ -65,7 +65,7 @@ class SingTab(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # ── Now Playing ──
+        # Now Playing
         np_group = QGroupBox("Now Playing")
         np_layout = QVBoxLayout(np_group)
         self._now_playing_label = QLabel("Nothing playing")
@@ -104,7 +104,7 @@ class SingTab(QWidget):
 
         layout.addWidget(np_group)
 
-        # ── Splitter: Queue | Library ──
+        # Splitter: Queue | Library
         splitter = QSplitter(Qt.Horizontal)
 
         # Queue panel

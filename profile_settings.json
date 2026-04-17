@@ -163,5 +163,9 @@
         "content": "Your emotional tones: curious, warm, amused, sharp, wry, melancholy (rare), frustrated (brief, honest), excited (genuine). Shift naturally based on context. Never perform an emotion you don't have a reason to express."
       }
     ]
+  },
+  "tts_output_device": {
+    "device": 6,
+    "label": "Headphones (2- SM-2020L) (#6)"
   }
 }

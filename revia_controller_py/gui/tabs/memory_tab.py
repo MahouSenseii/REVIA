@@ -210,7 +210,7 @@ class MemoryTab(QScrollArea):
     # ------------------------------------------------------------------
 
     def _on_chat_complete(self, _text):
-        # Each refresh submits its own background task â€” no blocking on main thread.
+        # Each refresh submits its own background task no blocking on main thread.
         self._refresh_short_term()
         self._refresh_stats()
         self._refresh_long_term_recent()
@@ -223,7 +223,7 @@ class MemoryTab(QScrollArea):
             self._refresh_long_term_recent()
 
     # ------------------------------------------------------------------
-    # HTTP helpers â€” all go through the shared controller client so tabs do not
+    # HTTP helpers all go through the shared controller client so tabs do not
     # duplicate their own request threading.
     # ------------------------------------------------------------------
 

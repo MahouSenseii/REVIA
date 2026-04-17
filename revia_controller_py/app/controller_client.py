@@ -52,7 +52,7 @@ class ControllerClient(QObject):
         self.async_result_ready.connect(self._dispatch_async_result)
 
         # Exponential backoff state for reconnection attempts.
-        # Interval doubles on each failed attempt: 3s → 6s → 12s → … → 30s cap.
+        # Interval doubles on each failed attempt: 3s -> 6s -> 12s -> ... -> 30s cap.
         self._reconnect_base_ms = 3000
         self._reconnect_max_ms = 30000
         self._reconnect_attempt = 0
@@ -272,7 +272,7 @@ class ControllerClient(QObject):
         self.ws_connected = True
         self.ws_connection_timer.stop()
         self._set_core_reachability(True)
-        # Reset exponential backoff — connection is healthy again.
+        # Reset exponential backoff - connection is healthy again.
         self._reconnect_attempt = 0
         self.reconnect_timer.setInterval(self._reconnect_base_ms)
 
@@ -594,6 +594,40 @@ class ControllerClient(QObject):
             default={},
             on_error=lambda error, _detail=None: self.event_bus.log_entry.emit(
                 f"[ERROR] Failed to save profile: {error}"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # TTS output device routing
+    # ------------------------------------------------------------------
+
+    def get_tts_output(self):
+        """Fetch the persisted TTS output device selection.
+
+        Always returns a dict shaped ``{"device": <int|str|None>, "label": <str>}``
+        — never raises, falls back to the "system default" shape on error.
+        """
+        result = self.get("/api/tts/output", timeout=2, default=None)
+        if not isinstance(result, dict):
+            return {"device": None, "label": ""}
+        return {
+            "device": result.get("device"),
+            "label": str(result.get("label") or ""),
+        }
+
+    def set_tts_output(self, data):
+        """Persist the TTS output device selection on the core.
+
+        ``data`` should be ``{"device": <int|str|None>, "label": <str>}``.
+        Sent asynchronously so the UI doesn't block on the round-trip.
+        """
+        return self.post_async(
+            "/api/tts/output",
+            json=data,
+            timeout=2,
+            default={},
+            on_error=lambda error, _detail=None: self.event_bus.log_entry.emit(
+                f"[ERROR] Failed to save TTS output device: {error}"
             ),
         )
 

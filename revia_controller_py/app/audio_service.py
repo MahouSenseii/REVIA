@@ -294,7 +294,7 @@ class AudioService(QObject):
                 t = threading.Thread(target=_run, daemon=True)
                 t.start()
                 if not done.wait(timeout=self._TTS_TIMEOUT_S):
-                    # Timed out — stop the engine and reset so the next call reinitialises.
+                    # Timed out - stop the engine and reset so the next call reinitialises.
                     try:
                         tts_engine.stop()
                     except Exception:

@@ -24,7 +24,7 @@ class ReviaState(str, Enum):
     SPEAKING = "Speaking"
     COOLDOWN = "Cooldown"
     ERROR = "Error"
-    # PRD §8 — IHS states
+    # PRD section 8 - IHS states
     INTERRUPTED = "Interrupted"   # user barged in while Revia was speaking
     RECOVERING  = "Recovering"    # pipeline is rebuilding after interruption
 
@@ -166,7 +166,7 @@ class ConversationStateMachine:
             ReviaState.INITIALIZING,
             ReviaState.IDLE,
         },
-        # PRD §8 — IHS recovery transitions
+        # PRD section 8 - IHS recovery transitions
         ReviaState.INTERRUPTED: {
             ReviaState.RECOVERING,
             ReviaState.LISTENING,
@@ -186,12 +186,12 @@ class ConversationStateMachine:
         self._state = ReviaState.BOOTING
         self._updated_at = time.monotonic()
 
-        # ── PRD §8 — IHS extended state fields ───────────────────────────
+        # PRD section 8 - IHS extended state fields
         self.interruption_type: str   = ""     # last InterruptionType value
         self.partial_response_spoken: str = "" # text Revia had delivered before barge-in
         self.topic_shift_confidence: float = 0.0
 
-        # ── PRD §10/§12 — AVS / ALE extended state fields ────────────────
+        # PRD section 10/section 12 - AVS / ALE extended state fields
         self.answer_confidence_last: float = 0.0  # last AVS composite score
         self.regen_count: int    = 0   # regens on the current turn
         self.loop_risk_score: float = 0.0  # last ALE loop_risk_score
@@ -201,7 +201,7 @@ class ConversationStateMachine:
         with self._lock:
             return self._state.value
 
-    # ── PRD §8 IHS helpers ────────────────────────────────────────────────
+    # PRD section 8 IHS helpers
 
     def record_interruption(
         self,
@@ -450,29 +450,50 @@ class ResponseFilter:
         self._recent_autonomous = deque(maxlen=6)
 
     def apply(self, text: str, trigger: TriggerRequest, emotion_label: str = "Neutral") -> ResponseFilterResult:
+        # Build a compact trigger-context header reused by all log lines below.
+        # Knowing which trigger produced a rejected output (and a peek at the
+        # text) makes post-mortems possible without diffing the full pipeline.
+        raw_preview = str(text or "").replace("\n", " ").strip()
+        if len(raw_preview) > 80:
+            raw_preview = raw_preview[:77] + "..."
+        trig_ctx = (
+            f"source={trigger.source} | kind={trigger.kind} "
+            f"| emotion={emotion_label} | reason={trigger.reason}"
+        )
+
         cleaned = self._normalize(text)
         if not cleaned:
             fallback = ""
             if str(trigger.kind) == TriggerKind.RESPONSE.value:
                 fallback = "I need another second to finish lining that up."
-            self._log("Response filter rejected: empty output")
+            self._log(
+                f"Response filter rejected: empty output | {trig_ctx} "
+                f"| input_len={len(str(text or ''))}"
+            )
             return ResponseFilterResult(False, fallback, "empty output", speakable=False)
 
         if str(trigger.kind) == TriggerKind.AUTONOMOUS.value:
             cleaned = self._trim_sentences(cleaned, max_sentences=2)
             if cleaned.startswith("["):
-                self._log("Response filter rejected: autonomous error output")
+                self._log(
+                    f"Response filter rejected: autonomous error output | "
+                    f"{trig_ctx} | preview={raw_preview!r}"
+                )
                 return ResponseFilterResult(False, "", "autonomous error output", speakable=False)
             sig = self._signature(cleaned)
             with self._lock:
                 if sig in self._recent_autonomous:
-                    self._log("Response filter rejected: repetitive autonomous output")
+                    self._log(
+                        f"Response filter rejected: repetitive autonomous output "
+                        f"| {trig_ctx} | sig={sig[:8]} | preview={raw_preview!r}"
+                    )
                     return ResponseFilterResult(False, "", "repetitive autonomous output", speakable=False)
                 self._recent_autonomous.append(sig)
 
         speakable = not cleaned.startswith("[")
         self._log(
-            f"Response filter accepted: {trigger.source} | emotion={emotion_label} | speakable={speakable}"
+            f"Response filter accepted: {trig_ctx} | speakable={speakable} "
+            f"| chars={len(cleaned)}"
         )
         return ResponseFilterResult(True, cleaned, "accepted", speakable=speakable)
 

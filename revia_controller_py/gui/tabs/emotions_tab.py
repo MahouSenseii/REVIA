@@ -375,7 +375,7 @@ class EmotionsTab(QScrollArea):
             self._fallback_hist.clear()
 
     def _toggle_injection(self, enabled):
-        # Fire-and-forget in background — no need to update UI from the response.
+        # Fire-and-forget in background - no need to update UI from the response.
         self.client.toggle_neural(
             "emotion_net",
             enabled,

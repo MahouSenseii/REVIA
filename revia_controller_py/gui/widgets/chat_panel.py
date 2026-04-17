@@ -9,13 +9,36 @@ from PySide6.QtWidgets import (
     QLabel,
     QComboBox,
     QSizePolicy,
+    QApplication,
 )
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor
 
 from app.ui_status import apply_status_style
 
 logger = logging.getLogger(__name__)
+
+_CHAT_THEME_FALLBACK = {
+    "PrimaryText": "#ede9fe",
+    "SecondaryText": "#8b7ab8",
+    "Accent": "#a855f7",
+    "AccentHover": "#c084fc",
+}
+
+
+def _chat_theme_tokens():
+    tokens = dict(_CHAT_THEME_FALLBACK)
+    app = QApplication.instance()
+    raw = app.property("reviaThemeTokens") if app else None
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key in tokens and QColor(str(value)).isValid():
+                tokens[key] = QColor(str(value)).name()
+    return tokens
+
+
+def _chat_color(key):
+    return _chat_theme_tokens().get(key, _CHAT_THEME_FALLBACK[key])
 
 
 class ChatPanel(QFrame):
@@ -169,7 +192,7 @@ class ChatPanel(QFrame):
             self.audio_service.tts_started.connect(self._on_fallback_tts_started)
             self.audio_service.tts_finished.connect(self._on_fallback_tts_finished)
 
-        # Wire up ContinuousAudioPipeline (PRD §6) for barge-in detection
+        # Wire up ContinuousAudioPipeline (PRD section 6) for barge-in detection
         if self.continuous_audio:
             self.continuous_audio.interruption_detected.connect(
                 self._on_barge_in_detected
@@ -178,7 +201,7 @@ class ChatPanel(QFrame):
                 self._on_continuous_speech_onset
             )
 
-        # Inline status tracking (Fix 4 — thinking/status inline in chat)
+        # Inline status tracking (Fix 4 - thinking/status inline in chat)
         self._inline_status_active = False
         self._inline_status_start = 0  # document char position before status block
 
@@ -248,7 +271,7 @@ class ChatPanel(QFrame):
         """
         logger.info("[ChatPanel] Barge-in detected: %s", fragment[:50])
         if self._assistant_audio_active:
-            # Stop TTS playback immediately (thread-safe — only touches locks)
+            # Stop TTS playback immediately (thread-safe - only touches locks)
             self._interrupt_output()
             # Also tell the server to abort token generation
             try:
@@ -309,7 +332,7 @@ class ChatPanel(QFrame):
         This enables sentence-level streaming: TTS starts speaking the first
         sentence while the LLM is still generating the rest.
         """
-        # Mark that server provides sentence events — disables old local extraction.
+        # Mark that server provides sentence events - disables old local extraction.
         # If fallback buffering already captured text before the first sentence
         # event arrived, drop it so we do not replay the same text later.
         if not self._server_sentence_streaming and self._tts_sentence_buf:
@@ -356,7 +379,7 @@ class ChatPanel(QFrame):
         with self._tts_worker_lock:
             self._tts_session_interrupted = True
             self._assistant_audio_active = False
-        # Drain the queue — get_nowait() is atomic; safety cap prevents infinite loop
+        # Drain the queue - get_nowait() is atomic; safety cap prevents infinite loop
         drained = self._drain_tts_queue()
         # Stop any active playback
         if self.voice_manager and hasattr(self.voice_manager, 'backend'):
@@ -872,9 +895,9 @@ class ChatPanel(QFrame):
     def interrupt_assistant_output(self):
         self._tts_sentence_buf = ""
         self._activity_interrupted = True
-        # Disarm the watchdog — interrupt is an intentional user action
+        # Disarm the watchdog - interrupt is an intentional user action
         self._thinking_watchdog.stop()
-        # Always remove any pending "Thinking…" / inline status bubble immediately so
+        # Always remove any pending "Thinking..." / inline status bubble immediately so
         # the user sees a clean slate before the next response starts rendering.
         self._clear_inline_status()
         # Stop playback FIRST so speak_sync() unblocks before we touch worker state
@@ -916,7 +939,7 @@ class ChatPanel(QFrame):
         self._activity_interrupted = False
         # Inject inline thinking indicator into the chat stream
         self._insert_inline_status("Thinking...")
-        # Arm the hard-timeout watchdog — stops automatically when reply arrives
+        # Arm the hard-timeout watchdog - stops automatically when reply arrives
         self._thinking_watchdog.start()
         self._refresh_activity_indicator()
 
@@ -931,9 +954,9 @@ class ChatPanel(QFrame):
             )
             self._activity_thinking_started_at = None
         self._activity_generation_started_at = now
-        # Disarm the watchdog — we have a live response stream
+        # Disarm the watchdog - we have a live response stream
         self._thinking_watchdog.stop()
-        # Clear the inline thinking indicator — response content follows immediately
+        # Clear the inline thinking indicator - response content follows immediately
         self._clear_inline_status()
         self._refresh_activity_indicator()
 
@@ -1128,9 +1151,9 @@ class ChatPanel(QFrame):
             self._schedule_next_queued_request(delay_ms=250)
 
     def _clear_reply_tracking(self):
-        # Disarm the watchdog — reply is being resolved (success, error, or stale recovery)
+        # Disarm the watchdog - reply is being resolved (success, error, or stale recovery)
         self._thinking_watchdog.stop()
-        # Always clear any lingering inline status bubble — this method is called
+        # Always clear any lingering inline status bubble - this method is called
         # on every exit path (completion, stale recovery, timeout) so doing it here
         # guarantees the indicator never gets orphaned.
         self._clear_inline_status()
@@ -1240,62 +1263,63 @@ class ChatPanel(QFrame):
             or (not self._tts_queue.empty())
         )
 
-    # ── Anime message format helpers ─────────────────────────────────────────
+    # Anime message format helpers
     @staticmethod
     def _fmt_user(text: str, note: str = "") -> str:
-        """Right-aligned user bubble with violet accent."""
+        primary = _chat_color("PrimaryText")
+        secondary = _chat_color("SecondaryText")
+        accent = _chat_color("Accent")
         note_html = (
-            f' <span style="color:#6b5d8a;font-size:8px;">{note}</span>'
+            f' <span style="color:{secondary};font-size:8px;">{note}</span>'
             if note else ""
         )
         return (
             '<table width="100%" cellpadding="0" cellspacing="0"'
             ' style="margin:3px 0 2px 0;">'
             '<tr><td align="right">'
-            '<span style="color:#c084fc;font-weight:bold;">◆ You</span>'
-            f' <span style="color:#ede9fe;">{text}</span>{note_html}'
+            f'<span style="color:{accent};font-weight:bold;">&#9670; You</span>'
+            f' <span style="color:{primary};">{text}</span>{note_html}'
             '</td></tr></table>'
         )
 
     @staticmethod
     def _fmt_revia_start() -> str:
-        """Header span that opens a streaming Revia turn."""
-        return (
-            '<span style="color:#f9a8d4;font-weight:bold;">✦ Revia</span> '
-        )
+        accent = _chat_color("AccentHover")
+        return f'<span style="color:{accent};font-weight:bold;">&#10022; Revia</span> '
 
     @staticmethod
     def _fmt_revia(text: str) -> str:
-        """Left-aligned Revia bubble with pink accent."""
+        primary = _chat_color("PrimaryText")
+        accent = _chat_color("AccentHover")
         return (
             '<table width="100%" cellpadding="0" cellspacing="0"'
             ' style="margin:3px 0 2px 0;">'
             '<tr><td align="left">'
-            '<span style="color:#f9a8d4;font-weight:bold;">✦ Revia</span>'
-            f' <span style="color:#ede9fe;">{text}</span>'
+            f'<span style="color:{accent};font-weight:bold;">&#10022; Revia</span>'
+            f' <span style="color:{primary};">{text}</span>'
             '</td></tr></table>'
         )
 
     @staticmethod
     def _fmt_system(text: str) -> str:
-        """Muted italic system annotation."""
+        secondary = _chat_color("SecondaryText")
         return (
-            '<span style="color:#6b5d8a;font-size:8px;font-style:italic;">'
-            f'⬡ {text}</span>'
+            f'<span style="color:{secondary};font-size:8px;font-style:italic;">'
+            f'&#11015; {text}</span>'
         )
 
     @staticmethod
     def _fmt_speech(text: str) -> str:
-        """Pink speech-recognition tag."""
+        accent = _chat_color("AccentHover")
         return (
-            '<span style="color:#f472b6;font-size:8px;font-style:italic;">'
-            f'🎤 &ldquo;{text}&rdquo;</span>'
+            f'<span style="color:{accent};font-size:8px;font-style:italic;">'
+            f'&#127908; &ldquo;{text}&rdquo;</span>'
         )
 
     def _append_system_note(self, text):
         self.chat_display.append(self._fmt_system(text))
 
-    # ── Inline chat status (Fix 4) ─────────────────────────────────────────
+    # Inline chat status (Fix 4)
 
     def _insert_inline_status(self, text: str) -> None:
         """Append a transient status bubble to the chat stream.
@@ -1326,11 +1350,8 @@ class ChatPanel(QFrame):
 
     @staticmethod
     def _fmt_status_inline(text: str) -> str:
-        """Transient assistant status bubble — italic, muted, clearly distinct
-        from final response content.  Matches the Revia visual language but
-        uses a lighter weight so users can distinguish status from speech.
-        """
+        secondary = _chat_color("SecondaryText")
         return (
-            '<span style="color:#8b7ab8;font-size:9px;font-style:italic;">'
-            f'⟳ {text}</span>'
+            f'<span style="color:{secondary};font-size:9px;font-style:italic;">'
+            f'&#10227; {text}</span>'
         )

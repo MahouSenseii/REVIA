@@ -36,7 +36,7 @@ class REVIADiscordBot:
         self._client = None
         self._thread = None
         self._loop = None
-        # Dedicated thread pool — keeps Discord I/O and LLM work off the default
+        # Dedicated thread pool - keeps Discord I/O and LLM work off the default
         # executor so other asyncio tasks are never starved.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="revia-discord-llm")
         self.running = False
@@ -78,7 +78,7 @@ class REVIADiscordBot:
 
             cfg = bot_ref.config
 
-            # Ignore DMs — guild is None for direct messages
+            # Ignore DMs - guild is None for direct messages
             if message.guild is None:
                 return
 
@@ -141,7 +141,7 @@ class REVIADiscordBot:
             platform_context = f"[Discord user {username}]: {content}"
             bot_ref._publish_user_text_event(message, content, username)
 
-            # Natural typing delay — makes responses feel less instant/robotic (configurable, reduced default)
+            # Natural typing delay - makes responses feel less instant/robotic (configurable, reduced default)
             delay_range = cfg.get("typing_delay_ms", [100, 400])  # Reduced from [600, 1800]
             if isinstance(delay_range, list) and len(delay_range) == 2:
                 delay_s = random.uniform(delay_range[0], delay_range[1]) / 1000

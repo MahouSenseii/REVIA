@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor
 
 
-# ── Log level detection + colors ──
+# Log level detection + colors
 
 _LEVEL_PATTERNS = {
     "error": re.compile(

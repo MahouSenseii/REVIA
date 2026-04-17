@@ -102,7 +102,7 @@ class SingCommandHandler:
             # Treat as song request
             return self._cmd_request(args, author)
         else:
-            # No args → auto-pick
+            # No args -> auto-pick
             return self._cmd_auto_pick(author)
 
     # ------------------------------------------------------------------
@@ -131,7 +131,7 @@ class SingCommandHandler:
     def _cmd_auto_pick(self, author: str) -> str:
         """Auto-pick a song (mood or random) and start."""
         if self._busy:
-            # Already singing — queue an auto-pick
+            # Already singing - queue an auto-pick
             item = self._queue.preview_auto_pick()
             if item:
                 self._queue.add_by_id(item.song_id, requested_by=author,
@@ -266,7 +266,7 @@ class SingCommandHandler:
                         _on_ready(analysis)
                         sing.play(analysis)
 
-                # Song finished — advance queue
+                # Song finished - advance queue
                 self._busy = False
                 self._queue.clear_now_playing()
                 if self._on_state:

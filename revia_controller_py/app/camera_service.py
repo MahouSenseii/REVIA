@@ -752,7 +752,7 @@ class CameraService(QObject):
             pass
 
     def __del__(self):
-        # Best-effort cleanup — always prefer calling close() explicitly.
+        # Best-effort cleanup - always prefer calling close() explicitly.
         try:
             self._detector_pool.shutdown(wait=False, cancel_futures=True)
         except TypeError:
