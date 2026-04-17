@@ -18,9 +18,9 @@ import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable
 
 _log = logging.getLogger(__name__)
 
@@ -205,6 +205,10 @@ class SingQueue:
                 return item
 
         return self._pick_random()
+
+    def preview_auto_pick(self) -> QueueItem | None:
+        """Choose an auto-pick without changing now-playing state."""
+        return self._auto_pick()
 
     def _pick_by_mood(self) -> QueueItem | None:
         """Pick a prepared song matching Revia's current mood."""

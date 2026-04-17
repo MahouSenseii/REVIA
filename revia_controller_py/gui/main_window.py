@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QTimer, QProcess
 
 from app.camera_service import CameraService
 from app.audio_service import AudioService
+from app.continuous_audio import ContinuousAudioPipeline
 from app.assistant_status_manager import AssistantStatusManager
 from app.conversation_policy import ConversationBehaviorController
 from app.conversation_starter import ConversationStarter
@@ -36,6 +37,10 @@ class MainWindow(QMainWindow):
         self.theme_mgr = theme_mgr
         self.camera_service = CameraService(self)
         self.audio_service = AudioService(self)
+        self.continuous_audio = ContinuousAudioPipeline(parent=self)
+        self.sing_library = None
+        self.sing_queue = None
+        self.sing_handler = None
         self.behavior_controller = None
         self.conversation_starter = None
         self.runtime_state_sync = None
@@ -78,7 +83,7 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self.topbar)
 
         self.chat_panel = ChatPanel(
-            self.event_bus, self.client, self.audio_service
+            self.event_bus, self.client, self.audio_service, self.continuous_audio
         )
         self.chat_panel.set_camera_service(self.camera_service)
         center_layout.addWidget(self.chat_panel, stretch=1)
@@ -88,12 +93,22 @@ class MainWindow(QMainWindow):
 
         self.shell_splitter.addWidget(center)
 
-        # Right tabs
+        # Right panel — container gives the tab widget a fixed inset margin so
+        # content never bleeds to the splitter edge.
+        right_container = QWidget()
+        right_container.setObjectName("rightPanel")
+        right_container.setMinimumWidth(280)
+        right_container.setMaximumWidth(660)
+        right_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        right_container_layout = QVBoxLayout(right_container)
+        right_container_layout.setContentsMargins(6, 6, 6, 6)
+        right_container_layout.setSpacing(0)
+
         self.tabs = QTabWidget()
         self.tabs.setObjectName("rightTabs")
-        self.tabs.setMinimumWidth(260)
-        self.tabs.setMaximumWidth(620)
-        self.tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_container_layout.addWidget(self.tabs)
 
         self.profile_tab = ProfileTab(self.event_bus, self.client)
         self.tabs.addTab(
@@ -112,6 +127,7 @@ class MainWindow(QMainWindow):
 
         # Give chat panel access to the voice manager for TTS
         self.chat_panel.set_voice_manager(self.voice_tab.voice_mgr)
+        self.chat_panel.set_voice_tab(self.voice_tab)
         self.behavior_controller = ConversationBehaviorController(
             status_provider=self.client.get_status_snapshot,
             log_fn=self.event_bus.log_entry.emit,
@@ -146,6 +162,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(LogsTab(self.event_bus), "Logs")
         self.sing_tab = SingTab(self.event_bus, self.client)
         self.tabs.addTab(self.sing_tab, "Sing")
+        self._init_sing_system()
         self.tabs.addTab(
             IntegrationsTab(self.event_bus, self.client), "Integrations"
         )
@@ -187,11 +204,38 @@ class MainWindow(QMainWindow):
             parent=self,
         )
 
-        self.shell_splitter.addWidget(self.tabs)
+        self.shell_splitter.addWidget(right_container)
         self.shell_splitter.setStretchFactor(0, 0)
         self.shell_splitter.setStretchFactor(1, 4)
         self.shell_splitter.setStretchFactor(2, 1)
-        self.shell_splitter.setSizes([180, 780, 360])
+        # Give right panel a comfortable default width (380px) so content
+        # breathes without feeling cramped.
+        self.shell_splitter.setSizes([180, 740, 380])
+
+    def _current_mood_label(self):
+        snapshot = self.client.get_status_snapshot()
+        emotion = snapshot.get("emotion", {}) if isinstance(snapshot, dict) else {}
+        return str(emotion.get("label", "neutral") or "neutral").lower()
+
+    def _init_sing_system(self):
+        try:
+            self.sing_library, self.sing_queue, self.sing_handler = (
+                self.voice_tab.voice_mgr.backend.init_sing_system(
+                    event_bus=self.event_bus,
+                    get_mood_fn=self._current_mood_label,
+                    voice_profile_fn=lambda: self.voice_tab.voice_mgr.active_profile,
+                )
+            )
+            self.sing_tab.set_sing_system(
+                self.sing_library,
+                self.sing_queue,
+                self.sing_handler,
+            )
+            self.chat_panel.set_sing_handler(self.sing_handler)
+            self.event_bus.sing_state_changed.connect(self.sing_tab.update_state)
+            self.event_bus.sing_lyrics_update.connect(self.sing_tab.update_lyrics)
+        except Exception as exc:
+            self.event_bus.log_entry.emit(f"[Sing] Failed to initialize: {exc}")
 
     def _connect_signals(self):
         self.event_bus.connection_changed.connect(self._on_connection)
@@ -209,8 +253,14 @@ class MainWindow(QMainWindow):
             self.conversation_starter.greet_on_startup(delay_ms=6_000)
 
     def _auto_start_services_on_launch(self):
+        if self.continuous_audio:
+            self.continuous_audio.start()
         if hasattr(self.system_tab, "auto_start_on_launch"):
             self.system_tab.auto_start_on_launch()
+        if hasattr(self.voice_tab, "auto_start_on_launch"):
+            QTimer.singleShot(700, self.voice_tab.auto_start_on_launch)
+        if hasattr(self.chat_panel, "sync_mic_state_from_audio"):
+            QTimer.singleShot(1200, self.chat_panel.sync_mic_state_from_audio)
         if hasattr(self.model_tab, "auto_start_on_launch"):
             QTimer.singleShot(1200, self.model_tab.auto_start_on_launch)
         if self.runtime_state_sync:
@@ -218,6 +268,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.camera_service.disconnect_camera()
+        try:
+            if self.continuous_audio:
+                self.continuous_audio.stop()
+        except Exception:
+            pass
         try:
             proc = getattr(self.model_tab, '_llm_process', None)
             if proc and proc.state() == QProcess.Running:

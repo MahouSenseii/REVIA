@@ -8,14 +8,14 @@ import importlib.util
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
-    QLabel, QComboBox, QGroupBox, QDoubleSpinBox, QCheckBox,
+    QLabel, QComboBox, QGroupBox, QCheckBox,
     QPushButton, QProgressBar, QListWidget, QTextEdit,
     QLineEdit, QTabWidget, QFileDialog, QInputDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, QProcess
 from PySide6.QtGui import QFont
 
-from app.voice_profile import VoiceProfile, VoiceMode
+from app.voice_profile import VoiceMode
 from app.voice_manager import VoiceManager
 from app.tts_backend import QWEN_SPEAKERS, QWEN_LANGUAGES, QWEN_MODEL_SIZES
 from app.ui_status import apply_status_style, clear_status_role
@@ -93,8 +93,17 @@ class VoiceTab(QScrollArea):
         self.tts_server_status.setWordWrap(True)
         sv.addRow("Server:", self.tts_server_status)
 
+        # Active backend indicator — always visible, single source of truth
+        self.active_backend_lbl = QLabel("Active: pyttsx3  |  Fallback: pyttsx3  |  Ready")
+        self.active_backend_lbl.setObjectName("metricLabel")
+        self.active_backend_lbl.setFont(QFont("Consolas", 8))
+        self.active_backend_lbl.setWordWrap(True)
+        sv.addRow("Backend:", self.active_backend_lbl)
+
         self.voice_mgr.backend.set_engine("pyttsx3")
         self.voice_mgr.backend.set_qwen_server("http://localhost:8000")
+        # Wire backend_changed so the indicator stays in sync
+        self.voice_mgr.backend_changed.connect(self._on_backend_changed)
         self._tts_process = None
         self._tts_ready_timer = None
         self._tts_last_lines: list[str] = []
@@ -159,6 +168,7 @@ class VoiceTab(QScrollArea):
         self.input_device = QComboBox()
         self.input_device.addItem("Default Microphone")
         self._populate_input_devices()
+        self.input_device.currentIndexChanged.connect(self._on_input_device_changed)
         stf.addRow("Input Device:", self.input_device)
         self.ptt_mode = QComboBox()
         self.ptt_mode.addItems([
@@ -227,7 +237,7 @@ class VoiceTab(QScrollArea):
         # Wiring
         self.voice_mgr.metrics_updated.connect(self._on_metrics)
         self.voice_mgr.error.connect(
-            lambda e: self._set_status(f"Error: {e}", "#cc3040")
+            lambda e: self._set_status(f"Error: {e}", role="error")
         )
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self._refresh_library()
@@ -471,7 +481,7 @@ class VoiceTab(QScrollArea):
             self.design_status.setText("Enter a voice description")
             return
         self.design_status.setText("Generating...")
-        apply_status_style(self.design_status, "color: #ccaa00;")
+        apply_status_style(self.design_status, role="warning")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_design(text, desc, lang)
@@ -482,11 +492,11 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_design_wav = wav
             self.design_status.setText(f"Generated: {wav}")
-            apply_status_style(self.design_status, "color: #00aa40;")
+            apply_status_style(self.design_status, role="success")
             self.voice_mgr.play_wav(wav)
         else:
             self.design_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.design_status, "color: #cc3040;")
+            apply_status_style(self.design_status, role="error")
 
     def _run_clone(self):
         ref = self.clone_ref_path.text().strip()
@@ -506,7 +516,7 @@ class VoiceTab(QScrollArea):
             )
             return
         self.clone_status.setText("Cloning...")
-        apply_status_style(self.clone_status, "color: #ccaa00;")
+        apply_status_style(self.clone_status, role="warning")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_clone(
@@ -519,11 +529,11 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_clone_wav = wav
             self.clone_status.setText(f"Generated: {wav}")
-            apply_status_style(self.clone_status, "color: #00aa40;")
+            apply_status_style(self.clone_status, role="success")
             self.voice_mgr.play_wav(wav)
         else:
             self.clone_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.clone_status, "color: #cc3040;")
+            apply_status_style(self.clone_status, role="error")
 
     def _run_custom(self):
         text = self.custom_text.toPlainText().strip()
@@ -535,7 +545,7 @@ class VoiceTab(QScrollArea):
             self.custom_status.setText("Enter text to synthesize")
             return
         self.custom_status.setText("Generating...")
-        apply_status_style(self.custom_status, "color: #ccaa00;")
+        apply_status_style(self.custom_status, role="warning")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_custom(
@@ -548,11 +558,11 @@ class VoiceTab(QScrollArea):
         if wav:
             self._last_custom_wav = wav
             self.custom_status.setText(f"Generated: {wav}")
-            apply_status_style(self.custom_status, "color: #00aa40;")
+            apply_status_style(self.custom_status, role="success")
             self.voice_mgr.play_wav(wav)
         else:
             self.custom_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.custom_status, "color: #cc3040;")
+            apply_status_style(self.custom_status, role="error")
 
     def _play_last(self, mode):
         wav = getattr(self, f"_last_{mode}_wav", None)
@@ -672,7 +682,7 @@ class VoiceTab(QScrollArea):
             return
         name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
         self.voice_mgr.set_active_voice(name)
-        self._set_status(f"Active voice: {name}", "#00aa40")
+        self._set_status(f"Active voice: {name}", role="success")
 
     def _rename_voice(self):
         cur = self.voice_list.currentItem()
@@ -704,7 +714,7 @@ class VoiceTab(QScrollArea):
         name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
         self.voice_mgr.library.set_default(name)
         self._refresh_library()
-        self._set_status(f"Default voice: {name}", "#00aa40")
+        self._set_status(f"Default voice: {name}", role="success")
 
     def _import_voice(self):
         d = QFileDialog.getExistingDirectory(self, "Import Voice Directory")
@@ -712,7 +722,7 @@ class VoiceTab(QScrollArea):
             p = self.voice_mgr.library.import_profile(d)
             if p:
                 self._refresh_library()
-                self._set_status(f"Imported: {p.name}", "#00aa40")
+                self._set_status(f"Imported: {p.name}", role="success")
 
     def _export_voice(self):
         cur = self.voice_list.currentItem()
@@ -723,7 +733,7 @@ class VoiceTab(QScrollArea):
         if d:
             dest = Path(d) / name
             self.voice_mgr.library.export_profile(name, dest)
-            self._set_status(f"Exported to: {dest}", "#00aa40")
+            self._set_status(f"Exported to: {dest}", role="success")
 
     def _open_folder(self):
         self.voice_mgr.library.open_folder()
@@ -737,7 +747,7 @@ class VoiceTab(QScrollArea):
         if p and p.has_wav():
             self.voice_mgr.play_wav(p.generated_wav)
         else:
-            self._set_status("No WAV file for this voice", "#cc3040")
+            self._set_status("No WAV file for this voice", role="error")
 
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Clone tab helpers
@@ -753,12 +763,11 @@ class VoiceTab(QScrollArea):
 
     def _record_ref_audio(self):
         self.clone_status.setText("Recording 5 seconds...")
-        apply_status_style(self.clone_status, "color: #dc3250;")
+        apply_status_style(self.clone_status, role="error")
 
         def _do():
             try:
                 import sounddevice as sd
-                import numpy as np
                 import wave
                 sr = 22050
                 audio = sd.rec(int(sr * 5), samplerate=sr, channels=1, dtype="int16")
@@ -778,21 +787,44 @@ class VoiceTab(QScrollArea):
     def _on_rec_done(self, path, error=None):
         if error:
             self.clone_status.setText(f"Recording failed: {error}")
-            apply_status_style(self.clone_status, "color: #cc3040;")
+            apply_status_style(self.clone_status, role="error")
         elif path:
             self.clone_ref_path.setText(path)
             self.clone_status.setText("Recording saved")
-            apply_status_style(self.clone_status, "color: #00aa40;")
+            apply_status_style(self.clone_status, role="success")
 
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Engine / Devices / Metrics
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _on_engine_changed(self, text):
-        if "pyttsx3" in text.lower():
-            self.voice_mgr.backend.set_engine("pyttsx3")
-        else:
-            self.voice_mgr.backend.set_engine("qwen3-tts")
+        """Route engine selection through VoiceManager (single source of truth)."""
+        engine_id = "pyttsx3" if "pyttsx3" in text.lower() else "qwen3-tts"
+        self.voice_mgr.set_backend(engine_id)
+        self._update_active_backend_label()
+
+    def _on_backend_changed(self, engine_id: str) -> None:
+        """Sync UI when VoiceManager emits backend_changed."""
+        self._update_active_backend_label()
+        # Keep engine_combo in sync if changed programmatically
+        label = self.voice_mgr.active_backend_label
+        if self.engine_combo.currentText() != label:
+            self.engine_combo.blockSignals(True)
+            self.engine_combo.setCurrentText(label)
+            self.engine_combo.blockSignals(False)
+
+    def _update_active_backend_label(self) -> None:
+        """Refresh the active-backend indicator label."""
+        if hasattr(self, "active_backend_lbl"):
+            label = self.voice_mgr.active_backend_label
+            fallback = self.voice_mgr.fallback_backend_name
+            ready = self.voice_mgr.is_backend_ready()
+            health = "Ready" if ready else "Unavailable"
+            role = "success" if ready else "warning"
+            self.active_backend_lbl.setText(
+                f"Active: {label}  |  Fallback: {fallback}  |  {health}"
+            )
+            apply_status_style(self.active_backend_lbl, role=role)
 
     def _populate_input_devices(self):
         try:
@@ -832,13 +864,126 @@ class VoiceTab(QScrollArea):
         self.dur_lbl.setText(f"Duration: {metrics.audio_duration}s")
         self.rtf_lbl.setText(f"RTF: {metrics.realtime_factor}x")
 
-    def _set_status(self, text, color="#808898"):
+    def _set_status(self, text, color=None, role: str = "muted"):
+        """Update the status label.
+
+        Prefer passing a semantic ``role`` (``"success"``, ``"warning"``,
+        ``"error"``, ``"muted"``).  The legacy ``color`` hex arg is still
+        accepted for backwards compatibility.
+        """
         self.status_label.setText(f"Status: {text}")
-        apply_status_style(self.status_label, f"color: {color};")
+        if color and "#" in str(color):
+            apply_status_style(self.status_label, f"color: {color};")
+        else:
+            apply_status_style(self.status_label, role=role)
 
     def _on_core_connection(self, connected):
         if connected:
-            self._set_status("Core online", "#00aa40")
+            self._set_status("Core online", role="success")
+
+    def auto_start_on_launch(self):
+        """Start voice services on app launch when local capabilities allow it."""
+        self._auto_start_stt_on_launch()
+        QTimer.singleShot(350, self._auto_start_qwen_tts_on_launch)
+
+    def _auto_start_stt_on_launch(self):
+        if not self.audio_service:
+            self._set_status("STT auto-start skipped: no audio service", role="warning")
+            return
+
+        check = getattr(self.audio_service, "stt_startup_check", None)
+        ok, reason = check() if callable(check) else (self.audio_service.is_stt_available(), "")
+        if not ok:
+            self._set_status(f"STT auto-start skipped: {reason}", role="warning")
+            self._log_voice_startup(f"STT auto-start skipped: {reason}")
+            return
+
+        self._on_input_device_changed(self.input_device.currentIndex())
+        if self.ptt_mode.currentText() != "Always Listening (VAD)":
+            self.ptt_mode.setCurrentText("Always Listening (VAD)")
+
+        started = self.audio_service.start_listening(always=True)
+        if started is False:
+            self._set_status("STT auto-start failed", role="warning")
+            self._log_voice_startup("STT auto-start failed")
+            return
+
+        self._set_status("STT always-listening started", role="success")
+        self._log_voice_startup("STT always-listening started")
+
+    def _auto_start_qwen_tts_on_launch(self):
+        port = 8000
+        if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
+            self._log_voice_startup("Qwen3-TTS already starting")
+            return
+
+        if self._qwen_server_ready(port):
+            self._activate_qwen_backend(port)
+            self.tts_server_status.setText(f"Running on :{port}")
+            apply_status_style(self.tts_server_status, role="success")
+            self._set_status("Qwen3-TTS ready on launch", role="success")
+            self._log_voice_startup(f"Qwen3-TTS attached to existing server on :{port}")
+            return
+
+        if self._port_has_listener(port):
+            msg = f"Port :{port} busy; Qwen3-TTS auto-start skipped"
+            self.tts_server_status.setText(msg)
+            apply_status_style(self.tts_server_status, role="warning")
+            self._set_status(msg, role="warning")
+            self._log_voice_startup(msg)
+            return
+
+        if not self._resolve_qwen_module():
+            msg = "Qwen3-TTS module not found; auto-start skipped"
+            self.tts_server_status.setText(msg)
+            apply_status_style(self.tts_server_status, role="warning")
+            self._set_status(msg, role="warning")
+            self._log_voice_startup(msg)
+            return
+
+        self._set_status("Starting Qwen3-TTS on launch", role="warning")
+        self._log_voice_startup("Starting Qwen3-TTS on launch")
+        self._start_tts_server()
+
+    def _on_input_device_changed(self, _index=None):
+        if self.audio_service:
+            self.audio_service.set_input_device(self.input_device.currentData())
+
+    def _activate_qwen_backend(self, port=8000):
+        url = f"http://localhost:{port}"
+        if self.qwen_url.text().strip().rstrip("/") != url:
+            self.qwen_url.setText(url)
+        else:
+            self.voice_mgr.backend.set_qwen_server(url)
+        if self.voice_mgr.active_backend_name != "qwen3-tts":
+            self.voice_mgr.set_backend("qwen3-tts")
+        else:
+            self._update_active_backend_label()
+
+    def _qwen_server_ready(self, port=8000):
+        try:
+            import urllib.request
+            with urllib.request.urlopen(
+                f"http://localhost:{port}/gradio_api/info",
+                timeout=1.5,
+            ) as response:
+                return 200 <= int(getattr(response, "status", 200)) < 300
+        except Exception:
+            return False
+
+    def _port_has_listener(self, port):
+        try:
+            import socket
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    def _log_voice_startup(self, message):
+        try:
+            self.event_bus.log_entry.emit(f"[Voice] {message}")
+        except Exception:
+            logger.debug("[Voice] %s", message)
 
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # Qwen3-TTS Local Server Management
@@ -886,7 +1031,7 @@ class VoiceTab(QScrollArea):
 
         qwen_module = self._resolve_qwen_module()
         if not qwen_module:
-            apply_status_style(self.tts_server_status, "color: #cc3333;")
+            apply_status_style(self.tts_server_status, role="error")
             self.tts_server_status.setText(
                 "Qwen3-TTS module not found. Install package, then retry."
             )
@@ -903,7 +1048,7 @@ class VoiceTab(QScrollArea):
 
         self._tts_process.setProcessEnvironment(env)
         self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
-        apply_status_style(self.tts_server_status, "color: #ccaa00;")
+        apply_status_style(self.tts_server_status, role="warning")
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
 
@@ -1062,9 +1207,11 @@ class VoiceTab(QScrollArea):
             import requests
             r = requests.get(f"http://localhost:{port}/gradio_api/info", timeout=2)
             if r.ok:
+                self._activate_qwen_backend(port)
                 self.tts_server_status.setText(f"Running on :{port}")
-                apply_status_style(self.tts_server_status, "color: #00aa40;")
+                apply_status_style(self.tts_server_status, role="success")
                 self._tts_ready_timer.stop()
+                self._set_status("Qwen3-TTS ready", role="success")
                 return
         except Exception as e:
             logger.debug(f"TTS server not ready: {e}")
@@ -1107,7 +1254,7 @@ class VoiceTab(QScrollArea):
             self._append_tts_log_line(line)
             if "Running on" in line:
                 self.tts_server_status.setText("Running on :8000")
-                apply_status_style(self.tts_server_status, "color: #00aa40;")
+                apply_status_style(self.tts_server_status, role="success")
                 if self._tts_ready_timer:
                     self._tts_ready_timer.stop()
 
@@ -1140,7 +1287,7 @@ class VoiceTab(QScrollArea):
                 if line:
                     error_hint = line[:120]
                     break
-            apply_status_style(self.tts_server_status, "color: #cc3333;")
+            apply_status_style(self.tts_server_status, role="error")
             if error_hint:
                 self.tts_server_status.setText(
                     f"Exited ({exit_code}): {error_hint}"

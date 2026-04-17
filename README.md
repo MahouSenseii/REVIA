@@ -1,4 +1,4 @@
-# REVIA
+    # REVIA
 
 Local AI assistant with a PySide6 controller UI and a Python core server that handles chat, memory, telemetry, integrations, and live runtime state.
 

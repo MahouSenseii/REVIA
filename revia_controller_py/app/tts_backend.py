@@ -1,11 +1,9 @@
 """TTS backend for REVIA. Supports Qwen3-TTS via gradio_client and local pyttsx3 fallback."""
 import logging
-import os
+import re
 import sys
 import time
-import wave
 import shutil
-import struct
 import threading
 import tempfile
 import urllib.request
@@ -53,6 +51,39 @@ _EMOTION_STYLE_MAP = {
     "amused": "Speak with a light, playful lilt and hint of laughter",
     "neutral": "Speak naturally with balanced pacing and clear tone",
 }
+
+_STYLE_DIRECTIVE_RE = re.compile(r"^\s*\[([^\]\r\n]{1,220})\]\s*")
+_STYLE_DIRECTIVE_HINTS = (
+    "speak",
+    "sing",
+    "voice",
+    "tone",
+    "pace",
+    "pacing",
+    "pitch",
+    "register",
+    "projection",
+    "melodically",
+    "softly",
+    "slowly",
+    "energetic",
+    "balanced",
+    "clear",
+)
+
+
+def _strip_leading_style_directives(text: str) -> str:
+    """Remove engine-facing bracketed style hints from spoken text."""
+    spoken = str(text or "").strip()
+    for _ in range(3):
+        match = _STYLE_DIRECTIVE_RE.match(spoken)
+        if not match:
+            break
+        directive = match.group(1).strip().lower()
+        if not any(hint in directive for hint in _STYLE_DIRECTIVE_HINTS):
+            break
+        spoken = spoken[match.end():].lstrip()
+    return spoken
 
 
 class QwenTTSBackend(QObject):
@@ -181,6 +212,7 @@ class QwenTTSBackend(QObject):
                              output_path=None):
         """Clone voice from reference audio and synthesize target text.
         Returns (wav_path, metrics) or (None, error_str)."""
+        target_text = _strip_leading_style_directives(target_text)
         if self._engine_name == "pyttsx3" or not self._has_gradio_client():
             return self._fallback_generate(target_text, output_path)
 
@@ -193,6 +225,7 @@ class QwenTTSBackend(QObject):
                               output_path=None):
         """Generate speech with predefined speaker + optional style instruction.
         Returns (wav_path, metrics) or (None, error_str)."""
+        text = _strip_leading_style_directives(text)
         if self._engine_name == "pyttsx3" or not self._has_gradio_client():
             return self._fallback_generate(text, output_path)
 
@@ -231,6 +264,7 @@ class QwenTTSBackend(QObject):
         to use their preferred TTS backend (Qwen3, pyttsx3, etc).
         """
         try:
+            sentence = _strip_leading_style_directives(sentence)
             wav_path, _ = self.generate_custom_voice(
                 sentence,
                 language="Auto",
@@ -294,8 +328,46 @@ class QwenTTSBackend(QObject):
         """Speak chat text synchronously — blocks until synthesis AND playback are done."""
         self._speak_from_profile_impl(text, voice_profile, emotion)
 
+    def synthesize_from_profile(self, text, voice_profile, emotion="neutral",
+                                output_path=None):
+        """Generate a WAV for chat text without playing it."""
+        text = _strip_leading_style_directives(text)
+        if not text:
+            return None, "empty text"
+
+        if self._engine_name == "pyttsx3" or not self._has_gradio_client():
+            return self._fallback_generate(text, output_path)
+
+        if not voice_profile or not voice_profile.has_wav():
+            return self._fallback_generate(text, output_path)
+
+        try:
+            from .voice_profile import _resolve_wav_path
+            wav_src = _resolve_wav_path(voice_profile.generated_wav)
+            return self._qwen_clone(
+                text,
+                wav_src,
+                voice_profile.clone_ref_text or "",
+                voice_profile.language or "Auto",
+                not bool(voice_profile.clone_ref_text),
+                output_path,
+                voice_profile.model_size or "0.6B",
+                style_instruction="",
+            )
+        except Exception as exc:
+            _log.error("[TTS] Profile synthesis error: %s", exc)
+            self.error_occurred.emit(f"Profile synthesis error: {exc}")
+            return None, str(exc)
+
+    def play_wav_sync(self, wav_path):
+        """Play a WAV synchronously on the caller's background thread."""
+        self._play_wav_blocking(wav_path)
+
     def _speak_from_profile_impl(self, text, voice_profile, emotion="neutral"):
         """Synthesize and play text using the voice profile. Always runs synchronously."""
+        text = _strip_leading_style_directives(text)
+        if not text:
+            return
         if not self._has_gradio_client():
             mods = voice_profile.get_modulated(emotion)
             self._speak_pyttsx3(text, mods["speed"], mods["pitch"])
@@ -456,13 +528,12 @@ class QwenTTSBackend(QObject):
                 #   params: ref_aud, ref_txt, use_xvec, text, lang_disp
                 # HF Space: /generate_voice_clone
                 #   params: ref_aud, ref_txt, text, lang, use_xvec, model_size
-                # Voice clone API doesn't have a style_instruction param, but we
-                # can prepend a prosody hint to the target text so Qwen3 adjusts
-                # its speech style accordingly (works with instruct-capable models).
-                tts_text = target_text
+                # Voice clone endpoints do not expose a separate style field.
+                # Never prepend style hints to target text: some engines read
+                # bracketed hints aloud, which makes Revia say her TTS prompt.
+                tts_text = _strip_leading_style_directives(target_text)
                 if style_instruction:
-                    tts_text = f"[{style_instruction}] {target_text}"
-                    _log.debug("[TTS] Injecting emotion style into clone text: %s", style_instruction)
+                    _log.debug("[TTS] Clone style hint kept out of spoken text: %s", style_instruction)
                 try:
                     result = client.predict(
                         ref, ref_text or "", x_vector_only,
@@ -490,6 +561,7 @@ class QwenTTSBackend(QObject):
 
     def _qwen_custom(self, text, language, speaker, style_instruction,
                       model_size, output_path):
+        text = _strip_leading_style_directives(text)
         # API: predict(text, language, speaker, instruct, model_size,
         #              api_name="/generate_custom_voice")
         #   -> (generated_audio: filepath, status: str)
@@ -574,6 +646,7 @@ class QwenTTSBackend(QObject):
     # ── pyttsx3 fallback ──
 
     def _fallback_generate(self, text, output_path=None):
+        text = _strip_leading_style_directives(text)
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
@@ -608,6 +681,9 @@ class QwenTTSBackend(QObject):
                 return None, str(exc)
 
     def _speak_pyttsx3(self, text, speed=1.0, pitch=1.0):
+        text = _strip_leading_style_directives(text)
+        if not text:
+            return
         with self._lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
@@ -692,7 +768,8 @@ class QwenTTSBackend(QObject):
         if hasattr(self, "_sing_mode") and self._sing_mode is not None:
             self._sing_mode.stop()
 
-    def init_sing_system(self, event_bus=None, get_mood_fn=None):
+    def init_sing_system(self, event_bus=None, get_mood_fn=None,
+                         voice_profile_fn=None):
         """Initialise the full !sing system: library, queue, command handler.
 
         Call this once after the TTS backend is ready. Returns the
@@ -721,7 +798,9 @@ class QwenTTSBackend(QObject):
             library=library,
             queue=queue,
             sing_mode_factory=self.get_sing_mode,
-            voice_profile_fn=getattr(self, "_get_active_voice_profile", None),
+            voice_profile_fn=voice_profile_fn or getattr(
+                self, "_get_active_voice_profile", None
+            ),
         )
 
         # Wire event bus signals

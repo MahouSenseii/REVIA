@@ -215,4 +215,43 @@ QFrame#themeSwatch {{
     min-width: 28px;
     min-height: 22px;
 }}
+
+/* Right-panel container — provides a small but intentional inset margin */
+QWidget#rightPanel {{
+    background-color: {t["SecondaryBackground"]};
+    border-left: 1px solid {t["Border"]};
+}}
+
+/* Right-panel tab bar — more breathing room between tabs */
+QWidget#rightPanel QTabBar::tab {{
+    padding: 8px 12px;
+    min-width: 52px;
+}}
+
+QWidget#rightPanel QTabWidget::pane {{
+    border: none;
+    background-color: {t["SecondaryBackground"]};
+}}
+
+/* Sections within right-panel tabs get consistent card spacing */
+QWidget#rightPanel QGroupBox {{
+    margin-top: 8px;
+    padding: 10px 8px 8px 8px;
+}}
+
+QWidget#rightPanel QGroupBox::title {{
+    top: -6px;
+    left: 8px;
+    padding: 0 4px;
+}}
+
+/* Ensure scroll areas in right panel fill available space cleanly */
+QWidget#rightPanel QScrollArea {{
+    border: none;
+    background: transparent;
+}}
+
+QWidget#rightPanel QScrollArea > QWidget > QWidget {{
+    background: transparent;
+}}
 """

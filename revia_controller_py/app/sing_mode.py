@@ -19,11 +19,9 @@ Dependencies (installed on demand):
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
-import struct
 import tempfile
 import threading
 import time
@@ -31,7 +29,7 @@ import wave
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 _log = logging.getLogger(__name__)
 
@@ -414,7 +412,7 @@ class VocalSynthesiser:
                 if voice_profile and voice_profile.has_wav():
                     ref_wav = _resolve_wav_path(voice_profile.generated_wav)
                     wav_path, _ = self._tts.generate_voice_clone(
-                        target_text=f"[{style}] {line.text}",
+                        target_text=line.text,
                         ref_audio_path=ref_wav,
                         ref_text=voice_profile.clone_ref_text or "",
                         language=voice_profile.language or "Auto",

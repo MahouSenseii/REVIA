@@ -1,14 +1,11 @@
 """Tests for the !sing system: song_library, sing_queue, sing_command."""
 
-import json
 import os
 import tempfile
-import time
 import unittest
 import wave
 import struct
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -302,6 +299,14 @@ class TestSingCommandHandler(unittest.TestCase):
     def test_cmd_skip_nothing_playing(self):
         reply = self.handler.handle("skip", "user1")
         self.assertIn("Nothing", reply)
+
+    def test_auto_pick_while_busy_does_not_replace_now_playing(self):
+        current = self.queue.next()
+        self.handler._busy = True
+        reply = self.handler.handle("", "user1")
+        self.assertIs(self.queue.now_playing, current)
+        self.assertEqual(self.queue.size, 1)
+        self.assertIn("Queued", reply)
 
 
 if __name__ == "__main__":

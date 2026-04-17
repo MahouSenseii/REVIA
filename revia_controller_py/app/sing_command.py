@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-from typing import Callable, Optional
+from typing import Callable
 
 _log = logging.getLogger(__name__)
 
@@ -133,7 +132,7 @@ class SingCommandHandler:
         """Auto-pick a song (mood or random) and start."""
         if self._busy:
             # Already singing — queue an auto-pick
-            item = self._queue.next()
+            item = self._queue.preview_auto_pick()
             if item:
                 self._queue.add_by_id(item.song_id, requested_by=author,
                                        pick_mode=item.pick_mode)

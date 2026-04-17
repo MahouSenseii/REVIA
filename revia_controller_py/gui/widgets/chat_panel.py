@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QTimer, Signal
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtGui import QFont
 
 from app.ui_status import apply_status_style
 
@@ -32,6 +32,8 @@ class ChatPanel(QFrame):
         self.continuous_audio = continuous_audio  # ContinuousAudioPipeline (PRD §6)
         self.camera_service = None
         self.voice_manager = None
+        self.voice_tab = None
+        self._sing_handler = None
         self.setObjectName("chatPanel")
         self._current_response = ""
         self._full_response = ""
@@ -72,6 +74,14 @@ class ChatPanel(QFrame):
         self._activity_timer = QTimer(self)
         self._activity_timer.setInterval(100)
         self._activity_timer.timeout.connect(self._refresh_activity_indicator)
+
+        # Hard-timeout watchdog: if the backend stays in Thinking for longer than
+        # this, force-clear reply state so the UI never stays stuck indefinitely.
+        # 120 s is generous enough for slow models but short enough to feel responsive.
+        self._thinking_watchdog = QTimer(self)
+        self._thinking_watchdog.setSingleShot(True)
+        self._thinking_watchdog.setInterval(120_000)  # 120 seconds
+        self._thinking_watchdog.timeout.connect(self._on_thinking_timeout)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -168,6 +178,10 @@ class ChatPanel(QFrame):
                 self._on_continuous_speech_onset
             )
 
+        # Inline status tracking (Fix 4 — thinking/status inline in chat)
+        self._inline_status_active = False
+        self._inline_status_start = 0  # document char position before status block
+
         self._conversation_starter = None
         self._behavior_controller = None
 
@@ -182,13 +196,16 @@ class ChatPanel(QFrame):
 
     def set_voice_manager(self, vm):
         self.voice_manager = vm
-        # Sync combo with backend engine
         if vm:
-            eng = vm.backend.engine_name
+            # Sync combo with backend engine (read from VoiceManager, not backend directly)
+            eng = vm.active_backend_name
             if "qwen" in eng.lower():
                 self.tts_combo.setCurrentText("Qwen3-TTS (Quality)")
-            elif eng == "pyttsx3":
+            else:
                 self.tts_combo.setCurrentText("pyttsx3 (Fast)")
+            # Keep combo in sync when backend changes via voice_tab or other sources
+            if hasattr(vm, "backend_changed"):
+                vm.backend_changed.connect(self._on_voice_manager_backend_changed)
             backend = getattr(vm, "backend", None)
             if backend is not None and backend is not self._wired_voice_backend:
                 backend.synthesis_started.connect(self._on_tts_generation_started)
@@ -197,6 +214,30 @@ class ChatPanel(QFrame):
                 backend.playback_finished.connect(self._on_tts_playback_finished)
                 backend.playback_interrupted.connect(self._on_tts_playback_interrupted)
                 self._wired_voice_backend = backend
+
+    def set_voice_tab(self, voice_tab):
+        self.voice_tab = voice_tab
+
+    def set_sing_handler(self, handler):
+        self._sing_handler = handler
+        if handler and hasattr(handler, "set_reply_callback"):
+            def _reply(text):
+                QTimer.singleShot(
+                    0,
+                    lambda msg=str(text or ""): self._append_system_note(msg),
+                )
+            handler.set_reply_callback(_reply)
+
+    def _on_voice_manager_backend_changed(self, engine_id: str) -> None:
+        """Keep tts_combo label in sync when the backend changes externally."""
+        if engine_id == "qwen3-tts":
+            target = "Qwen3-TTS (Quality)"
+        else:
+            target = "pyttsx3 (Fast)"
+        if self.tts_combo.currentText() != target:
+            self.tts_combo.blockSignals(True)
+            self.tts_combo.setCurrentText(target)
+            self.tts_combo.blockSignals(False)
 
     def _on_barge_in_detected(self, fragment):
         """User spoke while TTS was playing — interrupt output.
@@ -233,11 +274,13 @@ class ChatPanel(QFrame):
                 pass
 
     def _on_tts_engine_changed(self, text):
+        """Route engine selection through VoiceManager to keep ownership clear."""
         if text == "Off":
             return
         engine_id = "qwen3-tts" if "Qwen3-TTS" in text else "pyttsx3"
         if self.voice_manager:
-            self.voice_manager.backend.set_engine(engine_id)
+            # Use VoiceManager.set_backend so backend_changed signal fires
+            self.voice_manager.set_backend(engine_id)
 
     def _capture_frame_b64(self):
         if not self.camera_service or not self.camera_service.is_active():
@@ -307,6 +350,8 @@ class ChatPanel(QFrame):
         Thread-safe: can be called from the audio thread (barge-in) or the
         GUI thread. Qt signal emissions are marshalled via QTimer.singleShot.
         """
+        # Clear any pending inline status block in the chat stream
+        QTimer.singleShot(0, self._clear_inline_status)
         # Set interrupted flag first so the TTS worker stops picking up new items
         with self._tts_worker_lock:
             self._tts_session_interrupted = True
@@ -332,9 +377,30 @@ class ChatPanel(QFrame):
         """Revia is about to speak unprompted — show a subtle indicator."""
         self.chat_display.append(self._fmt_system("Revia initiates..."))
 
+    def _handle_local_command(self, text):
+        if not re.match(r"^!sing(?:\s|$)", text or "", re.IGNORECASE):
+            return False
+        self.input_field.clear()
+        self.chat_display.append(self._fmt_user(text))
+        if not self._sing_handler:
+            self._append_system_note("Sing mode is not enabled yet.")
+            return True
+        args = re.sub(r"^!sing(?:\s+)?", "", text, flags=re.IGNORECASE).strip()
+        try:
+            reply = self._sing_handler.handle(args, "local_chat")
+        except Exception as exc:
+            logger.error("[ChatPanel] !sing command error: %s", exc)
+            reply = "Something went wrong with !sing."
+        if reply:
+            self._append_system_note(reply)
+        return True
+
     def _send(self):
         text = self.input_field.text().strip()
         if not text or len(text) > 10000:
+            return
+        if self._handle_local_command(text):
+            self._pending_input_source = "UserMessage"
             return
         source = self._pending_input_source or "UserMessage"
         reason = "voice input response" if source == "VoiceInput" else "manual user message"
@@ -551,74 +617,150 @@ class ChatPanel(QFrame):
             self._tts_worker_active = True
             self._tts_session_interrupted = False
             self.tts_session_started.emit()
-            threading.Thread(target=self._tts_worker, daemon=True).start()
+            threading.Thread(target=self._tts_worker_prefetch, daemon=True).start()
 
-    def _tts_worker(self):
-        """Background thread: consumes sentence queue and speaks each one in order."""
-        while True:
-            # Check if interrupted before picking up the next item
+    def _tts_worker_prefetch(self):
+        """Synthesize upcoming chunks while the current chunk is playing."""
+        if not self.voice_manager:
             with self._tts_worker_lock:
-                if self._tts_session_interrupted:
-                    self._tts_worker_active = False
-                    self._assistant_audio_active = False
-                    self._tts_session_interrupted = False
-                    self._notify_continuous_audio_tts_state(False)
-                    self.tts_session_finished.emit(True)  # True = interrupted
-                    return
-            try:
-                item = self._tts_queue.get(timeout=1.0)
-                # Unpack (text, emotion) tuple
-                if isinstance(item, tuple) and len(item) == 2:
-                    sentence, emotion = item
-                else:
-                    # Legacy: handle plain text items
-                    sentence = item
-                    emotion = self._current_emotion
-                # Re-check after blocking get — interrupt may have arrived while waiting
+                self._tts_worker_active = False
+                self._assistant_audio_active = False
+                self._tts_session_interrupted = False
+            self.tts_session_finished.emit(False)
+            return
+
+        ready_queue = queue.Queue(maxsize=3)
+        sentinel = object()
+        stop_event = threading.Event()
+
+        def _interrupted():
+            if stop_event.is_set():
+                return True
+            with self._tts_worker_lock:
+                return bool(self._tts_session_interrupted)
+
+        def _coerce_item(item):
+            if isinstance(item, tuple) and len(item) == 2:
+                return str(item[0] or "").strip(), item[1] or self._current_emotion
+            return str(item or "").strip(), self._current_emotion
+
+        def _put_ready(payload):
+            while not _interrupted():
+                try:
+                    ready_queue.put(payload, timeout=0.25)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _synth_loop():
+            idle_ticks = 0
+            while not _interrupted():
+                try:
+                    item = self._tts_queue.get(timeout=0.25)
+                except queue.Empty:
+                    if not self._awaiting_reply:
+                        idle_ticks += 1
+                        if idle_ticks >= 4:
+                            break
+                    else:
+                        idle_ticks = 0
+                    continue
+
+                idle_ticks = 0
+                sentence, emotion = _coerce_item(item)
+                wav_path = None
+                error = ""
+                try:
+                    if sentence and hasattr(self.voice_manager, "synthesize_to_wav"):
+                        wav_path, info = self.voice_manager.synthesize_to_wav(
+                            sentence, emotion=emotion
+                        )
+                        if not wav_path:
+                            error = str(info or "")
+                    elif sentence:
+                        error = "voice prefetch unavailable"
+                except Exception as exc:
+                    error = str(exc)
+                    logger.error("[ChatPanel] TTS synthesis error: %s", exc)
+                finally:
+                    self._tts_queue.task_done()
+
+                if sentence and not _interrupted():
+                    _put_ready((sentence, emotion, wav_path, error))
+
+            _put_ready(sentinel)
+
+        synth_thread = threading.Thread(
+            target=_synth_loop,
+            daemon=True,
+            name="revia-tts-synth",
+        )
+        synth_thread.start()
+
+        interrupted = False
+        try:
+            while True:
+                if _interrupted():
+                    interrupted = True
+                    break
+
+                try:
+                    ready = ready_queue.get(timeout=0.25)
+                except queue.Empty:
+                    if not synth_thread.is_alive():
+                        break
+                    continue
+
+                if ready is sentinel:
+                    break
+
+                sentence, emotion, wav_path, error = ready
+                if not sentence:
+                    continue
+
                 with self._tts_worker_lock:
                     if self._tts_session_interrupted:
-                        self._tts_worker_active = False
-                        self._assistant_audio_active = False
-                        self._tts_session_interrupted = False
-                        self._notify_continuous_audio_tts_state(False)
-                        self.tts_session_finished.emit(True)
-                        return
+                        interrupted = True
+                        break
                     self._assistant_audio_active = True
-                # Notify ContinuousAudio that TTS is playing (enables barge-in detection)
+
                 self._notify_continuous_audio_tts_state(True)
                 self.event_bus.log_entry.emit("[Revia] TTS start")
-                self.voice_manager.speak_sync(
-                    sentence, emotion=emotion
-                )
-                self.event_bus.log_entry.emit("[Revia] TTS end")
-                self._tts_queue.task_done()
-            except queue.Empty:
-                with self._tts_worker_lock:
-                    if self._tts_queue.empty():
-                        was_interrupted = self._tts_session_interrupted
+                try:
+                    if wav_path and hasattr(self.voice_manager, "play_wav_sync"):
+                        self.voice_manager.play_wav_sync(wav_path)
+                    else:
+                        if error:
+                            self.event_bus.log_entry.emit(
+                                f"[Revia] TTS prefetch fallback: {error}"
+                            )
+                        self.voice_manager.speak_sync(sentence, emotion=emotion)
+                except Exception as exc:
+                    logger.error(f"TTS worker error: {exc}")
+                    self.event_bus.log_entry.emit(f"[Revia] TTS worker error: {exc}")
+                finally:
+                    self.event_bus.log_entry.emit("[Revia] TTS end")
+                    with self._tts_worker_lock:
                         self._assistant_audio_active = False
-                        self._tts_worker_active = False
-                        self._tts_session_interrupted = False
-                        # Notify ContinuousAudio that TTS stopped
-                        self._notify_continuous_audio_tts_state(False)
-                        if not was_interrupted:
-                            self.tts_session_finished.emit(False)
-                        return
-            except Exception as exc:
-                logger.error(f"TTS worker error: {exc}")
-                self.event_bus.log_entry.emit(f"[Revia] TTS worker error: {exc}")
-                with self._tts_worker_lock:
-                    was_interrupted = self._tts_session_interrupted
-                    self._assistant_audio_active = False
-                    self._tts_worker_active = False
-                    self._tts_session_interrupted = False
-                if not was_interrupted:
-                    self.tts_session_finished.emit(False)
-                return
-            finally:
-                with self._tts_worker_lock:
-                    if self._tts_queue.empty():
-                        self._assistant_audio_active = False
+                    self._notify_continuous_audio_tts_state(False)
+        finally:
+            interrupted = interrupted or _interrupted()
+            stop_event.set()
+            if interrupted:
+                try:
+                    if self.voice_manager and hasattr(self.voice_manager, "backend"):
+                        self.voice_manager.backend.stop_output()
+                except Exception:
+                    pass
+                self._drain_tts_queue()
+            synth_thread.join(timeout=0.5)
+            with self._tts_worker_lock:
+                self._assistant_audio_active = False
+                self._tts_worker_active = False
+                self._tts_session_interrupted = False
+            self._notify_continuous_audio_tts_state(False)
+            self.tts_session_finished.emit(bool(interrupted))
 
     def _on_telemetry(self, data):
         emotion = data.get("emotion", {}) if isinstance(data, dict) else {}
@@ -653,6 +795,8 @@ class ChatPanel(QFrame):
             self._current_request_id = request_id
 
         self._finish_activity_request()
+        # Always clear any lingering inline status block before rendering output
+        self._clear_inline_status()
 
         if (not text) and (not success) and error_type != "interrupted":
             text = str(
@@ -728,6 +872,11 @@ class ChatPanel(QFrame):
     def interrupt_assistant_output(self):
         self._tts_sentence_buf = ""
         self._activity_interrupted = True
+        # Disarm the watchdog — interrupt is an intentional user action
+        self._thinking_watchdog.stop()
+        # Always remove any pending "Thinking…" / inline status bubble immediately so
+        # the user sees a clean slate before the next response starts rendering.
+        self._clear_inline_status()
         # Stop playback FIRST so speak_sync() unblocks before we touch worker state
         if self.voice_manager:
             try:
@@ -765,6 +914,10 @@ class ChatPanel(QFrame):
         self._activity_tts_playback_duration = 0.0
         self._activity_waiting_for_tts = False
         self._activity_interrupted = False
+        # Inject inline thinking indicator into the chat stream
+        self._insert_inline_status("Thinking...")
+        # Arm the hard-timeout watchdog — stops automatically when reply arrives
+        self._thinking_watchdog.start()
         self._refresh_activity_indicator()
 
     def _start_activity_generation(self):
@@ -778,6 +931,10 @@ class ChatPanel(QFrame):
             )
             self._activity_thinking_started_at = None
         self._activity_generation_started_at = now
+        # Disarm the watchdog — we have a live response stream
+        self._thinking_watchdog.stop()
+        # Clear the inline thinking indicator — response content follows immediately
+        self._clear_inline_status()
         self._refresh_activity_indicator()
 
     def _finish_activity_request(self):
@@ -971,6 +1128,12 @@ class ChatPanel(QFrame):
             self._schedule_next_queued_request(delay_ms=250)
 
     def _clear_reply_tracking(self):
+        # Disarm the watchdog — reply is being resolved (success, error, or stale recovery)
+        self._thinking_watchdog.stop()
+        # Always clear any lingering inline status bubble — this method is called
+        # on every exit path (completion, stale recovery, timeout) so doing it here
+        # guarantees the indicator never gets orphaned.
+        self._clear_inline_status()
         self._awaiting_reply = False
         self._awaiting_started_at = 0.0
         self._pending_request_id = ""
@@ -978,6 +1141,21 @@ class ChatPanel(QFrame):
         self._current_response = ""
         self._full_response = ""
         self._tts_sentence_buf = ""
+
+    def _on_thinking_timeout(self):
+        """Called when the backend stays in Thinking for > 120 s with no response.
+
+        Force-clears all reply state and shows a user-visible note so the
+        conversation doesn't appear permanently frozen.
+        """
+        if not self._awaiting_reply:
+            return  # Already resolved — nothing to do
+        logger.warning("[ChatPanel] Thinking watchdog fired — no response after 120 s, clearing state")
+        self._clear_inline_status()
+        self._append_system_note("Response timed out — backend took too long. Try again.")
+        self._finish_activity_request()
+        self._clear_reply_tracking()
+        self._schedule_next_queued_request(delay_ms=500)
 
     def _schedule_next_queued_request(self, delay_ms=900):
         if not self._outbound_queue:
@@ -1006,6 +1184,25 @@ class ChatPanel(QFrame):
             self.vision_btn.setToolTip("Toggle live vision context for messages")
             self.input_field.setPlaceholderText("Type a message...")
 
+    def _is_always_listening_mode(self):
+        try:
+            return "always" in self.voice_tab.ptt_mode.currentText().lower()
+        except Exception:
+            return False
+
+    def sync_mic_state_from_audio(self):
+        """Reflect externally-started STT in the mic button without toggling it."""
+        active = bool(self.audio_service and self.audio_service.is_listening())
+        if self.mic_btn.isChecked() == active:
+            return
+        self.mic_btn.blockSignals(True)
+        self.mic_btn.setChecked(active)
+        self.mic_btn.blockSignals(False)
+        if active:
+            self.mic_btn.setToolTip("Listening... (click to stop)")
+        else:
+            self.mic_btn.setToolTip("Toggle Listening (click to start/stop)")
+
     def _on_mic_toggled(self, active):
         if active:
             self.mic_btn.setToolTip("Listening... (click to stop)")
@@ -1013,7 +1210,14 @@ class ChatPanel(QFrame):
                 self._fmt_system("🎤 Listening — speak now")
             )
             if self.audio_service:
-                self.audio_service.start_listening()
+                started = self.audio_service.start_listening(
+                    always=self._is_always_listening_mode()
+                )
+                if started is False:
+                    self.mic_btn.blockSignals(True)
+                    self.mic_btn.setChecked(False)
+                    self.mic_btn.blockSignals(False)
+                    self.mic_btn.setToolTip("Toggle Listening (click to start/stop)")
         else:
             self.mic_btn.setToolTip("Toggle Listening (click to start/stop)")
             if self.audio_service:
@@ -1090,3 +1294,43 @@ class ChatPanel(QFrame):
 
     def _append_system_note(self, text):
         self.chat_display.append(self._fmt_system(text))
+
+    # ── Inline chat status (Fix 4) ─────────────────────────────────────────
+
+    def _insert_inline_status(self, text: str) -> None:
+        """Append a transient status bubble to the chat stream.
+
+        Saves the document position so the block can be replaced or removed
+        when the assistant transitions to the next state.
+        """
+        if self._inline_status_active:
+            self._clear_inline_status()
+        # Record position at current document end (before append inserts a new block)
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._inline_status_start = cursor.position()
+        self.chat_display.append(self._fmt_status_inline(text))
+        self._inline_status_active = True
+        self.chat_display.ensureCursorVisible()
+
+    def _clear_inline_status(self) -> None:
+        """Remove the transient inline status block from the chat stream."""
+        if not self._inline_status_active:
+            return
+        cursor = self.chat_display.textCursor()
+        cursor.setPosition(self._inline_status_start)
+        cursor.movePosition(cursor.MoveOperation.End, cursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        self._inline_status_active = False
+        self._inline_status_start = 0
+
+    @staticmethod
+    def _fmt_status_inline(text: str) -> str:
+        """Transient assistant status bubble — italic, muted, clearly distinct
+        from final response content.  Matches the Revia visual language but
+        uses a lighter weight so users can distinguish status from speech.
+        """
+        return (
+            '<span style="color:#8b7ab8;font-size:9px;font-style:italic;">'
+            f'⟳ {text}</span>'
+        )

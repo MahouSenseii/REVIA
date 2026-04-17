@@ -1,3 +1,4 @@
+import importlib.util
 import threading
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer
@@ -28,6 +29,7 @@ class AudioService(QObject):
         self._input_device_index = None
         self._output_device_name = None
         self._stt_phase = "idle"
+        self._stt_recognition_slots = threading.BoundedSemaphore(2)
 
         # Volume monitoring
         self._vol_timer = QTimer(self)
@@ -45,7 +47,13 @@ class AudioService(QObject):
 
     def start_listening(self, always=False):
         if self._listening:
-            return
+            return True
+        ok, reason = self.stt_startup_check()
+        if not ok:
+            self._stt_phase = "error"
+            self.stt_error.emit(reason)
+            self.status_changed.emit(reason)
+            return False
         self._listening = True
         self._always_listening = always
         self._stop_event.clear()
@@ -57,6 +65,7 @@ class AudioService(QObject):
         self.stt_listening_started.emit()
         self.status_changed.emit("Listening...")
         self._start_volume_monitor()
+        return True
 
     def stop_listening(self):
         self._listening = False
@@ -74,11 +83,68 @@ class AudioService(QObject):
         return self._listening
 
     def is_stt_available(self):
+        return importlib.util.find_spec("speech_recognition") is not None
+
+    def stt_startup_check(self):
+        """Return (ok, reason) for whether STT can be started now."""
         try:
-            import speech_recognition  # noqa: F401
-            return True
+            import speech_recognition as sr
         except Exception:
-            return False
+            return False, "speech_recognition not installed"
+
+        try:
+            names = sr.Microphone.list_microphone_names()
+        except Exception as exc:
+            return False, f"Microphone unavailable: {exc}"
+
+        if not names:
+            return False, "No microphone input devices found"
+        return True, ""
+
+    def _recognize_audio_async(self, audio, *, always_mode=False):
+        """Transcribe one captured phrase without blocking the mic loop."""
+        if not self._stt_recognition_slots.acquire(blocking=False):
+            self.stt_error.emit("STT backlog full; dropped an audio chunk")
+            return
+        try:
+            try:
+                import speech_recognition as sr
+            except ImportError:
+                self._stt_phase = "error"
+                self.stt_error.emit("speech_recognition not installed")
+                self.status_changed.emit("speech_recognition not installed")
+                self._listening = False
+                return
+
+            recognizer = sr.Recognizer()
+            self._stt_phase = "processing"
+            self.stt_processing_started.emit()
+            try:
+                text = recognizer.recognize_google(audio)
+                text = text.strip()
+                if text:
+                    self.stt_processing_finished.emit(True, "")
+                    self.speech_recognized.emit(text)
+                    if not always_mode:
+                        self._listening = False
+                        self.status_changed.emit("Got speech")
+                else:
+                    self.stt_processing_finished.emit(False, "")
+            except sr.UnknownValueError:
+                self.stt_processing_finished.emit(False, "")
+            except sr.RequestError as e:
+                self._stt_phase = "error"
+                message = f"STT API error: {e}"
+                self.stt_error.emit(message)
+                self.stt_processing_finished.emit(False, message)
+                self.status_changed.emit(message)
+            finally:
+                if self._listening:
+                    self._stt_phase = "listening"
+                else:
+                    self._stt_phase = "idle"
+        finally:
+            self._stt_recognition_slots.release()
 
     def _stt_loop(self):
         try:
@@ -131,7 +197,20 @@ class AudioService(QObject):
                     except Exception:
                         continue
 
-                    # Transcribe in background
+                    if self._always_listening:
+                        if self._stt_phase == "listening":
+                            self.stt_listening_stopped.emit()
+                        threading.Thread(
+                            target=self._recognize_audio_async,
+                            args=(audio,),
+                            kwargs={"always_mode": True},
+                            daemon=True,
+                            name="revia-stt-recognize",
+                        ).start()
+                        self._stt_phase = "listening"
+                        continue
+
+                    # Transcribe single-shot microphone input inline.
                     try:
                         if self._stt_phase == "listening":
                             self.stt_listening_stopped.emit()

@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.ui_status import apply_status_style, clear_status_role
+from app.ui_status import apply_status_style, clear_status_role, role_from_state
 
 
 class StatusField(QWidget):
@@ -39,11 +39,18 @@ class StatusField(QWidget):
         layout.addWidget(self.value, 1)
 
     def set_status(self, value, style=""):
+        """Update the displayed value and apply a visual role.
+
+        ``style`` accepts either:
+        * A semantic role name (``"success"``, ``"warning"``, ``"error"``,
+          ``"muted"``, ``"accent"``, ``"info"``) — preferred.
+        * A legacy CSS string (``"color: #2dd4bf;"``).
+        """
         text = str(value or "---")
         self.value.setText(text)
         self.value.setToolTip(text)
         if style:
-            apply_status_style(self.value, style)
+            apply_status_style(self.value, legacy_style=style, role=style if "#" not in style else None)
         else:
             clear_status_role(self.value)
 
@@ -192,53 +199,44 @@ class StatusPanel(QFrame):
             f"{model_name} | {model_state}",
             self._state_style(model_state),
         )
-        self.think_time_field.set_status(
-            thinking_time,
-            "color: #6b5d8a;",
-        )
-        self.tts_gen_field.set_status(
-            tts_generation_time,
-            "color: #6b5d8a;",
-        )
+        self.think_time_field.set_status(thinking_time, "muted")
+        self.tts_gen_field.set_status(tts_generation_time, "muted")
         self.online_field.set_status(
             "On" if online_enabled else "Off",
-            self._binary_style(online_enabled, on_style="color: #2dd4bf;"),
+            self._binary_role(online_enabled, on_role="success"),
         )
         self.filter_field.set_status(
             self._format_toggle_detail(
                 filters_enabled,
                 snapshot.get("filter_level", "standard"),
             ),
-            self._binary_style(filters_enabled, on_style="color: #f59e0b;"),
+            self._binary_role(filters_enabled, on_role="warning"),
         )
         self.voice_field.set_status(
             self._format_toggle_detail(
                 voice_enabled,
                 snapshot.get("voice_name") or "none",
             ),
-            self._binary_style(voice_enabled, on_style="color: #2dd4bf;"),
+            self._binary_role(voice_enabled, on_role="success"),
         )
         self.vision_field.set_status(
             self._format_vision_value(vision_state, vision_model),
-            self._state_style(vision_state),
+            role_from_state(vision_state),
         )
-        self.stt_field.set_status(stt_status, self._state_style(stt_status))
+        self.stt_field.set_status(stt_status, role_from_state(stt_status))
         self.stt_time_field.set_status(
-            str(snapshot.get("stt_time_text", "0.00s")),
-            "color: #6b5d8a;",
+            str(snapshot.get("stt_time_text", "0.00s")), "muted"
         )
-        self.tts_field.set_status(tts_status, self._state_style(tts_status))
+        self.tts_field.set_status(tts_status, role_from_state(tts_status))
         self.tts_time_field.set_status(
-            str(snapshot.get("tts_time_text", "0.00s")),
-            "color: #6b5d8a;",
+            str(snapshot.get("tts_time_text", "0.00s")), "muted"
         )
         self.emotion_field.set_status(
-            snapshot.get("current_emotion", "Neutral"),
-            "color: #c084fc;",
+            snapshot.get("current_emotion", "Neutral"), "accent"
         )
         self.persona_field.set_status(
             snapshot.get("current_persona", snapshot.get("active_persona_profile_name", "Revia")),
-            "color: #f9a8d4;",
+            "accent",
         )
 
     @staticmethod
@@ -279,19 +277,11 @@ class StatusPanel(QFrame):
         return "0.00s"
 
     @staticmethod
-    def _binary_style(enabled, *, on_style):
-        return on_style if enabled else "color: #6b5d8a;"
+    def _binary_role(enabled: bool, *, on_role: str) -> str:
+        """Return a semantic role name based on an on/off boolean."""
+        return on_role if enabled else "muted"
 
     @staticmethod
-    def _state_style(state):
-        state = str(state or "").split("|", 1)[0].strip().lower()
-        if state in ("ready", "idle", "complete", "speaking", "listening", "on"):
-            return "color: #2dd4bf;"          # teal — active / ready
-        if state in ("booting", "initializing", "connecting", "cooldown",
-                     "thinking", "generating", "processing", "interrupted"):
-            return "color: #f59e0b;"          # amber — in-progress
-        if state in ("error", "disconnected", "offline"):
-            return "color: #f43f5e;"          # red — error
-        if state in ("disabled", "off"):
-            return "color: #4a3a6a;"          # muted purple — off
-        return "color: #8b7ab8;"              # muted — unknown
+    def _state_style(state: str) -> str:
+        """Delegate to ui_status role resolution — no hardcoded colors here."""
+        return role_from_state(state)

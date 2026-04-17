@@ -7,7 +7,7 @@ Usage:
     (REST on :8123, WebSocket on :8124)
 """
 
-import json, time, random, threading, asyncio, os, subprocess, sys, math, re, hashlib
+import json, time, threading, asyncio, os, subprocess, sys, math, re, hashlib
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -33,8 +33,120 @@ def _load_local_env():
 
 _load_local_env()
 
-# Sentence boundary detection for streaming TTS (compiled once at module level)
-_SENTENCE_ENDERS = re.compile(r'[.!?]+["\')\]]?\s|[\n]')
+# Sentence boundary helpers for streaming TTS.
+_TTS_SENTENCE_TERMINATORS = ".!?"
+_TTS_SENTENCE_CLOSERS = "\"')]}"
+_TTS_ABBREVIATIONS = {
+    "a.m",
+    "co",
+    "corp",
+    "dept",
+    "dr",
+    "e.g",
+    "etc",
+    "fig",
+    "i.e",
+    "inc",
+    "jr",
+    "ltd",
+    "max",
+    "min",
+    "mr",
+    "mrs",
+    "ms",
+    "mx",
+    "no",
+    "p.m",
+    "prof",
+    "sr",
+    "st",
+    "u.k",
+    "u.s",
+    "vs",
+}
+
+
+def _tts_has_terminal_punctuation(text: str) -> bool:
+    stripped = str(text or "").strip()
+    while stripped and stripped[-1] in _TTS_SENTENCE_CLOSERS:
+        stripped = stripped[:-1].rstrip()
+    return bool(stripped) and stripped[-1] in _TTS_SENTENCE_TERMINATORS
+
+
+def _tts_is_nonterminal_period(text: str, period_index: int) -> bool:
+    if (
+        period_index > 0
+        and period_index + 1 < len(text)
+        and text[period_index - 1].isdigit()
+        and text[period_index + 1].isdigit()
+    ):
+        return True
+
+    before = text[: period_index + 1].rstrip()
+    match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)\.$", before)
+    if not match:
+        return False
+
+    token = match.group(1).lower()
+    compact = token.replace(".", "")
+    if len(compact) == 1:
+        return True
+    if token in _TTS_ABBREVIATIONS or compact in _TTS_ABBREVIATIONS:
+        return True
+    if "." in token and len(compact) <= 4:
+        return True
+    return False
+
+
+def _extract_complete_tts_sentences(buffered: str, final: bool = False):
+    """Return complete TTS sentences and keep the unfinished tail buffered."""
+    text = str(buffered or "")
+    sentences = []
+    start = 0
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        if ch not in _TTS_SENTENCE_TERMINATORS:
+            i += 1
+            continue
+
+        if ch == "." and _tts_is_nonterminal_period(text, i):
+            i += 1
+            continue
+
+        j = i + 1
+        while j < n and text[j] in _TTS_SENTENCE_TERMINATORS:
+            j += 1
+        while j < n and text[j] in _TTS_SENTENCE_CLOSERS:
+            j += 1
+
+        boundary = j < n and text[j].isspace()
+        if final and j >= n:
+            boundary = True
+
+        if not boundary:
+            i = j
+            continue
+
+        sentence = text[start:j].strip()
+        if sentence:
+            sentences.append(sentence)
+        while j < n and text[j].isspace():
+            j += 1
+        start = j
+        i = j
+
+    remainder = text[start:]
+    if final:
+        final_sentence = remainder.strip()
+        if final_sentence:
+            if not _tts_has_terminal_punctuation(final_sentence):
+                final_sentence = f"{final_sentence}."
+            sentences.append(final_sentence)
+        remainder = ""
+    return sentences, remainder
 
 try:
     import psutil as _psutil
@@ -68,8 +180,6 @@ try:
     _requests_available = True
 except ImportError:
     _requests_available = False
-    import urllib.request as _urllib_req
-    import urllib.error as _urllib_err
     # Minimal shim so the rest of the file can still reference requests.*
     class _RequestsShim:
         class exceptions:
@@ -119,7 +229,7 @@ from runtime_models import (
 )
 from runtime_status import RuntimeStatusManager
 from reinforcement_learner import ReinforcementLearner, RewardSignal
-from vllm_backend import VLLMEnhancer, VLLMGenerateResult, classify_prompt_complexity
+from vllm_backend import VLLMEnhancer, classify_prompt_complexity
 
 # ---------------------------------------------------------------------------
 # Optional Redis client for Docker-backed long-term memory
@@ -3447,10 +3557,10 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         _device = telemetry.system.get("device", "CPU")
 
     token_started = False
-    _sentence_buffer = []  # Accumulates tokens for sentence-level TTS chunking
+    _sentence_buffer = ""  # Accumulates tokens for sentence-level TTS chunking
 
     def _pipeline_broadcast(payload):
-        nonlocal token_started
+        nonlocal token_started, _sentence_buffer
         if not turn_manager.is_current(turn.request_id):
             _revia_log(
                 f"Stale response discarded | request_id={turn.request_id} | type={payload.get('type', '')}"
@@ -3471,18 +3581,15 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 )
             # Buffer tokens and emit sentence-level events for TTS streaming
             tok = out.get("token", "")
-            _sentence_buffer.append(tok)
-            buffered = "".join(_sentence_buffer)
-            if _SENTENCE_ENDERS.search(buffered):
-                sentence = buffered.strip()
-                if sentence:
-                    broadcast_json({
-                        "type": "chat_sentence",
-                        "sentence": sentence,
-                        "request_id": turn.request_id,
-                        "turn_id": turn.turn_id,
-                    })
-                _sentence_buffer.clear()
+            _sentence_buffer += str(tok or "")
+            sentences, _sentence_buffer = _extract_complete_tts_sentences(_sentence_buffer)
+            for sentence in sentences:
+                broadcast_json({
+                    "type": "chat_sentence",
+                    "sentence": sentence,
+                    "request_id": turn.request_id,
+                    "turn_id": turn.turn_id,
+                })
         broadcast_json(out)
 
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
@@ -3702,7 +3809,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     # Check staleness BEFORE flushing sentence buffer -- don't broadcast stale data
     if not turn_manager.is_current(turn.request_id):
         _revia_log(f"Stale response discarded before completion | request_id={turn.request_id}")
-        _sentence_buffer.clear()
+        _sentence_buffer = ""
         turn_manager.finish_turn(
             turn.request_id,
             lifecycle_state=RequestLifecycleState.IDLE,
@@ -3712,17 +3819,18 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         _broadcast_runtime_status()
         return ""
 
-    # Flush any remaining sentence buffer for TTS (last sentence may not end with punctuation)
+    # Flush only after a clean completion. If the model omitted punctuation,
+    # add a terminal pause for TTS without changing the visible response text.
     if _sentence_buffer:
-        remaining = "".join(_sentence_buffer).strip()
-        if remaining:
+        sentences, _sentence_buffer = _extract_complete_tts_sentences(_sentence_buffer, final=True)
+        for sentence in sentences:
             broadcast_json({
                 "type": "chat_sentence",
-                "sentence": remaining,
+                "sentence": sentence,
                 "request_id": turn.request_id,
                 "turn_id": turn.turn_id,
             })
-        _sentence_buffer.clear()
+        _sentence_buffer = ""
 
     if _is_feelings_prompt(text) and _looks_like_emotion_disclaimer(response.text):
         response.text = (response.text or "").rstrip() + "\n\n" + _build_emotion_self_report(emo)
