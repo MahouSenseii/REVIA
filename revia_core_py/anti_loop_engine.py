@@ -225,14 +225,19 @@ class AntiLoopEngine:
         Count 4-grams that appear more than once within ``reply``.
         Returns proportion of reply tokens involved in repeated 4-grams.
         """
-        # Before scoring repetition, check whitelist
-        for phrase in _PERSONALITY_WHITELIST:
-            if phrase in reply.lower():
-                return 0.0  # Not a loop, it's a personality trait
-
         if not reply or not reply.strip():
             return 0.0  # Empty reply handled elsewhere; don't flag as loop
-        tokens = reply.lower().split()
+
+        reply_lower = reply.lower()
+
+        # Before scoring repetition, check whitelist.
+        # any() short-circuits on the first match — O(1) average for a hit.
+        if _PERSONALITY_WHITELIST and any(
+            phrase in reply_lower for phrase in _PERSONALITY_WHITELIST
+        ):
+            return 0.0  # Not a loop, it's a personality trait
+
+        tokens = reply_lower.split()
         n = 4
         if len(tokens) < n:
             return 0.0

@@ -294,11 +294,16 @@ class InterruptionHandler:
 
         hits = 0
         for pat in patterns:
+            # Support both pre-compiled re.Pattern objects and raw strings.
+            # Always compile raw strings so re.fullmatch / re.search receive the
+            # right type — passing a compiled Pattern to re.fullmatch(pat, text)
+            # would raise TypeError in Python ≥ 3.6.
+            compiled = pat if hasattr(pat, 'fullmatch') else re.compile(pat)
             if full_line:
-                if (pat.fullmatch(lower) if hasattr(pat, 'fullmatch') else re.fullmatch(pat, lower)):
+                if compiled.fullmatch(lower):
                     hits += 1
             else:
-                if (pat.search(lower) if hasattr(pat, 'search') else re.search(pat, lower)):
+                if compiled.search(lower):
                     hits += 1
 
         # Normalise against list length; any single hit earns at least 0.5

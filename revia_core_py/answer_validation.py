@@ -45,6 +45,17 @@ assert abs(sum(_WEIGHTS.values()) - 1.0) < 1e-9, "AVS weight sum != 1.0"
 
 # Pre-compiled regexes used in scoring (avoid re-compiling on every call)
 _FILLER_RE = re.compile(r"\.\.\.|<[^>]+>|\[INST\]|\[/INST\]|###")
+_WORD_WITH_APOSTROPHE_RE = re.compile(r"[a-z']+")   # intent coverage keyword extraction
+_ALPHA_WORD_RE = re.compile(r"[a-z]+")              # emotional alignment token extraction
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+")          # sentence boundary split
+
+# Contradiction pairs for factual coherence — compiled once, reused every call
+_CONTRADICTION_PAIRS: tuple[tuple, ...] = (
+    (re.compile(r"\byes\b"),        re.compile(r"\bno\b")),
+    (re.compile(r"\balways\b"),     re.compile(r"\bnever\b")),
+    (re.compile(r"\beveryone\b"),   re.compile(r"\bno\s+one\b")),
+    (re.compile(r"\bimpossible\b"), re.compile(r"\bpossible\b")),
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -252,7 +263,7 @@ class AnswerValidationSystem:
             return 1.0   # no utterance → trivially covered
 
         def _keywords(text: str) -> set[str]:
-            words = re.findall(r"[a-z']+", text.lower())
+            words = _WORD_WITH_APOSTROPHE_RE.findall(text.lower())
             return {w for w in words if w not in _STOPWORDS and len(w) > 2}
 
         utt_kw   = _keywords(utterance)
@@ -289,19 +300,13 @@ class AnswerValidationSystem:
         notes_deductions: list[float] = []
 
         # Contradiction signals
-        contradictions = [
-            (r"\byes\b", r"\bno\b"),
-            (r"\balways\b", r"\bnever\b"),
-            (r"\beveryone\b", r"\bno\s+one\b"),
-            (r"\bimpossible\b", r"\bpossible\b"),
-        ]
         lower = reply.lower()
-        for pat_a, pat_b in contradictions:
-            if re.search(pat_a, lower) and re.search(pat_b, lower):
+        for pat_a, pat_b in _CONTRADICTION_PAIRS:
+            if pat_a.search(lower) and pat_b.search(lower):
                 notes_deductions.append(0.15)
 
         # Repeated sentence penalty
-        sentences = [s.strip() for s in re.split(r"[.!?]+", reply) if s.strip()]
+        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(reply) if s.strip()]
         seen: dict[str, int] = {}
         for s in sentences:
             key = s.lower()[:120]
@@ -341,7 +346,7 @@ class AnswerValidationSystem:
             "okay", "sure", "understand", "noted", "right", "alright", "fine",
         }
 
-        tokens = set(re.findall(r"[a-z]+", reply.lower()))
+        tokens = set(_ALPHA_WORD_RE.findall(reply.lower()))
         pos_hits = len(tokens & POSITIVE_WORDS)
         neg_hits = len(tokens & NEGATIVE_WORDS)
         neu_hits = len(tokens & NEUTRAL_WORDS)

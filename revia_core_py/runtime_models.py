@@ -34,7 +34,7 @@ class TurnRecord:
     response_mode: str
     lifecycle_state: str = RequestLifecycleState.IDLE.value
     lifecycle_reason: str = ""
-    started_at: float = field(default_factory=time.monotonic)
+    started_at: float = field(default_factory=lambda: time.monotonic())
     metadata: dict = field(default_factory=dict)
 
 

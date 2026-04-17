@@ -1,0 +1,23 @@
+{
+  "songs": [
+    {
+      "song_id": "kwarz-whered-you-go",
+      "title": "Kwarz Where'D You Go ",
+      "artist": "MahouSensei",
+      "original_path": "C:\\Users\\USER\\Documents\\GitHub\\REVIA\\songs\\kwarz-whered-you-go\\original.mp3",
+      "prepared": false,
+      "analysis_path": "",
+      "karaoke_output_path": "",
+      "duration_sec": 249.91997916666668,
+      "bpm": 0.0,
+      "key": "",
+      "tags": [
+        "sad",
+        "confused"
+      ],
+      "added_ts": 1776447425.095355,
+      "last_played_ts": 0.0,
+      "play_count": 0
+    }
+  ]
+}

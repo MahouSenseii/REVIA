@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 
@@ -112,6 +113,32 @@ PERSONA_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pre-serialized templates
+# ---------------------------------------------------------------------------
+# Serializing once at import time and then deserializing per call is 3-5x
+# faster than copy.deepcopy() for pure JSON-safe dicts.  These are the only
+# two constant dicts that normalize_profile() copies on every request.
+_DEFAULT_PROMPT_PROFILE_JSON: str = json.dumps(DEFAULT_PROMPT_PROFILE)
+_DEFAULT_PERSONA_DEFINITION_JSON: str = json.dumps(DEFAULT_PERSONA_DEFINITION)
+_DEFAULT_INTERACTION_STYLE_JSON: str = json.dumps(
+    DEFAULT_PERSONA_DEFINITION["interaction_style"]
+)
+_DEFAULT_TRAITS: list = copy.deepcopy(DEFAULT_PERSONA_DEFINITION["traits"])
+
+
+def _copy_prompt_profile() -> dict:
+    return json.loads(_DEFAULT_PROMPT_PROFILE_JSON)
+
+
+def _copy_persona_definition() -> dict:
+    return json.loads(_DEFAULT_PERSONA_DEFINITION_JSON)
+
+
+def _copy_interaction_style() -> dict:
+    return json.loads(_DEFAULT_INTERACTION_STYLE_JSON)
+
+
 def _deep_merge(base: Any, overlay: Any) -> Any:
     if isinstance(base, dict) and isinstance(overlay, dict):
         for key, value in overlay.items():
@@ -170,7 +197,7 @@ def _coerce_traits(profile: dict[str, Any], persona: dict[str, Any]) -> list[str
         if weighted:
             return weighted
 
-    return copy.deepcopy(DEFAULT_PERSONA_DEFINITION["traits"])
+    return list(_DEFAULT_TRAITS)  # shallow copy is safe — list of immutable strings
 
 
 def _normalize_modules(persona: dict[str, Any]) -> list[dict[str, str]]:
@@ -218,12 +245,12 @@ def resolve_persona_preset_name(profile: dict[str, Any] | None) -> str:
 
 
 def normalize_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
-    merged = copy.deepcopy(DEFAULT_PROMPT_PROFILE)
+    merged = _copy_prompt_profile()
     if isinstance(profile, dict):
         merged = _deep_merge(merged, copy.deepcopy(profile))
 
     preset_name = resolve_persona_preset_name(merged)
-    persona = copy.deepcopy(DEFAULT_PERSONA_DEFINITION)
+    persona = _copy_persona_definition()
     persona = _deep_merge(persona, PERSONA_PRESETS.get(preset_name, {}))
 
     persona_source = merged.get("persona_definition")
@@ -245,7 +272,7 @@ def normalize_profile(profile: dict[str, Any] | None) -> dict[str, Any]:
         fallback=DEFAULT_PERSONA_DEFINITION["identity_prompt"],
     )
 
-    interaction_style = copy.deepcopy(DEFAULT_PERSONA_DEFINITION["interaction_style"])
+    interaction_style = _copy_interaction_style()
     interaction_style = _deep_merge(
         interaction_style, copy.deepcopy(persona.get("interaction_style", {}))
     )

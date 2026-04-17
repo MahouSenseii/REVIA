@@ -107,7 +107,11 @@ class QwenTTSBackend(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # guards _qwen_clients, _output_device
+        self._pyttsx3_lock = threading.Lock()  # guards _pyttsx3_engine exclusively (separate from _lock
+                                               # so device-routing reads never wait on synthesis)
+        self._synth_semaphore = threading.Semaphore(3)  # allows up to 3 parallel Gradio synthesis calls
+        self._metrics_lock = threading.Lock()  # guards last_metrics only
         self._engine_name = "qwen3-tts"
         self._qwen_url = ""  # custom Qwen3-TTS server URL (Gradio)
         self._qwen_clients = {}
@@ -542,7 +546,7 @@ class QwenTTSBackend(QObject):
             self.error_occurred.emit(f"Voice Design error: {exc}")
             return None, str(exc)
 
-        with self._lock:
+        with self._synth_semaphore:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
@@ -576,7 +580,7 @@ class QwenTTSBackend(QObject):
             self.error_occurred.emit(f"Voice Clone error: {exc}")
             return None, str(exc)
 
-        with self._lock:
+        with self._synth_semaphore:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
@@ -632,7 +636,7 @@ class QwenTTSBackend(QObject):
             self.error_occurred.emit(f"CustomVoice error: {exc}")
             return None, str(exc)
 
-        with self._lock:
+        with self._synth_semaphore:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
@@ -697,22 +701,27 @@ class QwenTTSBackend(QObject):
         m.synthesis_time = round(elapsed, 3)
         m.audio_duration = round(audio_dur, 2)
         m.realtime_factor = round(audio_dur / elapsed, 2) if elapsed > 0 else 0
-        self.last_metrics = m
+        with self._metrics_lock:
+            self.last_metrics = m
         return m
 
     # pyttsx3 fallback
 
     def _fallback_generate(self, text, output_path=None):
         text = _strip_leading_style_directives(text)
-        with self._lock:
+        # Use _pyttsx3_lock (not _lock) so device-routing reads are never
+        # blocked while pyttsx3 is synthesising.
+        with self._pyttsx3_lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             try:
                 import pyttsx3
                 engine = pyttsx3.init()
                 voices = engine.getProperty("voices")
-                if self._pyttsx3_voice_id:
-                    engine.setProperty("voice", self._pyttsx3_voice_id)
+                with self._lock:
+                    voice_id = self._pyttsx3_voice_id
+                if voice_id:
+                    engine.setProperty("voice", voice_id)
                 elif voices:
                     engine.setProperty("voice", voices[0].id)
                 engine.setProperty("rate", 180)
@@ -752,7 +761,9 @@ class QwenTTSBackend(QObject):
             self._speak_pyttsx3_to_device(text, speed, pitch)
             return
 
-        with self._lock:
+        # Use _pyttsx3_lock (not _lock) so device-routing reads are never
+        # blocked while pyttsx3 is synthesising.
+        with self._pyttsx3_lock:
             t0 = time.perf_counter()
             self.synthesis_started.emit()
             started = False
@@ -762,8 +773,10 @@ class QwenTTSBackend(QObject):
                     self._pyttsx3_engine = pyttsx3.init()
                 engine = self._pyttsx3_engine
                 voices = engine.getProperty("voices")
-                if self._pyttsx3_voice_id:
-                    engine.setProperty("voice", self._pyttsx3_voice_id)
+                with self._lock:
+                    voice_id = self._pyttsx3_voice_id
+                if voice_id:
+                    engine.setProperty("voice", voice_id)
                 elif voices:
                     engine.setProperty("voice", voices[0].id)
                 # Favor lower perceived latency for conversational turns.
@@ -777,7 +790,8 @@ class QwenTTSBackend(QObject):
                 m.synthesis_time = round(elapsed, 3)
                 m.audio_duration = round(len(text.split()) / 3.0, 2)
                 m.realtime_factor = round(m.audio_duration / elapsed, 2) if elapsed > 0 else 0
-                self.last_metrics = m
+                with self._metrics_lock:
+                    self.last_metrics = m
                 self.synthesis_finished.emit(m)
             except Exception as exc:
                 _log.error("[TTS] pyttsx3 speak error: %s", exc)

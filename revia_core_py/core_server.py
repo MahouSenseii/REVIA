@@ -36,6 +36,14 @@ _load_local_env()
 # Sentence boundary helpers for streaming TTS.
 _TTS_SENTENCE_TERMINATORS = ".!?"
 _TTS_SENTENCE_CLOSERS = "\"')]}"
+
+# Minimum/maximum characters per TTS chunk emitted to the client.
+# Chunks below _TTS_MIN_CHUNK_CHARS are accumulated with the next sentence so
+# Revia never says a single micro-word clip like "Yes." in isolation.
+# Chunks above _TTS_MAX_CHUNK_CHARS are flushed even if the next sentence
+# hasn't arrived yet so responses don't feel slow to start.
+_TTS_MIN_CHUNK_CHARS = 90
+_TTS_MAX_CHUNK_CHARS = 280
 _TTS_ABBREVIATIONS = {
     "a.m",
     "co",
@@ -3700,9 +3708,10 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
 
     token_started = False
     _sentence_buffer = ""  # Accumulates tokens for sentence-level TTS chunking
+    _tts_chunk_buf = ""    # Accumulates complete sentences until min chunk size
 
     def _pipeline_broadcast(payload):
-        nonlocal token_started, _sentence_buffer
+        nonlocal token_started, _sentence_buffer, _tts_chunk_buf
         if not turn_manager.is_current(turn.request_id):
             _revia_log(
                 f"Stale response discarded | request_id={turn.request_id} | type={payload.get('type', '')}"
@@ -3721,17 +3730,33 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     runtime_state=ReviaState.SPEAKING,
                     runtime_reason=f"{trigger.source}: first token",
                 )
-            # Buffer tokens and emit sentence-level events for TTS streaming
+            # Buffer tokens and emit sentence-level events for TTS streaming.
+            # Sentences are accumulated into chunks of _TTS_MIN_CHUNK_CHARS to
+            # avoid tiny clips (e.g. "Yes."), but flushed early if they grow
+            # past _TTS_MAX_CHUNK_CHARS so the first words start playing fast.
             tok = out.get("token", "")
             _sentence_buffer += str(tok or "")
             sentences, _sentence_buffer = _extract_complete_tts_sentences(_sentence_buffer)
             for sentence in sentences:
-                broadcast_json({
-                    "type": "chat_sentence",
-                    "sentence": sentence,
-                    "request_id": turn.request_id,
-                    "turn_id": turn.turn_id,
-                })
+                joiner = " " if _tts_chunk_buf else ""
+                _tts_chunk_buf += joiner + sentence
+                if len(_tts_chunk_buf) >= _TTS_MIN_CHUNK_CHARS:
+                    broadcast_json({
+                        "type": "chat_sentence",
+                        "sentence": _tts_chunk_buf.strip(),
+                        "request_id": turn.request_id,
+                        "turn_id": turn.turn_id,
+                    })
+                    _tts_chunk_buf = ""
+                elif len(_tts_chunk_buf) >= _TTS_MAX_CHUNK_CHARS:
+                    # Safety flush — chunk grew too large, emit now
+                    broadcast_json({
+                        "type": "chat_sentence",
+                        "sentence": _tts_chunk_buf.strip(),
+                        "request_id": turn.request_id,
+                        "turn_id": turn.turn_id,
+                    })
+                    _tts_chunk_buf = ""
         broadcast_json(out)
 
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
@@ -3963,6 +3988,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     if not turn_manager.is_current(turn.request_id):
         _revia_log(f"Stale response discarded before completion | request_id={turn.request_id}")
         _sentence_buffer = ""
+        _tts_chunk_buf = ""
         turn_manager.finish_turn(
             turn.request_id,
             lifecycle_state=RequestLifecycleState.IDLE,
@@ -3974,16 +4000,21 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
 
     # Flush only after a clean completion. If the model omitted punctuation,
     # add a terminal pause for TTS without changing the visible response text.
+    # Also flush any partially-accumulated chunk that didn't reach min size.
     if _sentence_buffer:
         sentences, _sentence_buffer = _extract_complete_tts_sentences(_sentence_buffer, final=True)
         for sentence in sentences:
-            broadcast_json({
-                "type": "chat_sentence",
-                "sentence": sentence,
-                "request_id": turn.request_id,
-                "turn_id": turn.turn_id,
-            })
+            joiner = " " if _tts_chunk_buf else ""
+            _tts_chunk_buf += joiner + sentence
         _sentence_buffer = ""
+    if _tts_chunk_buf.strip():
+        broadcast_json({
+            "type": "chat_sentence",
+            "sentence": _tts_chunk_buf.strip(),
+            "request_id": turn.request_id,
+            "turn_id": turn.turn_id,
+        })
+        _tts_chunk_buf = ""
 
     if _is_feelings_prompt(text) and _looks_like_emotion_disclaimer(response.text):
         response.text = (response.text or "").rstrip() + "\n\n" + _build_emotion_self_report(emo)

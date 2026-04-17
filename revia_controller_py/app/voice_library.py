@@ -48,7 +48,9 @@ class VoiceLibrary:
     def set_default(self, name):
         if name is None or name not in self._profiles:
             return False
-        for n, p in self._profiles.items():
+        # Snapshot to avoid RuntimeError if another thread mutates _profiles
+        # while we are iterating and calling p.save() (I/O can yield the GIL).
+        for n, p in list(self._profiles.items()):
             if p is None:
                 continue
             p.is_default = (n == name)
@@ -124,8 +126,18 @@ class VoiceLibrary:
     def open_folder(self):
         """Open the voices folder in the system file explorer."""
         import subprocess, sys
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", str(self.base_dir)])
+        path = str(self.base_dir)
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                # Linux / BSD — xdg-open is the standard cross-DE launcher
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("[VoiceLibrary] Could not open folder: %s", exc)
 
     def _safe_name(self, name):
         safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()

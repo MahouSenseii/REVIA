@@ -133,21 +133,21 @@ class ConversationBehaviorController:
             blocking_reasons.insert(0, "tts: local speech output is not ready")
 
         if not readiness.get("can_start_conversation", False):
-            return self._blocked(source, blocking_reasons[0] if blocking_reasons else "system not ready")
+            return self._blocked(source, blocking_reasons[0] if blocking_reasons else "system not ready", status)
 
         if autonomous and not readiness.get("can_auto_initiate", False) and not force:
-            return self._blocked(source, "startup warmup or autonomous gate is active")
+            return self._blocked(source, "startup warmup or autonomous gate is active", status)
 
         if autonomous:
             if self._is_user_speaking():
-                return self._blocked(source, "user is speaking")
+                return self._blocked(source, "user is speaking", status)
             if self._is_assistant_speaking():
-                return self._blocked(source, "assistant is already speaking")
+                return self._blocked(source, "assistant is already speaking", status)
             if runtime_state != STATE_IDLE:
-                return self._blocked(source, f"state={runtime_state}")
+                return self._blocked(source, f"state={runtime_state}", status)
             remaining = float(cooldowns.get("autonomous", 0.0) or 0.0)
             if remaining > 0.0 and not force:
-                return self._blocked(source, f"autonomous cooldown active ({remaining:.1f}s)")
+                return self._blocked(source, f"autonomous cooldown active ({remaining:.1f}s)", status)
         else:
             # User-initiated messages should feel like a real conversation:
             # the user can always send, can interrupt Revia mid-sentence,
@@ -159,7 +159,7 @@ class ConversationBehaviorController:
             # chat panel (it interrupts before sending). COOLDOWN is
             # explicitly non-blocking here.
             if runtime_state == STATE_THINKING:
-                return self._blocked(source, f"state={runtime_state}")
+                return self._blocked(source, f"state={runtime_state}", status)
 
         return self._allowed(source, reason)
 
@@ -167,13 +167,14 @@ class ConversationBehaviorController:
         self._log(f"[Revia] Allowed: {source} ({reason})")
         return BehaviorDecision(True, reason)
 
-    def _blocked(self, source: str, reason: str) -> BehaviorDecision:
+    def _blocked(self, source: str, reason: str, status: dict | None = None) -> BehaviorDecision:
         # Pull extra context so the first log line tells you *why* the block
-        # fired, not just "state=Thinking". If status isn't available we
-        # degrade gracefully to the old format.
+        # fired, not just "state=Thinking". Re-use the status snapshot passed
+        # from _evaluate() when available so the log reflects the exact state
+        # that triggered the block — not a potentially stale re-fetch.
         extras = []
         try:
-            status = self._status_provider() or {}
+            status = (status or self._status_provider()) or {}
             readiness = status.get("conversation_readiness", {}) or {}
             llm = status.get("llm_connection", {}) or {}
             behavior = status.get("behavior", {}) or {}

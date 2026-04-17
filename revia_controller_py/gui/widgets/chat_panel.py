@@ -643,7 +643,13 @@ class ChatPanel(QFrame):
             threading.Thread(target=self._tts_worker_prefetch, daemon=True).start()
 
     def _tts_worker_prefetch(self):
-        """Synthesize upcoming chunks while the current chunk is playing."""
+        """Synthesize upcoming chunks while the current chunk is playing.
+
+        Uses a ThreadPoolExecutor so up to 3 sentences are synthesized in
+        parallel.  A sequence-numbered ordered buffer ensures playback always
+        happens in the original sentence order even when faster-synthesizing
+        chunks finish ahead of slower ones.
+        """
         if not self.voice_manager:
             with self._tts_worker_lock:
                 self._tts_worker_active = False
@@ -652,7 +658,10 @@ class ChatPanel(QFrame):
             self.tts_session_finished.emit(False)
             return
 
-        ready_queue = queue.Queue(maxsize=3)
+        import heapq
+        from concurrent.futures import ThreadPoolExecutor
+
+        ready_queue = queue.Queue(maxsize=6)
         sentinel = object()
         stop_event = threading.Event()
 
@@ -676,22 +685,23 @@ class ChatPanel(QFrame):
                     continue
             return False
 
-        def _synth_loop():
-            idle_ticks = 0
-            while not _interrupted():
-                try:
-                    item = self._tts_queue.get(timeout=0.25)
-                except queue.Empty:
-                    if not self._awaiting_reply:
-                        idle_ticks += 1
-                        if idle_ticks >= 4:
-                            break
-                    else:
-                        idle_ticks = 0
-                    continue
+        # --- parallel synthesis state ---
+        heap_lock = threading.Lock()
+        ordered_heap = []      # min-heap of (seq_no, sentence, emotion, wav, error)
+        play_seq = [0]         # next expected sequence number for playback
+        pending_count = [0]    # futures not yet resolved
+        heap_event = threading.Event()
 
-                idle_ticks = 0
-                sentence, emotion = _coerce_item(item)
+        def _synth_loop():
+            """Submit synthesis jobs to the thread pool; put results in order."""
+            MAX_PARALLEL = 3
+            executor = ThreadPoolExecutor(
+                max_workers=MAX_PARALLEL, thread_name_prefix="revia-synth"
+            )
+            submit_seq = [0]
+            idle_ticks = 0
+
+            def _do_synth(sentence, emotion, seq):
                 wav_path = None
                 error = ""
                 try:
@@ -706,11 +716,70 @@ class ChatPanel(QFrame):
                 except Exception as exc:
                     error = str(exc)
                     logger.error("[ChatPanel] TTS synthesis error: %s", exc)
+                return seq, sentence, emotion, wav_path, error
+
+            def _on_future_done(future, seq):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = (seq, "", self._current_emotion, None, str(exc))
                 finally:
                     self._tts_queue.task_done()
+                with heap_lock:
+                    heapq.heappush(ordered_heap, result)
+                    pending_count[0] -= 1
+                heap_event.set()
 
-                if sentence and not _interrupted():
-                    _put_ready((sentence, emotion, wav_path, error))
+            def _flush_ordered():
+                """Push any in-order results from the heap to ready_queue."""
+                while True:
+                    with heap_lock:
+                        if not ordered_heap or ordered_heap[0][0] != play_seq[0]:
+                            break
+                        result = heapq.heappop(ordered_heap)
+                    play_seq[0] += 1
+                    _seq, sentence, emotion, wav_path, error = result
+                    if sentence and not _interrupted():
+                        if not _put_ready((sentence, emotion, wav_path, error)):
+                            return  # interrupted
+
+            try:
+                while not _interrupted():
+                    try:
+                        item = self._tts_queue.get(timeout=0.15)
+                    except queue.Empty:
+                        if not self._awaiting_reply:
+                            idle_ticks += 1
+                            if idle_ticks >= 6:
+                                break
+                        else:
+                            idle_ticks = 0
+                        _flush_ordered()
+                        heap_event.wait(timeout=0.1)
+                        heap_event.clear()
+                        continue
+
+                    idle_ticks = 0
+                    sentence, emotion = _coerce_item(item)
+                    seq = submit_seq[0]
+                    submit_seq[0] += 1
+
+                    with heap_lock:
+                        pending_count[0] += 1
+                    future = executor.submit(_do_synth, sentence, emotion, seq)
+                    future.add_done_callback(lambda f, s=seq: _on_future_done(f, s))
+
+                    _flush_ordered()
+
+                # Drain: wait for all in-flight futures to finish, then flush
+                while pending_count[0] > 0 and not _interrupted():
+                    heap_event.wait(timeout=0.5)
+                    heap_event.clear()
+                    _flush_ordered()
+                _flush_ordered()
+
+            finally:
+                executor.shutdown(wait=False)
 
             _put_ready(sentinel)
 
@@ -797,6 +866,9 @@ class ChatPanel(QFrame):
     def _on_complete_payload(self, payload):
         if not isinstance(payload, dict):
             return
+        # Always disarm the thinking watchdog first — the response arrived, so
+        # the timeout must not fire regardless of which code path follows.
+        self._thinking_watchdog.stop()
         text = str(payload.get("text", "") or "")
         request_id = str(payload.get("request_id", "") or "")
         speakable = bool(payload.get("speakable", True))

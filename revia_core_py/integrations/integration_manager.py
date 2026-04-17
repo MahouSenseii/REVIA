@@ -107,9 +107,17 @@ class IntegrationManager:
             logger.info("[Integrations] Discord bot already running")
             return
         effective = self._effective_config()
-        self.discord_bot = REVIADiscordBot(
-            self.pipeline_fn, effective["discord"]
-        )
+        discord_cfg = effective["discord"]
+
+        # Validate required config before instantiating the bot so errors
+        # surface immediately rather than inside the daemon thread.
+        errors = _validate_discord_config(discord_cfg)
+        if errors:
+            for err in errors:
+                logger.error("[Integrations] Discord config error: %s", err)
+            return
+
+        self.discord_bot = REVIADiscordBot(self.pipeline_fn, discord_cfg)
         if self._sing_command_handler:
             self.discord_bot.sing_command_handler = self._sing_command_handler
         self.discord_bot.start()
@@ -125,9 +133,16 @@ class IntegrationManager:
             logger.info("[Integrations] Twitch bot already running")
             return
         effective = self._effective_config()
-        self.twitch_bot = REVIATwitchBot(
-            self.pipeline_fn, effective["twitch"]
-        )
+        twitch_cfg = effective["twitch"]
+
+        # Validate required config before instantiating the bot.
+        errors = _validate_twitch_config(twitch_cfg)
+        if errors:
+            for err in errors:
+                logger.error("[Integrations] Twitch config error: %s", err)
+            return
+
+        self.twitch_bot = REVIATwitchBot(self.pipeline_fn, twitch_cfg)
         if self._sing_command_handler:
             self.twitch_bot.sing_command_handler = self._sing_command_handler
         self.twitch_bot.start()
@@ -223,6 +238,37 @@ def _apply_env_secrets(cfg: dict) -> dict:
             if env_value:
                 target[field] = env_value
     return effective
+
+
+def _validate_discord_config(cfg: dict) -> list[str]:
+    """Return a list of human-readable error strings, or [] if config is valid."""
+    errors: list[str] = []
+    token = str(cfg.get("bot_token", "") or "").strip()
+    if not token:
+        errors.append(
+            "bot_token is missing — set it in integrations_config.json "
+            "or via the REVIA_DISCORD_BOT_TOKEN environment variable"
+        )
+    # Channel IDs and guild IDs are optional — bots can run without them
+    # (they'll respond in all guilds/channels they have access to).
+    return errors
+
+
+def _validate_twitch_config(cfg: dict) -> list[str]:
+    """Return a list of human-readable error strings, or [] if config is valid."""
+    errors: list[str] = []
+    token = str(cfg.get("oauth_token", "") or "").strip()
+    if not token:
+        errors.append(
+            "oauth_token is missing — set it in integrations_config.json "
+            "or via the REVIA_TWITCH_OAUTH_TOKEN environment variable"
+        )
+    channels = cfg.get("channels", [])
+    if not channels:
+        errors.append(
+            "channels list is empty — add at least one Twitch channel name to join"
+        )
+    return errors
 
 
 def _public_config(cfg: dict) -> dict:

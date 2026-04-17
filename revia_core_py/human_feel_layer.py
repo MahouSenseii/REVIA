@@ -139,6 +139,24 @@ class HumanFeelLayer:
         self._rng = random.Random(rng_seed)
         self._rng_lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Thread-safe RNG helpers — lock only wraps the actual RNG call so
+    # the rest of the pipeline (profile lookups, prosody math, etc.) can
+    # run concurrently from other threads.
+    # ------------------------------------------------------------------
+
+    def _rng_random(self) -> float:
+        with self._rng_lock:
+            return self._rng.random()
+
+    def _rng_choice(self, seq):
+        with self._rng_lock:
+            return self._rng.choice(seq)
+
+    def _rng_seed(self, seed: int | None) -> None:
+        with self._rng_lock:
+            self._rng.seed(seed)
+
     # Public API
 
     def process(
@@ -170,36 +188,35 @@ class HumanFeelLayer:
                 elapsed_ms=(time.monotonic() - t0) * 1000,
             )
 
-        with self._rng_lock:
-            if rng_seed is not None:
-                self._rng.seed(rng_seed)
+        if rng_seed is not None:
+            self._rng_seed(rng_seed)
 
-            result = HFLResult(original=reply, processed=reply)
+        result = HFLResult(original=reply, processed=reply)
 
-            # 1. Thinking pause
-            result = self._apply_thinking_pause(result)
+        # 1. Thinking pause
+        result = self._apply_thinking_pause(result)
 
-            # 2. Self-correction
-            result = self._apply_self_correction(result)
+        # 2. Self-correction
+        result = self._apply_self_correction(result)
 
-            # 3. Prosody
-            result.prosody = self._compute_prosody(emotion_label)
+        # 3. Prosody (pure math — no RNG, no lock needed)
+        result.prosody = self._compute_prosody(emotion_label)
 
-            # 4. Verbosity trim
-            result = self._apply_verbosity_trim(result)
+        # 4. Verbosity trim (deterministic — no RNG)
+        result = self._apply_verbosity_trim(result)
 
-            # 5. Inject personality quirks from profile
-            if self._pe:
-                quirks = self._pe.get_speech_quirks()
-                freq = self._pe.get_quirk_frequency()
-            else:
-                quirks = ["honestly", "here's the thing", "ngl", "okay so", "like"]
-                freq = 0.15
-            result.processed = self.inject_quirks(result.processed, quirks, freq)
+        # 5. Inject personality quirks from profile
+        if self._pe:
+            quirks = self._pe.get_speech_quirks()
+            freq = self._pe.get_quirk_frequency()
+        else:
+            quirks = ["honestly", "here's the thing", "ngl", "okay so", "like"]
+            freq = 0.15
+        result.processed = self.inject_quirks(result.processed, quirks, freq)
 
-            # 6. Inject emotional vocalizations
-            if emotion_label and emotion_label.lower() not in ("neutral", "disabled", "---", ""):
-                result.processed = self.inject_vocalizations(result.processed, emotion_label)
+        # 6. Inject emotional vocalizations
+        if emotion_label and emotion_label.lower() not in ("neutral", "disabled", "---", ""):
+            result.processed = self.inject_vocalizations(result.processed, emotion_label)
 
         result.elapsed_ms = (time.monotonic() - t0) * 1000
         _log.debug(
@@ -217,8 +234,8 @@ class HumanFeelLayer:
 
     def _apply_thinking_pause(self, result: HFLResult) -> HFLResult:
         prob = self._get_thinking_pause_probability()
-        if self._rng.random() < prob:
-            pause = self._rng.choice(_THINKING_PAUSES)
+        if self._rng_random() < prob:
+            pause = self._rng_choice(_THINKING_PAUSES)
             result.processed  = pause + result.processed
             result.pause_added = True
             result.notes.append(f"thinking_pause: {pause!r}")
@@ -226,7 +243,7 @@ class HumanFeelLayer:
 
     def _apply_self_correction(self, result: HFLResult) -> HFLResult:
         rate = self._get_self_correction_rate()
-        if self._rng.random() >= rate:
+        if self._rng_random() >= rate:
             return result   # skip with probability (1 - rate)
 
         text = result.processed
@@ -240,11 +257,10 @@ class HumanFeelLayer:
         if not eligible:
             return result
 
-        pos        = self._rng.choice(eligible)
-        correction = self._rng.choice(_SELF_CORRECTIONS)
+        pos        = self._rng_choice(eligible)
+        correction = self._rng_choice(_SELF_CORRECTIONS)
 
         # Insert correction phrase AFTER the delimiter, preserving the original char
-        delimiter = text[pos]
         new_text = text[:pos + 1] + " " + correction + text[pos + 1:].lstrip()
         result.processed       = new_text
         result.correction_added = True
@@ -292,8 +308,8 @@ class HumanFeelLayer:
         parts = re.split(r'(?<=[.!?]) +', text)
         result = []
         for i, sent in enumerate(parts):
-            if i > 0 and sent and self._rng.random() < frequency and quirks:
-                quirk = self._rng.choice(quirks)
+            if i > 0 and sent and self._rng_random() < frequency and quirks:
+                quirk = self._rng_choice(quirks)
                 sent = f"{quirk}, {sent[0].lower()}{sent[1:]}"
             result.append(sent)
         return ' '.join(result)
@@ -307,9 +323,9 @@ class HumanFeelLayer:
             "angry": ["ugh", "seriously", "wow okay"],
             "sad": ["sigh", "*sigh*", "..."],
         }
-        if emotion in markers and text and self._rng.random() < 0.25:
-            marker = self._rng.choice(markers[emotion])
-            if self._rng.random() < 0.5:
+        if emotion in markers and text and self._rng_random() < 0.25:
+            marker = self._rng_choice(markers[emotion])
+            if self._rng_random() < 0.5:
                 # Prepend marker before text
                 if len(text) > 1:
                     text = f"{marker}, {text[0].lower()}{text[1:]}"

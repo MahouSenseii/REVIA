@@ -295,18 +295,38 @@ class ConsoleBackend(ErrorBackend):
 
 
 class FileBackend(ErrorBackend):
-    """Appends JSON-line reports to a file."""
+    """Appends JSON-line reports to a file using a persistent file handle.
+
+    A single file handle is opened at construction time and reused for every
+    subsequent write.  This avoids the open()/close() syscall overhead on
+    every error report, which matters when errors burst (e.g. pipeline failures).
+
+    The handle is flushed after each write so crash-time log lines are never
+    buffered away.  Call ``close()`` during shutdown for a clean flush+close.
+    """
 
     def __init__(self, path: str) -> None:
+        import json as _json
+        self._json = _json
         self._path = path
         self._lock = threading.Lock()
+        # Open once — append mode, line-buffered on text channels
+        self._fh = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
 
     def emit(self, report: ErrorReport) -> None:
-        import json
-        line = json.dumps(report.as_dict()) + "\n"
+        line = self._json.dumps(report.as_dict()) + "\n"
         with self._lock:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line)
+            self._fh.write(line)
+            self._fh.flush()
+
+    def close(self) -> None:
+        """Flush and close the underlying file handle.  Safe to call multiple times."""
+        with self._lock:
+            try:
+                self._fh.flush()
+                self._fh.close()
+            except OSError:
+                pass
 
 
 def _severity_to_logging(sev: ErrorSeverity) -> int:

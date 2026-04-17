@@ -107,3 +107,31 @@ class RuntimeStateSync(QObject):
                 return
         self._last_pushed_snapshot = snapshot
         self.client.push_runtime_config(snapshot)
+
+    def teardown(self):
+        """Disconnect all signals and stop the debounce timer.
+
+        Call this before the object is destroyed to prevent callbacks firing
+        against already-deleted Qt widgets (which causes C++ object-deleted
+        crashes in PySide6).
+        """
+        try:
+            self._debounce.stop()
+            self._debounce.timeout.disconnect(self.push_now)
+        except RuntimeError:
+            pass  # Already disconnected or timer deleted
+
+        try:
+            self.event_bus.telemetry_updated.disconnect(self._on_telemetry)
+        except RuntimeError:
+            pass
+
+        try:
+            self.event_bus.connection_changed.disconnect()
+        except RuntimeError:
+            pass
+
+        try:
+            self.assistant_status_manager.runtime_state_changed.disconnect()
+        except RuntimeError:
+            pass

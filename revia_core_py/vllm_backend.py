@@ -68,6 +68,19 @@ _SIMPLE_INDICATORS = re.compile(
 _VLLM_MIN_CONTEXT_TOKENS = 1500   # Don't bother with vLLM under this
 _VLLM_LONG_CONTEXT_TOKENS = 4000  # Definitely use vLLM above this
 
+# Tokens-per-word ratio used to estimate context length from word count.
+# English averages ~1.3 tokens/word with BPE tokenizers (GPT-style).
+# For CJK or code-heavy contexts this can be 1.5-2.5.
+# Override via REVIA_TOKENS_PER_WORD env var if your model diverges.
+try:
+    _TOKENS_PER_WORD: float = float(
+        os.environ.get("REVIA_TOKENS_PER_WORD", "1.3")
+    )
+    if not (0.5 <= _TOKENS_PER_WORD <= 5.0):
+        raise ValueError(f"Out of sane range: {_TOKENS_PER_WORD}")
+except (TypeError, ValueError):
+    _TOKENS_PER_WORD = 1.3
+
 
 @dataclass
 class PromptClassification:
@@ -133,8 +146,8 @@ def classify_prompt_complexity(
         elif msg.get("role") in ("user", "assistant"):
             turn_count += 1
 
-    # Rough token estimate: ~1.3 tokens per word for English
-    result.estimated_context_tokens = int(total_words * 1.3)
+    # Rough token estimate — ratio set by REVIA_TOKENS_PER_WORD (default 1.3)
+    result.estimated_context_tokens = int(total_words * _TOKENS_PER_WORD)
     result.has_multi_turn = turn_count > 6
     result.user_text_words = len(user_text.split()) if user_text else 0
 

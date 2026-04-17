@@ -104,13 +104,19 @@ class REVIADiscordBot:
                     async with message.channel.typing():
                         loop = asyncio.get_running_loop()
                         try:
-                            reply = await loop.run_in_executor(
-                                bot_ref._executor, handler.handle, args, username
+                            reply = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    bot_ref._executor, handler.handle, args, username
+                                ),
+                                timeout=30.0,
                             )
                             if reply:
                                 chunks = _split_message(reply, 1900)
                                 for chunk in chunks:
                                     await message.channel.send(chunk)
+                        except asyncio.TimeoutError:
+                            logger.error("[Discord] !sing timed out after 30s")
+                            await message.channel.send("That took too long — please try again.")
                         except Exception as exc:
                             logger.error("[Discord] !sing error: %s", exc)
                             await message.channel.send("Something went wrong with !sing.")
@@ -154,8 +160,11 @@ class REVIADiscordBot:
 
                 loop = asyncio.get_running_loop()
                 try:
-                    response = await loop.run_in_executor(
-                        bot_ref._executor, bot_ref.pipeline_fn, platform_context
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            bot_ref._executor, bot_ref.pipeline_fn, platform_context
+                        ),
+                        timeout=30.0,
                     )
                     with bot_ref._counter_lock:
                         bot_ref.messages_processed += 1
@@ -169,6 +178,10 @@ class REVIADiscordBot:
                         except Exception as exc:
                             logger.error(f"[Discord] Message splitting error: {exc}")
                             bot_ref.last_error = str(exc)
+                except asyncio.TimeoutError:
+                    logger.error("[Discord] Pipeline timed out after 30s")
+                    bot_ref.last_error = "pipeline_timeout"
+                    await message.channel.send("I took too long to think — please try again.")
                 except Exception as exc:
                     logger.error(f"[Discord] Pipeline error: {exc}")
                     bot_ref.last_error = str(exc)

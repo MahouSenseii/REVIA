@@ -1063,11 +1063,79 @@ class AssistantStatusManager(QObject):
         return state_text
 
     def cleanup(self):
-        """Stop all timers and clean up resources."""
+        """Stop all timers and disconnect all signals.
+
+        Must be called before the widget tree is destroyed.  Without this,
+        Qt can fire slots against already-deleted C++ objects, producing
+        hard-to-reproduce RuntimeError / segfaults.
+        """
         try:
             self._live_timer.stop()
+            self._live_timer.timeout.disconnect(self._on_live_timer)
+        except RuntimeError:
+            pass
+
+        # Event bus signals
+        _bus_pairs = [
+            (self.event_bus.telemetry_updated, self._on_telemetry),
+            (self.event_bus.chat_request_accepted, self._on_request_accepted),
+            (self.event_bus.chat_token_payload, self._on_token_payload),
+            (self.event_bus.chat_complete_payload, self._on_complete_payload),
+        ]
+        for signal, slot in _bus_pairs:
+            try:
+                signal.disconnect(slot)
+            except RuntimeError:
+                pass
+
+        # Audio service signals
+        if self.audio_service:
+            _audio_pairs = [
+                (self.audio_service.stt_listening_started, self._on_stt_listening_started),
+                (self.audio_service.stt_listening_stopped, self._on_stt_listening_stopped),
+                (self.audio_service.stt_processing_started, self._on_stt_processing_started),
+                (self.audio_service.stt_processing_finished, self._on_stt_processing_finished),
+                (self.audio_service.stt_error, self._on_stt_error),
+                (self.audio_service.status_changed, self._on_audio_status_text),
+                (self.audio_service.tts_started, self._on_fallback_tts_started),
+                (self.audio_service.tts_finished, self._on_fallback_tts_finished),
+            ]
+            for signal, slot in _audio_pairs:
+                try:
+                    signal.disconnect(slot)
+                except RuntimeError:
+                    pass
+
+        # TTS backend signals
+        try:
+            backend = self.voice_tab.voice_mgr.backend
+            _tts_pairs = [
+                (backend.synthesis_started, self._on_tts_generation_started),
+                (backend.synthesis_finished, self._on_tts_generation_finished),
+                (backend.playback_started, self._on_tts_playback_started),
+                (backend.playback_finished, self._on_tts_playback_finished),
+                (backend.playback_interrupted, self._on_tts_playback_interrupted),
+                (backend.error_occurred, self._on_tts_error),
+            ]
+            for signal, slot in _tts_pairs:
+                try:
+                    signal.disconnect(slot)
+                except RuntimeError:
+                    pass
         except Exception:
             pass
+
+        # Chat panel TTS session signals
+        _chat_pairs = [
+            (self.chat_panel.tts_session_started, self._on_tts_session_started),
+            (self.chat_panel.tts_session_finished, self._on_tts_session_finished),
+            (self.chat_panel.assistant_output_interrupted, self._on_assistant_output_interrupted),
+        ]
+        for signal, slot in _chat_pairs:
+            try:
+                signal.disconnect(slot)
+            except RuntimeError:
+                pass
 
     def _log(self, message: str):
         self.event_bus.log_entry.emit(f"[Status] {message}")

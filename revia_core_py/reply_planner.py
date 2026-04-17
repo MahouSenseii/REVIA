@@ -20,9 +20,30 @@ All thresholds come from ProfileEngine.
 from __future__ import annotations
 
 import logging
+import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# Module-level constants for _parse_intent (avoids per-call recompile)
+# ---------------------------------------------------------------------------
+_QUESTION_WORDS: tuple[str, ...] = (
+    "what", "how", "why", "when", "where", "who", "which",
+    "can you", "could you", "would you", "should",
+)
+
+_POSITIVE_RE    = re.compile(r"\b(great|love|thanks|happy|excited|please|awesome)\b")
+_NEGATIVE_RE    = re.compile(r"\b(hate|angry|frustrated|terrible|bad|wrong|upset)\b")
+_INTENT_REMIND  = re.compile(r"\b(remind|set|schedule|alarm|timer)\b")
+_INTENT_MEDIA   = re.compile(r"\b(play|music|song|queue|next)\b")
+_INTENT_INFO    = re.compile(r"\b(what('?s| is)|tell me|explain|define|describe)\b")
+_INTENT_PROC    = re.compile(r"\b(how (do|can|should|would)|steps|instructions)\b")
+_INTENT_GREET   = re.compile(r"\b(hello|hi|hey|how are you|what's up)\b")
+_INTENT_THANKS  = re.compile(r"\b(thank(s| you)|appreciate)\b")
+_INTENT_ENTMNT  = re.compile(r"\b(joke|funny|laugh|humor|entertain)\b")
+
 
 try:
     from .answer_validation import AnswerValidationSystem, AVSResult
@@ -253,7 +274,13 @@ class ReplyPlanner:
 
         # All attempts exhausted - fallback accept via AVS.select_best()
         if plan.avs_results:
-            best = self._avs.select_best(plan.avs_results)
+            try:
+                best = self._avs.select_best(plan.avs_results)
+            except (ValueError, IndexError) as exc:
+                # select_best raises ValueError on empty list; fall back to the
+                # last recorded result rather than crashing the pipeline.
+                best = plan.avs_results[-1]
+                plan.notes.append(f"select_best fallback due to: {exc}")
             plan.fallback_accept = True
             plan.notes.append("Fallback accept after all regen attempts exhausted")
             plan = self._finalise(plan, best.reply, resolved_emotion, t0)
@@ -292,7 +319,6 @@ class ReplyPlanner:
         else:
             weights = {"explain": 0.5, "react": 0.5}
 
-        import random
         reply_types = list(weights.keys())
         reply_weights = [weights.get(rt, 0.0) for rt in reply_types]
 
@@ -314,42 +340,36 @@ class ReplyPlanner:
 
         In production, replace with a proper NLU / embedding classifier.
         """
-        import re
-
         lower = utterance.lower().strip()
         frame = IntentFrame()
 
-        # Question words
-        q_words = [w for w in ["what", "how", "why", "when", "where", "who", "which",
-                                "can you", "could you", "would you", "should"] if w in lower]
-        frame.question_words = q_words
+        # Question words — module-level tuple for O(1) containment check
+        frame.question_words = [w for w in _QUESTION_WORDS if w in lower]
 
-        # Sentiment
-        positive_re = re.compile(r"\b(great|love|thanks|happy|excited|please|awesome)\b")
-        negative_re = re.compile(r"\b(hate|angry|frustrated|terrible|bad|wrong|upset)\b")
-        if positive_re.search(lower):
+        # Sentiment — module-level compiled patterns
+        if _POSITIVE_RE.search(lower):
             frame.sentiment = "positive"
-        elif negative_re.search(lower):
+        elif _NEGATIVE_RE.search(lower):
             frame.sentiment = "negative"
         else:
             frame.sentiment = "neutral"
 
-        # Primary intent
-        if re.search(r"\b(remind|set|schedule|alarm|timer)\b", lower):
+        # Primary intent — module-level compiled patterns
+        if _INTENT_REMIND.search(lower):
             frame.primary_intent = "set_reminder"
-        elif re.search(r"\b(play|music|song|queue|next)\b", lower):
+        elif _INTENT_MEDIA.search(lower):
             frame.primary_intent = "media_control"
-        elif re.search(r"\b(what('?s| is)|tell me|explain|define|describe)\b", lower):
+        elif _INTENT_INFO.search(lower):
             frame.primary_intent = "information_request"
-        elif re.search(r"\b(how (do|can|should|would)|steps|instructions)\b", lower):
+        elif _INTENT_PROC.search(lower):
             frame.primary_intent = "procedural_request"
-        elif re.search(r"\b(hello|hi|hey|how are you|what's up)\b", lower):
+        elif _INTENT_GREET.search(lower):
             frame.primary_intent = "greeting"
-        elif re.search(r"\b(thank(s| you)|appreciate)\b", lower):
+        elif _INTENT_THANKS.search(lower):
             frame.primary_intent = "gratitude"
-        elif re.search(r"\b(joke|funny|laugh|humor|entertain)\b", lower):
+        elif _INTENT_ENTMNT.search(lower):
             frame.primary_intent = "entertainment"
-        elif q_words:
+        elif frame.question_words:
             frame.primary_intent = "general_question"
         else:
             frame.primary_intent = "general_query"

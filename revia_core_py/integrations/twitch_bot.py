@@ -126,10 +126,14 @@ class REVIATwitchBot:
         """Generate a response from the AI pipeline for events."""
         try:
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                self._executor, self.pipeline_fn, prompt
+            response = await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self.pipeline_fn, prompt),
+                timeout=30.0,
             )
             return response or ""
+        except asyncio.TimeoutError:
+            logger.error("[Twitch] Event response timed out after 30s (source=%s)", source)
+            return ""
         except Exception as exc:
             logger.error(f"[Twitch] Event response generation failed: {exc}")
             return ""
@@ -147,8 +151,9 @@ class REVIATwitchBot:
             return
         try:
             platform_context = f"[Twitch chatter {author}]: {text}"
-            response = await loop.run_in_executor(
-                self._executor, self.pipeline_fn, platform_context
+            response = await asyncio.wait_for(
+                loop.run_in_executor(self._executor, self.pipeline_fn, platform_context),
+                timeout=30.0,
             )
             with self._counter_lock:
                 self.messages_processed += 1
@@ -156,6 +161,10 @@ class REVIATwitchBot:
             if response:
                 self._cache_set(text.lower(), response)
                 await send_fn(_truncate(response, max_len))
+        except asyncio.TimeoutError:
+            logger.error("[Twitch] Pipeline timed out after 30s (user=%s)", author)
+            self.last_error = "pipeline_timeout"
+            await send_fn(f"@{author} I took too long to think — please try again.")
         except Exception as exc:
             logger.error(f"[Twitch] Pipeline error: {exc}")
             self.last_error = str(exc)
@@ -298,12 +307,16 @@ class REVIATwitchBot:
             # Run command handler in executor to avoid blocking
             loop = asyncio.get_running_loop()
             try:
-                reply = await loop.run_in_executor(
-                    parent._executor, handler.handle, args, author
+                reply = await asyncio.wait_for(
+                    loop.run_in_executor(parent._executor, handler.handle, args, author),
+                    timeout=30.0,
                 )
                 if reply:
                     max_len = parent.config.get("max_response_len", 450)
                     await ctx.send(f"@{author} {_truncate(reply, max_len)}")
+            except asyncio.TimeoutError:
+                logger.error("[Twitch] !sing timed out after 30s")
+                await ctx.send(f"@{author} That took too long — please try again.")
             except Exception as exc:
                 logger.error("[Twitch] !sing command error: %s", exc)
                 await ctx.send(f"@{author} Something went wrong with !sing.")

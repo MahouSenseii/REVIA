@@ -124,7 +124,7 @@ class CharacterProfileManager:
             "pretending the request succeeded."
         )
         parts.append(
-            f"Avoid generic assistant phrasing. Sound like {name}, not a default helper bot."
+            f"Stay in character as {name} at all times. Avoid defaulting to formulaic bot-like responses."
         )
         parts.append(
             f"Active persona confirmation: you are {name}."
@@ -275,8 +275,13 @@ class PromptAssemblyManager:
                 "is missing from system context. Proceeding with current prompt."
             )
             return False
-        if "generic assistant" in str(system_text or "").lower():
-            if not self._warned_generic_assistant:
+        # Warn only when "generic assistant" appears as an *identity claim*, not an avoidance
+        # instruction (e.g. "avoid …", "don't be …", "stay in character … not a …").
+        _sys_lower = str(system_text or "").lower()
+        if "generic assistant" in _sys_lower:
+            _negation_words = ("avoid", "don't", "do not", "not a", "sound like", "stay in")
+            _is_avoidance = any(word in _sys_lower for word in _negation_words)
+            if not _is_avoidance and not self._warned_generic_assistant:
                 self._warned_generic_assistant = True
                 self._log(
                     "Prompt validation warning: generic assistant wording detected in prompt context"
