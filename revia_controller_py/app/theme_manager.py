@@ -417,8 +417,16 @@ class ThemeManager:
         tid = str(draft.ThemeId or "").strip()
         if not tid:
             raise ValueError("ThemeId must not be blank.")
+        if not all(ch.isalnum() or ch in "_-" for ch in tid):
+            raise ValueError(
+                "ThemeId may only contain letters, numbers, underscores, and hyphens."
+            )
         if tid in _BUILTIN_THEMES:
             raise ValueError(f"'{tid}' is a built-in theme and cannot be overwritten.")
+        validation = self.validate_theme(draft)
+        if validation.get("errors"):
+            raise ValueError("; ".join(validation["errors"]))
+        draft.ThemeId = tid
         draft.IsBuiltIn = False
         self._themes[tid] = draft
         self._persist_custom_themes()

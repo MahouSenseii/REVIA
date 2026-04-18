@@ -10,6 +10,7 @@
 #include "core/StateManager.h"
 #include "core/StructuredLogger.h"
 #include <algorithm>
+#include <cstdlib>
 #include <thread>
 #include <fstream>
 #include <filesystem>
@@ -437,7 +438,9 @@ void RestServer::run(std::atomic<bool>& running) {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
-    svr_.listen("0.0.0.0", port_);
+    const char* host_env = std::getenv("REVIA_REST_HOST");
+    const std::string host = (host_env && *host_env) ? host_env : "127.0.0.1";
+    svr_.listen(host, port_);
 }
 
 void RestServer::stop() {

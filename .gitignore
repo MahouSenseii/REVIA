@@ -6,6 +6,7 @@ build/
 logs/
 .env
 config.local.json
+model_settings.local.json
 *.pt
 .idea/workspace.xml
 .claude/

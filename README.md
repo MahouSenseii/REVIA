@@ -69,12 +69,19 @@ Copy `.env.example` into `.env` and set any values you need:
 
 - `REDIS_HOST`
 - `REDIS_PORT`
-- `REVIA_REST_PORT`
-- `REVIA_WS_PORT`
+- `REVIA_REST_HOST` / `REVIA_REST_PORT`
+- `REVIA_WS_HOST` / `REVIA_WS_PORT`
+- `REVIA_QWEN_TTS_HOST`
+- `REVIA_QWEN_TTS_DEVICE`
+- `REVIA_QWEN_TTS_CUDA_DEBUG`
+- `REVIA_QWEN_TTS_DISABLE_FLASH_ATTN`
+- `REVIA_QWEN_TTS_DTYPE`
 - `REVIA_DISCORD_BOT_TOKEN`
 - `REVIA_TWITCH_OAUTH_TOKEN`
 
 Integration secrets are env-aware and should not be committed into source-controlled config files.
+
+For fastest Qwen3-TTS generation, use the `0.6B` model unless you specifically need the quality of `1.7B`. CUDA debug blocking is disabled by default because it slows GPU synthesis; set `REVIA_QWEN_TTS_CUDA_DEBUG=1` only while diagnosing CUDA failures. If auto-detection misses your GPU, set `REVIA_QWEN_TTS_DEVICE=cuda`.
 
 ## Optional Features
 

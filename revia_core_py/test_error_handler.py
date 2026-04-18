@@ -314,16 +314,12 @@ class TestPERF07_AsyncCheck(unittest.TestCase):
 
     def test_acheck_true(self):
         h = ReviaErrorHandler()
-        result = asyncio.get_event_loop().run_until_complete(
-            h.acheck(True, "should pass")
-        )
+        result = asyncio.run(h.acheck(True, "should pass"))
         assert result is True
 
     def test_acheck_false_logs(self):
         h = ReviaErrorHandler()
-        result = asyncio.get_event_loop().run_until_complete(
-            h.acheck(False, "async fail")
-        )
+        result = asyncio.run(h.acheck(False, "async fail"))
         assert result is False
         assert h.store.total == 1
 
@@ -506,6 +502,7 @@ class TestFileBackend(unittest.TestCase):
             backend = FileBackend(path)
             h = ReviaErrorHandler(backend=backend)
             h.error("general", "file test")
+            h.close()
             with open(path) as f:
                 content = f.read()
             assert "file test" in content

@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Persisted model settings live alongside the top-level config.json
 _SETTINGS_FILE = Path(__file__).resolve().parents[3] / "model_settings.json"
+_SECRET_SETTINGS_FILE = Path(__file__).resolve().parents[3] / "model_settings.local.json"
 
 
 class ModelTab(QScrollArea):
@@ -751,7 +752,11 @@ class ModelTab(QScrollArea):
     # ------------------------------------------------------------------
 
     def _save_settings(self):
-        """Write current UI state to model_settings.json."""
+        """Write current UI state to model_settings.json.
+
+        API keys are persisted separately in ignored local settings so they
+        cannot be committed with normal model configuration.
+        """
         if self._loading:
             return
         data = {
@@ -771,7 +776,6 @@ class ModelTab(QScrollArea):
             # Online API
             "api_provider": self.api_provider.currentText(),
             "api_endpoint": self.api_endpoint.text(),
-            "api_key": self.api_key.text(),
             "api_model": self.api_model.currentText(),
             "api_org": self.api_org.text(),
             # Generation params
@@ -789,18 +793,61 @@ class ModelTab(QScrollArea):
         }
         try:
             _SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._save_secret_settings()
         except Exception as e:
             self.event_bus.log_entry.emit(f"[Model] Could not save settings: {e}")
 
+    def _save_secret_settings(self):
+        """Persist local-only model secrets outside tracked settings."""
+        api_key = self.api_key.text().strip()
+        try:
+            if api_key:
+                _SECRET_SETTINGS_FILE.write_text(
+                    json.dumps({"api_key": api_key}, indent=2),
+                    encoding="utf-8",
+                )
+            elif _SECRET_SETTINGS_FILE.exists():
+                _SECRET_SETTINGS_FILE.unlink()
+        except Exception as e:
+            self.event_bus.log_entry.emit(f"[Model] Could not save local secrets: {e}")
+
+    def _load_secret_settings(self) -> dict:
+        """Load ignored local model secrets plus environment fallback."""
+        data: dict = {}
+        if _SECRET_SETTINGS_FILE.exists():
+            try:
+                raw = json.loads(_SECRET_SETTINGS_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data.update(raw)
+            except Exception as e:
+                logger.warning(f"Error loading local model secrets: {e}")
+        data.setdefault(
+            "api_key",
+            os.environ.get("REVIA_API_KEY", "") or os.environ.get("OPENAI_API_KEY", ""),
+        )
+        return data
+
     def _load_settings(self):
         """Restore UI state from model_settings.json (if it exists)."""
-        if not _SETTINGS_FILE.exists():
+        env_api_key = (
+            os.environ.get("REVIA_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
+        )
+        if (
+            not _SETTINGS_FILE.exists()
+            and not _SECRET_SETTINGS_FILE.exists()
+            and not env_api_key
+        ):
             return
+        data: dict = {}
         try:
-            data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+            if _SETTINGS_FILE.exists():
+                loaded = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data.update(loaded)
         except Exception as e:
             logger.warning(f"Error loading model settings: {e}")
             return
+        data.update(self._load_secret_settings())
 
         self._loading = True
         try:

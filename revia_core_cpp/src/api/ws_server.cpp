@@ -1,5 +1,6 @@
 #include "api/ws_server.h"
 #include "telemetry/telemetry.h"
+#include <cstdlib>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -7,8 +8,17 @@
 
 namespace revia {
 
+namespace {
+
+std::string websocket_bind_host() {
+    const char* host = std::getenv("REVIA_WS_HOST");
+    return (host && *host) ? std::string(host) : std::string("127.0.0.1");
+}
+
+} // namespace
+
 WsServer::WsServer(int port, TelemetryEngine& t)
-    : port_(port), telemetry_(t), server_(port, "0.0.0.0") {
+    : port_(port), telemetry_(t), server_(port, websocket_bind_host()) {
 
     server_.setOnClientMessageCallback(
         [](std::shared_ptr<ix::ConnectionState>,

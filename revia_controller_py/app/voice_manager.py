@@ -142,14 +142,15 @@ class VoiceManager(QObject):
         )
 
     def generate_clone(self, target_text, ref_audio_path, ref_text="",
-                       language="Auto", x_vector_only=False, output_path=None):
+                       language="Auto", x_vector_only=False, output_path=None,
+                       model_size="0.6B"):
         return self.backend.generate_voice_clone(
             target_text, ref_audio_path, ref_text, language,
-            x_vector_only, output_path
+            x_vector_only, output_path, model_size
         )
 
     def generate_custom(self, text, language="Auto", speaker="Ryan",
-                        style_instruction="", model_size="1.7B",
+                        style_instruction="", model_size="0.6B",
                         output_path=None):
         return self.backend.generate_custom_voice(
             text, language, speaker, style_instruction, model_size,
@@ -177,17 +178,19 @@ class VoiceManager(QObject):
         return p
 
     def create_clone_profile(self, name, ref_audio, ref_text="",
-                             language="Auto", x_vector_only=False):
+                             language="Auto", x_vector_only=False,
+                             model_size="0.6B"):
         p = VoiceProfile(name, VoiceMode.CLONE)
         p.reference_audio = str(ref_audio)
         p.clone_ref_text = ref_text
         p.language = language
         p.x_vector_only = x_vector_only
+        p.model_size = model_size
         return p
 
     def create_custom_profile(self, name, speaker="Ryan",
                               style_instruction="", language="Auto",
-                              model_size="1.7B"):
+                              model_size="0.6B"):
         p = VoiceProfile(name, VoiceMode.CUSTOM)
         p.speaker_id = speaker
         p.style_instruction = style_instruction

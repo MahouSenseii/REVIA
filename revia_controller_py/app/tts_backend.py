@@ -250,7 +250,7 @@ class QwenTTSBackend(QObject):
     # Voice Clone
     def generate_voice_clone(self, target_text, ref_audio_path, ref_text="",
                              language="Auto", x_vector_only=False,
-                             output_path=None):
+                             output_path=None, model_size="0.6B"):
         """Clone voice from reference audio and synthesize target text.
         Returns (wav_path, metrics) or (None, error_str)."""
         target_text = _strip_leading_style_directives(target_text)
@@ -258,11 +258,12 @@ class QwenTTSBackend(QObject):
             return self._fallback_generate(target_text, output_path)
 
         return self._qwen_clone(target_text, ref_audio_path, ref_text,
-                                language, x_vector_only, output_path)
+                                language, x_vector_only, output_path,
+                                model_size)
 
     # CustomVoice (TTS with predefined speakers)
     def generate_custom_voice(self, text, language="Auto", speaker="Ryan",
-                              style_instruction="", model_size="1.7B",
+                              style_instruction="", model_size="0.6B",
                               output_path=None):
         """Generate speech with predefined speaker + optional style instruction.
         Returns (wav_path, metrics) or (None, error_str)."""
@@ -566,7 +567,7 @@ class QwenTTSBackend(QObject):
                 return None, str(exc)
 
     def _qwen_clone(self, target_text, ref_audio, ref_text, language,
-                     x_vector_only, output_path, model_size="1.7B",
+                     x_vector_only, output_path, model_size="0.6B",
                      style_instruction=""):
         # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
         # _get_client uses self._lock internally; re-entering a non-reentrant Lock

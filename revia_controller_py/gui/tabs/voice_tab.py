@@ -33,6 +33,17 @@ QWEN_MODELS = {
 }
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+QWEN_TTS_BIND_HOST = (
+    os.environ.get("REVIA_QWEN_TTS_HOST", "127.0.0.1").strip() or "127.0.0.1"
+)
+QWEN_TTS_DEFAULT_MODEL_SIZE = "0.6B"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class VoiceTab(QScrollArea):
@@ -404,7 +415,7 @@ class VoiceTab(QScrollArea):
         row.addWidget(self.clone_lang)
         self.clone_model_size = QComboBox()
         self.clone_model_size.addItems(QWEN_MODEL_SIZES)
-        self.clone_model_size.setCurrentText("1.7B")
+        self.clone_model_size.setCurrentText(QWEN_TTS_DEFAULT_MODEL_SIZE)
         row.addWidget(QLabel("Model Size:"))
         row.addWidget(self.clone_model_size)
         fl.addRow(row)
@@ -483,7 +494,7 @@ class VoiceTab(QScrollArea):
 
         self.custom_model_size = QComboBox()
         self.custom_model_size.addItems(QWEN_MODEL_SIZES)
-        self.custom_model_size.setCurrentText("1.7B")
+        self.custom_model_size.setCurrentText(QWEN_TTS_DEFAULT_MODEL_SIZE)
         fl.addRow("Model Size:", self.custom_model_size)
 
         vl.addLayout(fl)
@@ -548,6 +559,7 @@ class VoiceTab(QScrollArea):
         ref_text = self.clone_ref_text.toPlainText().strip()
         target = self.clone_target_text.toPlainText().strip()
         lang = self.clone_lang.currentText()
+        model_size = self.clone_model_size.currentText()
         xvec = self.clone_xvec.isChecked()
         if not ref:
             self.clone_status.setText("Select reference audio first")
@@ -565,7 +577,7 @@ class VoiceTab(QScrollArea):
 
         def _do():
             wav, metrics = self.voice_mgr.generate_clone(
-                target, ref, ref_text, lang, xvec
+                target, ref, ref_text, lang, xvec, model_size=model_size
             )
             QTimer.singleShot(0, lambda: self._on_clone_done(wav, metrics))
         threading.Thread(target=_do, daemon=True).start()
@@ -651,6 +663,7 @@ class VoiceTab(QScrollArea):
             self.clone_ref_text.toPlainText().strip(),
             self.clone_lang.currentText(),
             self.clone_xvec.isChecked(),
+            self.clone_model_size.currentText(),
         )
         voice_dir = self.voice_mgr.save_voice(p)
         dest = voice_dir / "generated.wav"
@@ -1323,8 +1336,11 @@ class VoiceTab(QScrollArea):
         if device_label == "CPU":
             env.insert("CUDA_VISIBLE_DEVICES", "")
         else:
-            # Helps CUDA errors point at the real failing op in Qwen logs.
-            env.insert("CUDA_LAUNCH_BLOCKING", "1")
+            if _env_flag("REVIA_QWEN_TTS_CUDA_DEBUG"):
+                # Opt-in diagnostics only; this serializes CUDA work and slows synthesis.
+                env.insert("CUDA_LAUNCH_BLOCKING", "1")
+            else:
+                env.remove("CUDA_LAUNCH_BLOCKING")
             env.insert("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
         self._tts_process.setProcessEnvironment(env)
@@ -1395,7 +1411,20 @@ class VoiceTab(QScrollArea):
             device, is_cpu_only = override, override == "cpu"
         else:
             device, is_cpu_only = self._detect_tts_device()
-        model_args = [model_id, "--port", port, "--ip", "0.0.0.0", "--no-flash-attn"]
+        model_args = [
+            model_id,
+            "--port",
+            port,
+            "--ip",
+            QWEN_TTS_BIND_HOST,
+        ]
+        if self._should_disable_tts_flash_attn(device, is_cpu_only):
+            model_args.append("--no-flash-attn")
+
+        dtype = str(os.environ.get("REVIA_QWEN_TTS_DTYPE", "")).strip().lower()
+        if dtype in {"bfloat16", "bf16", "float16", "fp16", "float32", "fp32"}:
+            if self._qwen_cli_supports_flag(qwen_module, "--dtype"):
+                model_args.extend(["--dtype", dtype])
 
         if is_cpu_only:
             # PyTorch is not compiled with CUDA.  Any call to torch.cuda.*
@@ -1413,6 +1442,23 @@ class VoiceTab(QScrollArea):
                 args.extend(["--device", device])
 
         return args, device.upper()
+
+    def _should_disable_tts_flash_attn(self, device: str, is_cpu_only: bool) -> bool:
+        """Keep FlashAttention enabled only when the local install can use it."""
+        if is_cpu_only or str(device).lower().startswith("cpu"):
+            return True
+        if _env_flag("REVIA_QWEN_TTS_DISABLE_FLASH_ATTN"):
+            return True
+        if _env_flag("REVIA_QWEN_TTS_FORCE_FLASH_ATTN"):
+            return False
+        return not self._tts_flash_attn_available()
+
+    @staticmethod
+    def _tts_flash_attn_available() -> bool:
+        try:
+            return importlib.util.find_spec("flash_attn") is not None
+        except (ImportError, ValueError):
+            return False
 
     def _create_tts_launcher(self, qwen_module: str) -> str:
         """Write a temp launcher that patches torch.cuda before running qwen_tts.
@@ -1509,6 +1555,22 @@ class VoiceTab(QScrollArea):
 
     def _qwen_cli_supports_flag(self, qwen_module: str, flag: str) -> bool:
         """Check whether qwen_tts demo CLI accepts a given option."""
+        cache_key = (qwen_module, flag)
+        cache = getattr(self, "_qwen_cli_flag_cache", None)
+        if cache is None:
+            cache = {}
+            self._qwen_cli_flag_cache = cache
+        if cache_key in cache:
+            return cache[cache_key]
+        try:
+            spec = importlib.util.find_spec(qwen_module)
+            origin = Path(getattr(spec, "origin", "") or "")
+            if origin.is_file():
+                supports = flag in origin.read_text(encoding="utf-8", errors="ignore")
+                cache[cache_key] = supports
+                return supports
+        except Exception as e:
+            logger.debug(f"Error checking Qwen CLI source support: {e}")
         try:
             import subprocess
             result = subprocess.run(
@@ -1517,9 +1579,12 @@ class VoiceTab(QScrollArea):
                 text=True,
                 timeout=8,
             )
-            return flag in ((result.stdout or "") + (result.stderr or ""))
+            supports = flag in ((result.stdout or "") + (result.stderr or ""))
+            cache[cache_key] = supports
+            return supports
         except Exception as e:
             logger.debug(f"Error checking Qwen CLI support: {e}")
+            cache[cache_key] = False
             return False
 
     def _poll_tts_ready(self):

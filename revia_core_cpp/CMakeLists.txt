@@ -6,11 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Set Release build as default and add optimization flags
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
 
 include(FetchContent)
 
@@ -48,6 +46,25 @@ target_link_libraries(revia_core PRIVATE
     nlohmann_json::nlohmann_json
     ixwebsocket
 )
+
+if(MSVC)
+    target_compile_options(revia_core PRIVATE
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/GL>
+    )
+    target_link_options(revia_core PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+    )
+else()
+    target_compile_options(revia_core PRIVATE
+        $<$<CONFIG:Release>:-O3>
+        $<$<CONFIG:Release>:-march=native>
+        $<$<CONFIG:Release>:-flto>
+    )
+    target_link_options(revia_core PRIVATE
+        $<$<CONFIG:Release>:-flto>
+    )
+endif()
 
 # Add precompiled headers if supported
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.16")

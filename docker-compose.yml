@@ -1,5 +1,3 @@
-version: "3.9"
-
 # REVIA Docker services
 # Run: docker compose up -d
 # Starts Redis (long-term memory) + the Python core server (REST :8123, WS :8124).
@@ -11,7 +9,7 @@ services:
     container_name: revia-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - revia_redis_data:/data
     command: redis-server --appendonly yes --save 60 1 --save 300 10
@@ -35,11 +33,13 @@ services:
     container_name: revia-core
     restart: unless-stopped
     ports:
-      - "8123:8123"
-      - "8124:8124"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:8124:8124"
     environment:
       - REDIS_HOST=${REDIS_HOST:-revia-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
+      - REVIA_REST_HOST=0.0.0.0
+      - REVIA_WS_HOST=0.0.0.0
       - REVIA_REST_PORT=${REVIA_REST_PORT:-8123}
       - REVIA_WS_PORT=${REVIA_WS_PORT:-8124}
       - REVIA_DISCORD_BOT_TOKEN=${REVIA_DISCORD_BOT_TOKEN:-}

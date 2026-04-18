@@ -235,12 +235,15 @@ class TestSingModeController(unittest.TestCase):
 
     def test_play_with_analysis(self):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            _make_test_wav(f.name, duration_sec=0.5, channels=1)
-            analysis = SongAnalysis(karaoke_output_path=f.name)
+            wav_path = f.name
+        try:
+            _make_test_wav(wav_path, duration_sec=0.5, channels=1)
+            analysis = SongAnalysis(karaoke_output_path=wav_path)
             self.sing.play(analysis)
-            self.mock_tts.play_wav.assert_called_once_with(f.name)
+            self.mock_tts.play_wav.assert_called_once_with(wav_path)
             self.assertEqual(self.sing.state, SingModeState.PLAYING)
-            os.unlink(f.name)
+        finally:
+            os.unlink(wav_path)
 
     def test_cleanup(self):
         self.sing._work_dir = tempfile.mkdtemp()

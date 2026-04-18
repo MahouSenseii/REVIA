@@ -71,7 +71,7 @@ class VoiceProfile:
         self.name = name
         self.mode = mode
         self.language = "Auto"
-        self.model_size = "1.7B"
+        self.model_size = "0.6B"
 
         # Voice Design fields
         self.voice_description = ""
@@ -130,7 +130,7 @@ class VoiceProfile:
         p.name = data.get("name", "Default")
         p.mode = VoiceMode(data.get("mode", "custom"))
         p.language = data.get("language", "Auto")
-        p.model_size = data.get("modelSize", "1.7B")
+        p.model_size = data.get("modelSize", "0.6B")
         # Backward compat: old profiles used "description"/"stylePrompt"
         p.voice_description = (
             data.get("voiceDescription", "")

@@ -4467,8 +4467,28 @@ def _broadcast_runtime_status():
 # Flask REST API
 # ---------------------------------------------------------------------------
 
+def _allowed_cors_origins() -> list[str]:
+    raw = os.environ.get("REVIA_CORS_ORIGINS", "").strip()
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "http://127.0.0.1",
+        "http://localhost",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ]
+
+
+def _max_request_bytes() -> int:
+    try:
+        return max(1024, int(os.environ.get("REVIA_MAX_REQUEST_BYTES", "16777216")))
+    except (TypeError, ValueError):
+        return 16 * 1024 * 1024
+
+
 app = Flask(__name__)
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = _max_request_bytes()
+CORS(app, origins=_allowed_cors_origins())
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
@@ -5235,14 +5255,24 @@ def api_twitch_stop():
 # Startup
 # ---------------------------------------------------------------------------
 
-REST_PORT = int(os.environ.get("REVIA_REST_PORT", "8123"))
-WS_PORT = int(os.environ.get("REVIA_WS_PORT", "8124"))
+def _env_port(name: str, default: int) -> int:
+    try:
+        port = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+REST_HOST = os.environ.get("REVIA_REST_HOST", os.environ.get("REVIA_HOST", "127.0.0.1"))
+WS_HOST = os.environ.get("REVIA_WS_HOST", os.environ.get("REVIA_HOST", "127.0.0.1"))
+REST_PORT = _env_port("REVIA_REST_PORT", 8123)
+WS_PORT = _env_port("REVIA_WS_PORT", 8124)
 
 async def start_ws_server():
     global ws_loop
     ws_loop = asyncio.get_event_loop()
-    async with websockets.server.serve(ws_handler, "0.0.0.0", WS_PORT):
-        print(f"[REVIA Core] WebSocket server on ws://0.0.0.0:{WS_PORT}")
+    async with websockets.server.serve(ws_handler, WS_HOST, WS_PORT):
+        print(f"[REVIA Core] WebSocket server on ws://{WS_HOST}:{WS_PORT}")
         await asyncio.Future()
 
 def run_ws():
@@ -5456,12 +5486,12 @@ def main():
 
     conversation_manager.mark_startup_complete("Core services online")
     telemetry.state = conversation_manager.current_state
-    print(f"[REVIA Core] REST server on http://0.0.0.0:{REST_PORT}")
+    print(f"[REVIA Core] REST server on http://{REST_HOST}:{REST_PORT}")
     print(f"[REVIA Core] Ready. Open the controller and click 'Connect'.")
     print()
     import atexit
     atexit.register(rl_engine.save)
-    app.run(host="0.0.0.0", port=REST_PORT, debug=False, use_reloader=False)
+    app.run(host=REST_HOST, port=REST_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()

@@ -255,6 +255,10 @@ class ErrorBackend(abc.ABC):
     @abc.abstractmethod
     def emit(self, report: ErrorReport) -> None: ...
 
+    def close(self) -> None:
+        """Release backend resources, if any."""
+        return None
+
 
 class ConsoleBackend(ErrorBackend):
     """Logs to stderr with token-bucket rate limiting (SEC-02)."""
@@ -472,12 +476,17 @@ class ReviaErrorHandler:
     def reset_instance(cls) -> None:
         with cls._instance_lock:
             if cls._instance is not None:
+                cls._instance.close()
                 cls._instance.store.reset()
             cls._instance = None
 
     def reset(self) -> None:
         """Reset store state (for tests)."""
         self.store.reset()
+
+    def close(self) -> None:
+        """Release resources held by the active backend."""
+        self._backend.close()
 
     # --- core logging ---
     def log(
@@ -550,6 +559,7 @@ class ReviaErrorHandler:
 
     # --- backend swap ---
     def swap_backend(self, backend: ErrorBackend) -> None:
+        self._backend.close()
         self._backend = backend
 
     # --- timer ---
