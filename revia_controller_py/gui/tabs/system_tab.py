@@ -559,6 +559,7 @@ class SystemTab(QScrollArea):
         def _check():
             ok = False
             ver = "?"
+            err_detail = ""
             try:
                 # Use a fresh session for health checks to avoid stale
                 # Keep-Alive connections from before the server restarted.
@@ -570,7 +571,17 @@ class SystemTab(QScrollArea):
                     ok = True
                     ver = r.json().get("version", "?")
             except Exception as e:
-                logger.debug(f"Error checking core status: {e}")
+                err_detail = f"{type(e).__name__}: {e}"
+                logger.debug(f"Error checking core status: {err_detail}")
+                # Emit first attempt, and every 5th after, so the Logs tab
+                # shows the real failure reason (e.g. ConnectionRefusedError).
+                if attempts <= 1 or attempts % 5 == 0:
+                    self._bg.dispatch(
+                        lambda d=err_detail, a=attempts:
+                            self.event_bus.log_entry.emit(
+                                f"[Core] Health check #{a} failed: {d}"
+                            )
+                    )
 
             def _apply(ok=ok, ver=ver, a=attempts):
                 if ok:
