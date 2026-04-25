@@ -496,6 +496,8 @@ class SystemTab(QScrollArea):
         self._core_process.errorOccurred.connect(self._on_server_error)
         python_exe = self._resolve_python_exe()
 
+        self.event_bus.log_entry.emit(f"[Core] Python: {python_exe}")
+        self.event_bus.log_entry.emit(f"[Core] Script: {script}")
         self.event_bus.log_entry.emit(f"[Core] Launching: {python_exe} {script}")
         # Pass -u flag for unbuffered Python output so startup messages
         # and any tracebacks appear in the Logs tab immediately.
@@ -558,7 +560,10 @@ class SystemTab(QScrollArea):
             ok = False
             ver = "?"
             try:
-                r = self.client._session_get(
+                # Use a fresh session for health checks to avoid stale
+                # Keep-Alive connections from before the server restarted.
+                import requests as _requests
+                r = _requests.get(
                     f"http://{host}:{rest}/api/status", timeout=2
                 )
                 if r.ok:
