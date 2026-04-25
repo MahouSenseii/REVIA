@@ -294,7 +294,11 @@ def _get_redis():
     with _redis_lock:
         return _redis_client
 
-_init_redis()
+# Run Redis init in a background thread so it never blocks Flask startup.
+# Previously this stalled the main thread for up to 4 s (2 s connect +
+# 2 s ping timeout) before app.run() was reached, causing the UI health-
+# check poll to time out before the REST endpoint became available.
+threading.Thread(target=_init_redis, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Emotion history (in-memory ring buffer)
@@ -2463,14 +2467,16 @@ emotion_net = EmotionNet()
 try:
     from neural_refiner import NeuralRefiner
     neural_refiner = NeuralRefiner(log_fn=_revia_log)
-except ImportError:
+except Exception as exc:
+    print(f"[REVIA Core] Neural refiner init failed: {exc}")
     neural_refiner = None
 
 # Parallel Pipeline — concurrent lane execution for Revia
 try:
     from parallel_pipeline import ParallelPipeline
     parallel_pipeline = ParallelPipeline(log_fn=_revia_log)
-except ImportError:
+except Exception as exc:
+    print(f"[REVIA Core] Parallel pipeline init failed: {exc}")
     parallel_pipeline = None
 router_cls = RouterClassifier()
 

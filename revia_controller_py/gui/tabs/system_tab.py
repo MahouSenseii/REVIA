@@ -486,14 +486,20 @@ class SystemTab(QScrollArea):
         self._core_process = QProcess(self)
         self._core_process.setWorkingDirectory(str(Path(script).parent))
         self._core_process.setProcessEnvironment(self._build_env(rest, ws))
+        # Merge stderr into stdout so all Python output (including tracebacks)
+        # is captured by _on_server_stdout. Without this, crash tracebacks
+        # can be lost if stderr is read before stdout.
+        from PySide6.QtCore import QProcess as _QProc
+        self._core_process.setProcessChannelMode(_QProc.ProcessChannelMode.MergedChannels)
         self._core_process.readyReadStandardOutput.connect(self._on_server_stdout)
-        self._core_process.readyReadStandardError.connect(self._on_server_stderr)
         self._core_process.finished.connect(self._on_server_finished)
         self._core_process.errorOccurred.connect(self._on_server_error)
         python_exe = self._resolve_python_exe()
 
         self.event_bus.log_entry.emit(f"[Core] Launching: {python_exe} {script}")
-        self._core_process.start(python_exe, [script])
+        # Pass -u flag for unbuffered Python output so startup messages
+        # and any tracebacks appear in the Logs tab immediately.
+        self._core_process.start(python_exe, ["-u", script])
 
         if not self._core_process.waitForStarted(5000):
             err = self._core_process.errorString()
@@ -510,13 +516,16 @@ class SystemTab(QScrollArea):
         self._connect_attempts = 0
         self._server_starting = True
 
-        QTimer.singleShot(2500, self._auto_connect_after_start)
+        # Give the server more time before first check — Redis timeout,
+        # model loading, and neural refiner init can take 10-15s.
+        QTimer.singleShot(5000, self._auto_connect_after_start)
 
     def _build_env(self, rest_port, ws_port):
         from PySide6.QtCore import QProcessEnvironment
         env = QProcessEnvironment.systemEnvironment()
         env.insert("REVIA_REST_PORT", str(rest_port))
         env.insert("REVIA_WS_PORT", str(ws_port))
+        env.insert("PYTHONUNBUFFERED", "1")
         return env
 
     def _auto_connect_after_start(self):
@@ -537,8 +546,8 @@ class SystemTab(QScrollArea):
             self.stop_server_btn.setEnabled(False)
             self._server_starting = False
             return
-        if self._connect_attempts > 15:
-            self.server_status.setText("Server: Timeout waiting for REST")
+        if self._connect_attempts > 30:
+            self.server_status.setText("Server: Timeout waiting for REST (check Logs)")
             apply_status_style(self.server_status, "color: #cc3040;")
             self._server_starting = False
             return
@@ -579,7 +588,17 @@ class SystemTab(QScrollArea):
                 errors="replace"
             ).strip()
             if data:
-                self.event_bus.log_entry.emit(f"[Core] {data}")
+                for line in data.splitlines():
+                    line = line.strip()
+                    if line:
+                        self.event_bus.log_entry.emit(f"[Core] {line}")
+                        # Surface key milestones in the status label
+                        if "Ready" in line or "REST server on" in line:
+                            self.server_status.setText("Server: Running")
+                            apply_status_style(self.server_status, "color: #00aa40;")
+                        elif "Traceback" in line or "Error" in line:
+                            self.server_status.setText(f"Server: {line[:60]}")
+                            apply_status_style(self.server_status, "color: #cc3040;")
 
     def _on_server_error(self, error):
         error_names = {
