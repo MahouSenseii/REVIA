@@ -24,6 +24,7 @@ class SystemTab(QScrollArea):
         self.client = client
         self.theme_mgr = theme_mgr
         self._core_process = None
+        self._server_starting = False
         self._auto_start_attempted = False
         self._neural_refresh_inflight = False
         self._bg = UiThreadBridge(self)
@@ -474,8 +475,13 @@ class SystemTab(QScrollArea):
         killed |= self._kill_port_holder(ws)
         if killed:
             self.event_bus.log_entry.emit(
-                "[Core] Waiting for port cleanup (non-blocking)..."
+                "[Core] Waiting for port cleanup..."
             )
+            # Brief pause so the OS releases the port before Flask tries to bind.
+            # Without this, the new process can fail with "Address already in use"
+            # immediately after a taskkill, causing a silent crash → timeout.
+            import time as _time
+            _time.sleep(1.0)
 
         self._core_process = QProcess(self)
         self._core_process.setWorkingDirectory(str(Path(script).parent))
@@ -502,6 +508,7 @@ class SystemTab(QScrollArea):
         self.start_server_btn.setEnabled(False)
         self.stop_server_btn.setEnabled(True)
         self._connect_attempts = 0
+        self._server_starting = True
 
         QTimer.singleShot(2500, self._auto_connect_after_start)
 
@@ -516,16 +523,24 @@ class SystemTab(QScrollArea):
         self._connect_attempts = getattr(self, "_connect_attempts", 0) + 1
         host = self.core_host.text().strip() or "127.0.0.1"
         rest = self.rest_port.value()
+        # If the process we launched has already exited (_server_starting cleared
+        # by _on_server_finished), stop polling — the exit status was already
+        # shown by _on_server_finished. Without this check, _core_process being
+        # None causes the crash to go undetected and we poll all 15 attempts.
+        if not self._server_starting:
+            return
         # Check if process died before spending time on an HTTP probe.
         if self._core_process and self._core_process.state() == QProcess.NotRunning:
             self.server_status.setText("Server: Failed to start (check Logs)")
             apply_status_style(self.server_status, "color: #cc3040;")
             self.start_server_btn.setEnabled(True)
             self.stop_server_btn.setEnabled(False)
+            self._server_starting = False
             return
         if self._connect_attempts > 15:
             self.server_status.setText("Server: Timeout waiting for REST")
             apply_status_style(self.server_status, "color: #cc3040;")
+            self._server_starting = False
             return
 
         attempts = self._connect_attempts  # snapshot for the closure
@@ -545,6 +560,7 @@ class SystemTab(QScrollArea):
 
             def _apply(ok=ok, ver=ver, a=attempts):
                 if ok:
+                    self._server_starting = False
                     self.server_status.setText(f"Server: Running (v{ver})")
                     apply_status_style(self.server_status, "color: #00aa40;")
                     self._connect_core()
@@ -622,6 +638,7 @@ class SystemTab(QScrollArea):
         self.start_server_btn.setEnabled(True)
         self.stop_server_btn.setEnabled(False)
         self._core_process = None
+        self._server_starting = False
 
     def _stop_core_server(self):
         stopped = False
@@ -648,7 +665,7 @@ class SystemTab(QScrollArea):
             # Server was started externally — try to kill by port
             self._disconnect_core()
             rest_port = self.rest_port.value()
-            killed = self._kill_port_listener(rest_port)
+            killed = self._kill_port_holder(rest_port)
             if killed:
                 stopped = True
             else:
