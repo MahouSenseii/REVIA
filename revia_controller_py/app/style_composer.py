@@ -270,4 +270,22 @@ QWidget#rightPanel QScrollArea > QWidget,
 QWidget#rightPanel QScrollArea > QWidget > QWidget {{
     background: transparent;
 }}
+
+/* Category tabs (nested within top-level tabs) — compact and subtle */
+QTabWidget#categoryTabs {{
+    background: transparent;
+}}
+QTabWidget#categoryTabs QTabBar::tab {{
+    padding: 5px 8px;
+    min-width: 36px;
+    font-size: 9px;
+}}
+QTabWidget#categoryTabs QTabBar::tab:selected {{
+    color: {t["PrimaryText"]};
+    border-bottom: 2px solid {t["Accent"]};
+}}
+QTabWidget#categoryTabs QTabWidget::pane {{
+    border: none;
+    background: transparent;
+}}
 """

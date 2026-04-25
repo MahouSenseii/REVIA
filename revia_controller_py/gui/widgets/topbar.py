@@ -52,6 +52,7 @@ class TopBar(QFrame):
         layout.addWidget(self.health_pill)
 
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
+        self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
 
     def _on_telemetry(self, data):
         sys_data = data.get("system", {})
@@ -118,3 +119,14 @@ class TopBar(QFrame):
             clear_status_role(self.health_pill)
         self.health_pill.style().unpolish(self.health_pill)
         self.health_pill.style().polish(self.health_pill)
+
+    def _on_theme_changed(self, _theme_id):
+        """Repoll health pill styling after theme switch."""
+        self.set_health(self._current_health_status)
+
+    @property
+    def _current_health_status(self):
+        text = self.health_pill.text()
+        if text.startswith("Health: "):
+            return text[8:]
+        return "Offline"

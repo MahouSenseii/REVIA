@@ -68,7 +68,7 @@ class ControllerClient(QObject):
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_status)
-        self.poll_timer.setInterval(2000)
+        self.poll_timer.setInterval(1500)
 
     def start(self):
         self._try_connect()

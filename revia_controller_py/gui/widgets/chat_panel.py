@@ -100,10 +100,11 @@ class ChatPanel(QFrame):
 
         # Hard-timeout watchdog: if the backend stays in Thinking for longer than
         # this, force-clear reply state so the UI never stays stuck indefinitely.
-        # 120 s is generous enough for slow models but short enough to feel responsive.
+        # 60s is generous enough for slow models but prevents the UI from
+        # appearing frozen for extended periods.
         self._thinking_watchdog = QTimer(self)
         self._thinking_watchdog.setSingleShot(True)
-        self._thinking_watchdog.setInterval(120_000)  # 120 seconds
+        self._thinking_watchdog.setInterval(60_000)  # 60 seconds
         self._thinking_watchdog.timeout.connect(self._on_thinking_timeout)
 
         layout = QVBoxLayout(self)
@@ -1238,14 +1239,14 @@ class ChatPanel(QFrame):
         self._tts_sentence_buf = ""
 
     def _on_thinking_timeout(self):
-        """Called when the backend stays in Thinking for > 120 s with no response.
+        """Called when the backend stays in Thinking for too long with no response.
 
         Force-clears all reply state and shows a user-visible note so the
         conversation doesn't appear permanently frozen.
         """
         if not self._awaiting_reply:
             return  # Already resolved — nothing to do
-        logger.warning("[ChatPanel] Thinking watchdog fired — no response after 120 s, clearing state")
+        logger.warning("[ChatPanel] Thinking watchdog fired — no response after timeout, clearing state")
         self._clear_inline_status()
         self._append_system_note("Response timed out — backend took too long. Try again.")
         self._finish_activity_request()
@@ -1347,17 +1348,17 @@ class ChatPanel(QFrame):
         )
         return (
             '<table width="100%" cellpadding="0" cellspacing="0"'
-            ' style="margin:3px 0 2px 0;">'
-            '<tr><td align="right">'
-            f'<span style="color:{accent};font-weight:bold;">&#9670; You</span>'
-            f' <span style="color:{primary};">{text}</span>{note_html}'
+            ' style="margin:6px 0 3px 0;">'
+            '<tr><td align="right" style="padding:6px 10px;">'
+            f'<span style="color:{accent};font-weight:600;font-size:11px;">&#9670; You</span>'
+            f'&nbsp;&nbsp;<span style="color:{primary};font-size:11px;line-height:1.5;">{text}</span>{note_html}'
             '</td></tr></table>'
         )
 
     @staticmethod
     def _fmt_revia_start() -> str:
         accent = _chat_color("AccentHover")
-        return f'<span style="color:{accent};font-weight:bold;">&#10022; Revia</span> '
+        return f'<span style="color:{accent};font-weight:600;font-size:11px;">&#10022; Revia</span> '
 
     @staticmethod
     def _fmt_revia(text: str) -> str:
@@ -1365,10 +1366,10 @@ class ChatPanel(QFrame):
         accent = _chat_color("AccentHover")
         return (
             '<table width="100%" cellpadding="0" cellspacing="0"'
-            ' style="margin:3px 0 2px 0;">'
-            '<tr><td align="left">'
-            f'<span style="color:{accent};font-weight:bold;">&#10022; Revia</span>'
-            f' <span style="color:{primary};">{text}</span>'
+            ' style="margin:6px 0 3px 0;">'
+            '<tr><td align="left" style="padding:6px 10px;">'
+            f'<span style="color:{accent};font-weight:600;font-size:11px;">&#10022; Revia</span>'
+            f'&nbsp;&nbsp;<span style="color:{primary};font-size:11px;line-height:1.5;">{text}</span>'
             '</td></tr></table>'
         )
 
@@ -1376,7 +1377,7 @@ class ChatPanel(QFrame):
     def _fmt_system(text: str) -> str:
         secondary = _chat_color("SecondaryText")
         return (
-            f'<span style="color:{secondary};font-size:8px;font-style:italic;">'
+            f'<span style="color:{secondary};font-size:9px;font-style:italic;">'
             f'&#11015; {text}</span>'
         )
 
@@ -1384,7 +1385,7 @@ class ChatPanel(QFrame):
     def _fmt_speech(text: str) -> str:
         accent = _chat_color("AccentHover")
         return (
-            f'<span style="color:{accent};font-size:8px;font-style:italic;">'
+            f'<span style="color:{accent};font-size:9px;font-style:italic;">'
             f'&#127908; &ldquo;{text}&rdquo;</span>'
         )
 

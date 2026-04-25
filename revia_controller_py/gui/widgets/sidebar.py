@@ -227,6 +227,114 @@ class ActivityMeter(QFrame):
         p.end()
 
 
+class NeuralIndicator(QFrame):
+    """Animated neural network visualization — pulsing nodes with connections.
+
+    Makes Revia feel alive by showing real-time neural activity patterns.
+    Node brightness pulses based on the current assistant state:
+      - Idle: slow gentle pulse
+      - Thinking: rapid active pulse, nodes brighten
+      - Speaking: rhythmic wave pattern
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(84, 50)
+        self.setMaximumSize(180, 70)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._tick = 0
+        self._state = "idle"
+        self._pulse_speed = 0.08
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+        self._timer.start(80)
+
+    def set_state(self, state: str):
+        normalized = str(state or "idle").strip().lower()
+        if "think" in normalized or "generat" in normalized:
+            self._state = "thinking"
+            self._pulse_speed = 0.25
+        elif "speak" in normalized:
+            self._state = "speaking"
+            self._pulse_speed = 0.18
+        elif "listen" in normalized:
+            self._state = "listening"
+            self._pulse_speed = 0.15
+        else:
+            self._state = "idle"
+            self._pulse_speed = 0.08
+
+    def _advance(self):
+        self._tick += 1
+        self.update()
+
+    def paintEvent(self, event):
+        tokens = _theme_tokens()
+        accent = _theme_color(tokens, "Accent")
+        accent_hover = _theme_color(tokens, "AccentHover")
+        surface = _theme_color(tokens, "Surface")
+        disabled = _theme_color(tokens, "Disabled")
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+        t = self._tick * self._pulse_speed
+
+        # Node positions (3 rows of nodes)
+        rows = 3
+        cols = 5
+        node_r = 3
+        nodes = []
+        for row in range(rows):
+            for col in range(cols):
+                nx = 14 + col * (w - 28) / max(cols - 1, 1)
+                ny = 10 + row * (h - 20) / max(rows - 1, 1)
+                nodes.append((nx, ny, row, col))
+
+        # Draw connections between layers
+        p.setPen(QPen(_with_alpha(accent, 25), 1))
+        for i, (x1, y1, r1, c1) in enumerate(nodes):
+            for j, (x2, y2, r2, c2) in enumerate(nodes):
+                if r2 == r1 + 1 and abs(c2 - c1) <= 2:
+                    p.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        # Draw nodes with pulsing brightness
+        for nx, ny, row, col in nodes:
+            phase_offset = (row * 1.5 + col * 0.7)
+            pulse = (math.sin(t + phase_offset) * 0.5 + 0.5)
+
+            if self._state == "thinking":
+                brightness = 0.3 + pulse * 0.7
+            elif self._state == "speaking":
+                wave = (math.sin(t * 1.5 + row * 2.0) * 0.5 + 0.5)
+                brightness = 0.2 + wave * 0.6
+            elif self._state == "listening":
+                brightness = 0.15 + pulse * 0.35
+            else:
+                brightness = 0.1 + pulse * 0.2
+
+            alpha = int(brightness * 255)
+            node_color = _with_alpha(accent_hover, alpha) if brightness > 0.5 else _with_alpha(accent, alpha)
+
+            # Glow
+            if brightness > 0.4:
+                glow = QRadialGradient(nx, ny, node_r + 6)
+                glow.setColorAt(0.0, _with_alpha(accent_hover, int(brightness * 60)))
+                glow.setColorAt(1.0, _with_alpha(accent, 0))
+                p.setBrush(QBrush(glow))
+                p.setPen(Qt.NoPen)
+                p.drawEllipse(int(nx - node_r - 6), int(ny - node_r - 6),
+                              (node_r + 6) * 2, (node_r + 6) * 2)
+
+            # Node dot
+            p.setBrush(node_color)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(int(nx - node_r), int(ny - node_r),
+                          node_r * 2, node_r * 2)
+
+        p.end()
+
+
 class SidebarWidget(QFrame):
     def __init__(self, event_bus, parent=None):
         super().__init__(parent)
@@ -288,8 +396,14 @@ class SidebarWidget(QFrame):
         self.activity = ActivityMeter()
         layout.addWidget(self.activity, alignment=Qt.AlignCenter)
 
+        layout.addSpacing(8)
+
+        self.neural_indicator = NeuralIndicator()
+        layout.addWidget(self.neural_indicator, alignment=Qt.AlignCenter)
+
         self.event_bus.connection_changed.connect(self._on_connection)
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
+        self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
 
     def _on_connection(self, connected):
         if connected:
@@ -323,10 +437,16 @@ class SidebarWidget(QFrame):
         if "listen" in state:
             self.mod_stt.set_status("active")
             self.activity.value = 0.7
-        elif "speak" in state or "think" in state:
+            self.neural_indicator.set_state("listening")
+        elif "speak" in state:
             self.activity.value = 0.9
+            self.neural_indicator.set_state("speaking")
+        elif "think" in state or "generat" in state:
+            self.activity.value = 0.9
+            self.neural_indicator.set_state("thinking")
         else:
             self.activity.value = 0.3
+            self.neural_indicator.set_state("idle")
 
         self.mod_stt.set_status(
             "active" if (checks.get("stt", {}) or {}).get("ready", False) else "error"
@@ -336,3 +456,11 @@ class SidebarWidget(QFrame):
         )
         self.mod_memory.set_status("active")
         self.mod_vision.set_status("active" if data.get("architecture", {}).get("modules", {}).get("vision", {}).get("online", False) else "idle")
+
+    def _on_theme_changed(self, _theme_id):
+        """Repaint all custom-painted child widgets when the theme changes."""
+        self.avatar.update()
+        self.activity.update()
+        self.neural_indicator.update()
+        for m in (self.mod_vision, self.mod_stt, self.mod_tts, self.mod_memory):
+            m.update()

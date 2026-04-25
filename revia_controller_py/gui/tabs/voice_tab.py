@@ -246,12 +246,7 @@ class VoiceTab(QScrollArea):
         self.vol_bar.setTextVisible(False)
         self.vol_bar.setMinimumHeight(18)
         self.vol_bar.setMaximumHeight(28)
-        self.vol_bar.setStyleSheet(
-            "QProgressBar{border:1px solid #555;border-radius:4px;background:#1a1a2e;}"
-            "QProgressBar::chunk{background:qlineargradient("
-            "x1:0,y1:0,x2:1,y2:0,stop:0 #00cc44,stop:0.7 #cccc00,stop:1 #cc3040);"
-            "border-radius:3px;}"
-        )
+        self._apply_vol_bar_style()
         ml.addWidget(self.vol_bar)
         mic_row = QHBoxLayout()
         self.mic_test_btn = QPushButton("Test Microphone")
@@ -298,6 +293,7 @@ class VoiceTab(QScrollArea):
             lambda e: self._set_status(f"Error: {e}", role="error")
         )
         self.event_bus.connection_changed.connect(self._on_core_connection)
+        self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
         self._refresh_library()
 
         # Defer the "fetch persisted TTS output device" hit to let the core
@@ -1141,6 +1137,28 @@ class VoiceTab(QScrollArea):
     def _on_core_connection(self, connected):
         if connected:
             self._set_status("Core online", role="success")
+
+    def _apply_vol_bar_style(self):
+        """Apply theme-aware volume bar stylesheet using current theme tokens."""
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QColor
+        app = QApplication.instance()
+        tokens = app.property("reviaThemeTokens") if app else None
+        border = "#555"
+        bg = "#1a1a2e"
+        if isinstance(tokens, dict):
+            border = tokens.get("Border", border)
+            bg = tokens.get("Surface", bg)
+        self.vol_bar.setStyleSheet(
+            f"QProgressBar{{border:1px solid {border};border-radius:4px;background:{bg};}}"
+            "QProgressBar::chunk{background:qlineargradient("
+            "x1:0,y1:0,x2:1,y2:0,stop:0 #00cc44,stop:0.7 #cccc00,stop:1 #cc3040);"
+            "border-radius:3px;}"
+        )
+
+    def _on_theme_changed(self, _theme_id):
+        """Re-apply dynamic widget styles when theme changes."""
+        self._apply_vol_bar_style()
 
     def auto_start_on_launch(self):
         """Start voice services on app launch when local capabilities allow it."""

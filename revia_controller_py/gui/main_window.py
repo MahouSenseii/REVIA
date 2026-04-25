@@ -110,20 +110,84 @@ class MainWindow(QMainWindow):
         self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_container_layout.addWidget(self.tabs)
 
+        # ── Tab 1: Personality ────────────────────────────────────
+        personality_container = QWidget()
+        personality_layout = QVBoxLayout(personality_container)
+        personality_layout.setContentsMargins(0, 4, 0, 0)
+        personality_layout.setSpacing(0)
+        self.personality_tabs = QTabWidget()
+        self.personality_tabs.setDocumentMode(True)
+        self.personality_tabs.setObjectName("categoryTabs")
+        personality_layout.addWidget(self.personality_tabs)
+        self.tabs.addTab(personality_container, "Persona")
+
         self.profile_tab = ProfileTab(self.event_bus, self.client)
-        self.tabs.addTab(
-            self.profile_tab, "Profile"
-        )
-        self.model_tab = ModelTab(self.event_bus, self.client)
-        self.tabs.addTab(self.model_tab, "Model")
+        self.personality_tabs.addTab(self.profile_tab, "Profile")
+
         self.memory_tab = MemoryTab(self.event_bus, self.client)
+        self.personality_tabs.addTab(self.memory_tab, "Memory")
+
         self.tabs.addTab(
-            self.memory_tab, "Memory"
+            EmotionsTab(self.event_bus, self.client), "Emotions"
         )
+
+        self.sing_tab = SingTab(self.event_bus, self.client)
+        self.personality_tabs.addTab(self.sing_tab, "Sing")
+        self._init_sing_system()
+
+        # ── Tab 2: System ─────────────────────────────────────────
+        system_container = QWidget()
+        system_layout = QVBoxLayout(system_container)
+        system_layout.setContentsMargins(0, 4, 0, 0)
+        system_layout.setSpacing(0)
+        self.system_tabs = QTabWidget()
+        self.system_tabs.setDocumentMode(True)
+        self.system_tabs.setObjectName("categoryTabs")
+        system_layout.addWidget(self.system_tabs)
+        self.tabs.addTab(system_container, "System")
+
+        self.model_tab = ModelTab(self.event_bus, self.client)
+        self.system_tabs.addTab(self.model_tab, "Model")
+
         self.voice_tab = VoiceTab(
             self.event_bus, self.client, self.audio_service
         )
-        self.tabs.addTab(self.voice_tab, "Voice")
+        self.system_tabs.addTab(self.voice_tab, "Voice")
+
+        self.vision_tab = VisionTab(
+            self.event_bus, self.client, self.camera_service
+        )
+        self.system_tabs.addTab(self.vision_tab, "Vision")
+
+        self.system_tab = SystemTab(
+            self.event_bus, self.client, self.theme_mgr
+        )
+        self.system_tabs.addTab(self.system_tab, "Server")
+
+        self.filters_tab = FiltersTab(self.event_bus, self.client)
+        self.system_tabs.addTab(self.filters_tab, "Filters")
+
+        # ── Tab 3: Advanced ────────────────────────────────────────
+        advanced_container = QWidget()
+        advanced_layout = QVBoxLayout(advanced_container)
+        advanced_layout.setContentsMargins(0, 4, 0, 0)
+        advanced_layout.setSpacing(0)
+        self.advanced_tabs = QTabWidget()
+        self.advanced_tabs.setDocumentMode(True)
+        self.advanced_tabs.setObjectName("categoryTabs")
+        advanced_layout.addWidget(self.advanced_tabs)
+        self.tabs.addTab(advanced_container, "Advanced")
+
+        self.advanced_tabs.addTab(LogsTab(self.event_bus), "Logs")
+
+        self.theme_tab = ThemeTab(
+            self.event_bus, self.client, self.theme_mgr
+        )
+        self.advanced_tabs.addTab(self.theme_tab, "Theme")
+
+        self.advanced_tabs.addTab(
+            IntegrationsTab(self.event_bus, self.client), "Integrations"
+        )
 
         # Give chat panel access to the voice manager for TTS
         self.chat_panel.set_voice_manager(self.voice_tab.voice_mgr)
@@ -146,34 +210,6 @@ class MainWindow(QMainWindow):
         )
         self.chat_panel.set_conversation_starter(self.conversation_starter)
         self.chat_panel.set_behavior_controller(self.behavior_controller)
-
-        self.vision_tab = VisionTab(
-            self.event_bus, self.client, self.camera_service
-        )
-        self.tabs.addTab(self.vision_tab, "Vision")
-
-        self.tabs.addTab(
-            EmotionsTab(self.event_bus, self.client), "Emotions"
-        )
-        self.filters_tab = FiltersTab(self.event_bus, self.client)
-        self.tabs.addTab(
-            self.filters_tab, "Filters"
-        )
-        self.tabs.addTab(LogsTab(self.event_bus), "Logs")
-        self.sing_tab = SingTab(self.event_bus, self.client)
-        self.tabs.addTab(self.sing_tab, "Sing")
-        self._init_sing_system()
-        self.tabs.addTab(
-            IntegrationsTab(self.event_bus, self.client), "Integrations"
-        )
-        self.theme_tab = ThemeTab(
-            self.event_bus, self.client, self.theme_mgr
-        )
-        self.tabs.addTab(self.theme_tab, "Theme")
-        self.system_tab = SystemTab(
-            self.event_bus, self.client, self.theme_mgr
-        )
-        self.tabs.addTab(self.system_tab, "System")
 
         self.assistant_status_manager = AssistantStatusManager(
             event_bus=self.event_bus,

@@ -60,7 +60,7 @@ def main():
 
     event_bus = EventBus()
     client = ControllerClient(event_bus)
-    theme_mgr = ThemeManager(app)
+    theme_mgr = ThemeManager(app, event_bus=event_bus)
     theme_mgr.apply_theme(theme_mgr.current_theme)
 
     window = MainWindow(event_bus, client, theme_mgr)

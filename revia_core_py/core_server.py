@@ -1477,7 +1477,13 @@ class LLMBackend:
             full_text = ""
             t0 = time.perf_counter()
             read_timeout = self._stream_read_timeout_s("REVIA_LOCAL_LLM_READ_TIMEOUT_S", 80.0)
+            # Per-token timeout: if no new token arrives within this many seconds,
+            # consider the generation stalled and abort. This is separate from the
+            # overall read timeout — a model that's producing tokens slowly (1-2/s)
+            # is fine, but one that stops for 30+ seconds between tokens is stuck.
+            _token_stall_timeout = 30.0
             last_token_t = t0
+            first_token_t = None
             self._mark_generation_activity(started=True)
 
             def _response_detail(resp_obj):
@@ -1535,9 +1541,19 @@ class LLMBackend:
 
             with resp:
                 for line in resp.iter_lines(decode_unicode=False, chunk_size=128):
-                    if time.perf_counter() - last_token_t > read_timeout:
+                    now = time.perf_counter()
+                    # Check per-token stall timeout
+                    if last_token_t and (now - last_token_t) > _token_stall_timeout:
+                        _revia_log(
+                            f"[LLM] Local generation stalled — no token for "
+                            f"{now - last_token_t:.1f}s (stall timeout={_token_stall_timeout:.0f}s). "
+                            f"Aborting with {len(full_text.split())} tokens so far."
+                        )
+                        # If we have partial text, deliver it rather than discarding
+                        if full_text.strip():
+                            break
                         raise requests.exceptions.Timeout(
-                            f"Local LLM stream produced no tokens for {read_timeout:.0f}s"
+                            f"Local LLM stream stalled for {now - last_token_t:.0f}s between tokens"
                         )
                     # Check for interrupt before processing each token (thread-safe)
                     if self._is_interrupted():
@@ -1556,6 +1572,8 @@ class LLMBackend:
                         tok = delta.get("content", "")
                         if tok:
                             last_token_t = time.perf_counter()
+                            if first_token_t is None:
+                                first_token_t = last_token_t
                             self._mark_generation_activity()
                             full_text += tok
                             broadcast_fn({"type": "chat_token", "token": tok})
@@ -2289,6 +2307,13 @@ class EmotionNet:
         # Slight sharpening so top hypotheses are more interpretable in UI.
         temperature = 0.78
         logits = {emo: score / temperature for emo, score in logits.items()}
+
+        # Neural Refiner: apply learned nonlinear refinement to logits
+        # if the PyTorch-based refiner is available and enabled.
+        _refiner = globals().get("neural_refiner")
+        if _refiner is not None and _refiner.available:
+            logits = _refiner.refine_logits(feat, logits)
+
         probs = self._softmax(logits)
         if prev_probs:
             alpha = 0.78
@@ -2379,6 +2404,16 @@ class EmotionNet:
         }
         self.last_inference_ms = result["inference_ms"]
         self.last_output = result["label"]
+
+        # Neural Refiner: online learning step — teach the network to predict
+        # the final blended emotion distribution from the raw features.
+        _refiner = globals().get("neural_refiner")
+        if _refiner is not None and _refiner.is_training:
+            try:
+                _refiner.online_learn(feat, emotion_probs)
+            except Exception:
+                pass
+
         return result
 
 
@@ -2421,6 +2456,22 @@ class RouterClassifier:
 
 
 emotion_net = EmotionNet()
+
+# Neural Refiner — PyTorch-based deep learning layer that wraps around EmotionNet
+# to refine logits using learned patterns. Falls back gracefully when PyTorch
+# is not available.
+try:
+    from neural_refiner import NeuralRefiner
+    neural_refiner = NeuralRefiner(log_fn=_revia_log)
+except ImportError:
+    neural_refiner = None
+
+# Parallel Pipeline — concurrent lane execution for Revia
+try:
+    from parallel_pipeline import ParallelPipeline
+    parallel_pipeline = ParallelPipeline(log_fn=_revia_log)
+except ImportError:
+    parallel_pipeline = None
 router_cls = RouterClassifier()
 
 
@@ -3653,6 +3704,7 @@ def _set_turn_stage(
     *,
     runtime_state=None,
     runtime_reason="",
+    force_state=False,
 ):
     request_id = str(getattr(turn, "request_id", "") or "")
     if not request_id:
@@ -3660,7 +3712,7 @@ def _set_turn_stage(
     if not turn_manager.mark_state(request_id, lifecycle_state, stage):
         return False
     if runtime_state is not None:
-        _set_runtime_state(runtime_state, runtime_reason or stage, broadcast=True)
+        _set_runtime_state(runtime_state, runtime_reason or stage, force=force_state, broadcast=True)
     else:
         _broadcast_runtime_status()
     return True
@@ -3691,12 +3743,24 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         f"| source={trigger.source} | reason={trigger.reason}"
     )
     _mark_user_activity()
+    # User-driven responses should force the state transition even if currently
+    # in Cooldown. The behavior controller already gates on trigger kind, so
+    # only legitimate user messages reach here. Without force=True, the FSM
+    # rejects Cooldown -> Thinking, leaving user messages silently dropped.
+    _is_user_driven = trigger.kind == TriggerKind.RESPONSE.value or trigger.force
+    # Clear any stale interrupt flag from a previous (e.g. autonomous) turn.
+    # The interrupt flag is only reset inside generate(), but _pipeline_interrupted()
+    # checks it before generate() is ever called — so a leftover True flag from
+    # an aborted autonomous turn silently kills every subsequent pipeline run.
+    if _is_user_driven:
+        llm_backend.clear_interrupt()
     _set_turn_stage(
         turn,
         RequestLifecycleState.THINKING,
         "request_prepare",
         runtime_state=ReviaState.THINKING,
         runtime_reason=f"{trigger.source}: {trigger.reason}",
+        force_state=_is_user_driven,
     )
 
     vision_context = str(vision_context or "").strip()
@@ -3922,6 +3986,7 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                     "llm_decode",
                     runtime_state=ReviaState.THINKING,
                     runtime_reason=f"{trigger.source}: llm decode",
+                    force_state=_is_user_driven,
                 )
                 # Apply RL-adjusted temperature before generation
                 _rl_params = rl_engine.get_params()
@@ -4451,6 +4516,8 @@ def _build_status_payload():
             "interaction_count": rl_engine.get_stats().get("interaction_count", 0),
             "average_reward": rl_engine.get_stats().get("average_reward", 0.0),
         },
+        "parallel_pipeline": parallel_pipeline.status() if parallel_pipeline else {"lanes": {}, "any_running": False},
+        "neural_refiner": neural_refiner.status() if neural_refiner else {"available": False},
     }
 
 
@@ -4537,6 +4604,40 @@ def api_interrupt():
     broadcast_json({"type": "interrupt_ack", "interrupted": True})
     _revia_log("LLM generation interrupted via /api/interrupt")
     return jsonify({"ok": True, "interrupted": True})
+
+
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """Graceful shutdown — flushes state and exits the process.
+
+    Called by the controller UI when the user clicks "Stop Server".
+    """
+    _revia_log("Shutdown requested via /api/shutdown")
+    # Save RL engine state
+    try:
+        rl_engine.save()
+    except Exception:
+        pass
+    # Save neural refiner weights
+    if neural_refiner is not None:
+        try:
+            neural_refiner.shutdown()
+        except Exception:
+            pass
+    # Save telemetry log
+    try:
+        telemetry.close()
+    except Exception:
+        pass
+    # Broadcast final status before exiting
+    broadcast_json({"type": "status_update", "state": "Shutdown", "status": _build_status_payload()})
+
+    def _do_shutdown():
+        time.sleep(0.3)  # Give the HTTP response time to be sent
+        os._exit(0)
+
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return jsonify({"ok": True, "status": "shutting_down"})
 
 
 # ---------------------------------------------------------------------------
@@ -4715,6 +4816,7 @@ def api_neural():
             "last_inference_ms": emotion_net.last_inference_ms,
             "last_output": emotion_net.last_output,
         },
+        "neural_refiner": neural_refiner.status() if neural_refiner else {"available": False},
         "router_classifier": {
             "enabled": router_cls.enabled,
             "last_inference_ms": router_cls.last_inference_ms,
@@ -5491,7 +5593,11 @@ def main():
     print()
     import atexit
     atexit.register(rl_engine.save)
-    app.run(host=REST_HOST, port=REST_PORT, debug=False, use_reloader=False)
+    if neural_refiner is not None:
+        atexit.register(neural_refiner.shutdown)
+    if parallel_pipeline is not None:
+        atexit.register(parallel_pipeline.shutdown)
+    app.run(host=REST_HOST, port=REST_PORT, debug=False, use_reloader=False, threaded=True)
 
 if __name__ == "__main__":
     main()

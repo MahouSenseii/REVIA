@@ -160,6 +160,7 @@ class ConversationStateMachine:
         },
         ReviaState.COOLDOWN: {
             ReviaState.IDLE,
+            ReviaState.THINKING,  # User-driven responses can interrupt cooldown
             ReviaState.ERROR,
         },
         ReviaState.ERROR: {
@@ -472,7 +473,14 @@ class ResponseFilter:
             )
             return ResponseFilterResult(False, fallback, "empty output", speakable=False)
 
-        if str(trigger.kind) == TriggerKind.AUTONOMOUS.value:
+        # Startup greetings are exempt from the autonomous repetition filter
+        # — they naturally repeat across sessions and that's expected behavior.
+        is_startup_greeting = (
+            str(trigger.source) == TriggerSource.STARTUP.value
+            or str(trigger.reason or "").startswith("startup")
+        )
+
+        if str(trigger.kind) == TriggerKind.AUTONOMOUS.value and not is_startup_greeting:
             cleaned = self._trim_sentences(cleaned, max_sentences=2)
             if cleaned.startswith("["):
                 self._log(

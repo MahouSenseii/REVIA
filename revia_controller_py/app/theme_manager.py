@@ -11,7 +11,7 @@ Widgets should consume the stylesheet generated here instead of owning
 hardcoded colors.
 
 API contract (matches main.py and theme_tab.py):
-    theme_mgr = ThemeManager(app)
+    theme_mgr = ThemeManager(app, event_bus=event_bus)
     theme_mgr.apply_theme(theme_mgr.current_theme)
     theme_mgr.available_themes()        -> list[ThemeDefinition]
     theme_mgr.get_theme(theme_id)       -> ThemeDefinition
@@ -301,8 +301,9 @@ class ThemeManager:
       themes are still fully usable without hand-writing QSS.
     """
 
-    def __init__(self, app, config_dir: Path | None = None):
+    def __init__(self, app, config_dir: Path | None = None, event_bus=None):
         self.app = app                       # QApplication — for setStyleSheet
+        self._event_bus = event_bus          # Optional EventBus — for ui_theme_changed
         self._current_theme: str = _DEFAULT_THEME_ID
         self._themes: dict[str, ThemeDefinition] = dict(_BUILTIN_THEMES)
         self._composer = StyleComposer()
@@ -369,9 +370,65 @@ class ThemeManager:
             self.app.setProperty("reviaThemeTokens", theme.tokens())
         except Exception:
             pass
+        # Phase 1: Clear local widget stylesheets that override the app stylesheet.
+        # Widgets with setStyleSheet() calls using hardcoded old-theme colors would
+        # otherwise survive the theme switch and appear "black" or in the old palette.
+        self._clear_local_stylesheets()
+        # Phase 2: Clear then set the application-level stylesheet so Qt drops
+        # its cached QSS parse state from the previous theme.
         self.app.setStyleSheet("")
         self.app.setStyleSheet(qss)
+        # Phase 3: Force every widget to re-polish against the new stylesheet.
         self._repolish_all_widgets()
+        # Phase 4: Notify any listeners (custom-painted widgets, etc.) that
+        # the theme changed so they can re-read tokens from the app property.
+        if self._event_bus is not None:
+            try:
+                self._event_bus.ui_theme_changed.emit(theme.ThemeId)
+            except Exception:
+                pass
+
+    def _clear_local_stylesheets(self) -> None:
+        """Clear per-widget stylesheets that hardcode old-theme colors.
+
+        Many widgets receive a local ``setStyleSheet()`` call (e.g. emotion
+        dots, volume bars, theme swatches) with hex colors from the active
+        theme.  When the theme changes, those local stylesheets survive the
+        app-level ``setStyleSheet()`` replacement, leaving the widget painted
+        in the old palette or appearing "black" because the old colors clash
+        with the new background.
+
+        This method walks all live widgets and clears any local stylesheet
+        that contains a hex color literal (#RRGGBB or #RGB). Widgets whose
+        local stylesheet contains ONLY non-color properties (e.g. "border:
+        none") are left intact.
+        """
+        import re as _re
+        _HEX_RE = _re.compile(r"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\b")
+        # Object names that are allowed to keep their local stylesheets
+        # because they are part of the theme editor UI itself.
+        _ALLOWED_OBJECT_NAMES = {"themeSwatch"}
+
+        try:
+            widgets = list(self.app.allWidgets())
+        except Exception:
+            return
+        for widget in widgets:
+            try:
+                local_qss = widget.styleSheet()
+                if not local_qss or not local_qss.strip():
+                    continue
+                obj_name = widget.objectName() or ""
+                if obj_name in _ALLOWED_OBJECT_NAMES:
+                    continue
+                # If the local stylesheet contains any hex color, it likely
+                # references the old theme and must be cleared so the
+                # application stylesheet takes over.
+                if _HEX_RE.search(local_qss):
+                    widget.setStyleSheet("")
+                    widget.update()
+            except Exception:
+                continue
 
     def _repolish_all_widgets(self) -> None:
         """Force Qt to re-polish every live widget.

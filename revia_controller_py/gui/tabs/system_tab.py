@@ -218,6 +218,20 @@ class SystemTab(QScrollArea):
         ws_row.addWidget(self.websearch_info, stretch=1)
         ng.addLayout(ws_row)
 
+        # Neural Refiner status
+        nr_row = QHBoxLayout()
+        self.refiner_label = QLabel("Neural Refiner: ---")
+        self.refiner_label.setFont(QFont("Consolas", 8))
+        nr_row.addWidget(self.refiner_label, stretch=1)
+        ng.addLayout(nr_row)
+
+        # Parallel Pipeline status
+        pp_row = QHBoxLayout()
+        self.pipeline_label = QLabel("Parallel Pipeline: ---")
+        self.pipeline_label.setFont(QFont("Consolas", 8))
+        pp_row.addWidget(self.pipeline_label, stretch=1)
+        ng.addLayout(pp_row)
+
         layout.addWidget(neural_group)
 
         # Plugins
@@ -610,6 +624,7 @@ class SystemTab(QScrollArea):
         self._core_process = None
 
     def _stop_core_server(self):
+        stopped = False
         if self._core_process and self._core_process.state() == QProcess.Running:
             self._disconnect_core()
             pid = self._core_process.processId()
@@ -619,21 +634,45 @@ class SystemTab(QScrollArea):
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=5,
                     )
+                    stopped = True
                 except Exception as e:
                     logger.debug(f"taskkill failed for {pid}, using kill(): {e}")
                     self._core_process.kill()
+                    stopped = True
             else:
                 self._core_process.kill()
+                stopped = True
             self._core_process.waitForFinished(3000)
-            self.server_status.setText("Server: Stopped")
-            clear_status_role(self.server_status)
-            self.start_server_btn.setEnabled(True)
-            self.stop_server_btn.setEnabled(False)
             self._core_process = None
         else:
-            self.server_status.setText("Server: Not running")
-            self.start_server_btn.setEnabled(True)
-            self.stop_server_btn.setEnabled(False)
+            # Server was started externally — try to kill by port
+            self._disconnect_core()
+            rest_port = self.rest_port.value()
+            killed = self._kill_port_listener(rest_port)
+            if killed:
+                stopped = True
+            else:
+                # Fallback: try the /api/shutdown endpoint
+                try:
+                    host = self.core_host.text().strip() or "127.0.0.1"
+                    r = self.client._session_post(
+                        f"http://{host}:{rest_port}/api/shutdown",
+                        json={},
+                        timeout=3,
+                    )
+                    if r.ok:
+                        stopped = True
+                except Exception:
+                    pass
+
+        if stopped:
+            self.server_status.setText("Server: Stopped")
+            clear_status_role(self.server_status)
+        else:
+            self.server_status.setText("Server: Stop failed (not found)")
+            apply_status_style(self.server_status, "color: #cc3040;")
+        self.start_server_btn.setEnabled(True)
+        self.stop_server_btn.setEnabled(False)
 
     # --- Core connection ---
 
@@ -746,6 +785,9 @@ class SystemTab(QScrollArea):
             self.core_status.setText("Status: Connected (WebSocket live)")
             apply_status_style(self.core_status, "color: #00aa40;")
             self.core_disconnect_btn.setEnabled(True)
+            # Enable stop button even for externally-started servers
+            # (the stop handler can kill by port or /api/shutdown)
+            self.stop_server_btn.setEnabled(True)
             self._refresh_plugins()
             self._refresh_neural()
         else:
@@ -888,6 +930,26 @@ class SystemTab(QScrollArea):
                     self.router_info.setText(
                         f"Inference: {rc.get('last_inference_ms', 0):.1f} ms "
                         f"| Output: {rc.get('last_output', '---')}"
+                    )
+                    nr = data.get("neural_refiner", {})
+                    if nr.get("available", False):
+                        self.refiner_label.setText(
+                            f"Neural Refiner: Active | Steps: {nr.get('step_count', 0)} "
+                            f"| Avg Loss: {nr.get('avg_loss', 0):.4f} "
+                            f"| Inference: {nr.get('last_inference_ms', 0):.1f} ms"
+                        )
+                    else:
+                        self.refiner_label.setText(
+                            "Neural Refiner: Not available (install PyTorch)"
+                        )
+                    pp = data.get("parallel_pipeline", {})
+                    lanes = pp.get("lanes", {})
+                    running = pp.get("any_running", False)
+                    lane_status = " | ".join(
+                        f"{k}: {v}" for k, v in lanes.items()
+                    ) if lanes else "idle"
+                    self.pipeline_label.setText(
+                        f"Parallel Pipeline: {'ACTIVE' if running else 'Ready'} | {lane_status}"
                     )
                 if ws_data:
                     enabled = ws_data.get("enabled", False)

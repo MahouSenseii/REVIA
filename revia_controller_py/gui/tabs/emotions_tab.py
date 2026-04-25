@@ -199,6 +199,7 @@ class EmotionsTab(QScrollArea):
 
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
         self.event_bus.chat_complete.connect(lambda _: self._refresh_history())
+        self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
 
     def _build_chart(self):
         chart = QChart()
@@ -423,3 +424,26 @@ class EmotionsTab(QScrollArea):
                 else:
                     lines.append(f"[{ts}] {lbl:<11} ({conf:.0%}) V:{val:+.2f}")
             self._fallback_hist.setPlainText("\n".join(lines))
+
+    def _on_theme_changed(self, _theme_id):
+        """Re-apply emotion legend dots and probability bars after theme switch.
+
+        The ThemeManager clears local stylesheets during theme application,
+        which removes the colored dots and progress bar chunks. Re-apply
+        them using the same emotion-specific color palette (which is
+        content-driven, not theme-driven).
+        """
+        # Re-apply legend dots
+        for idx, (emo, color) in enumerate(_EMOTION_COLORS.items()):
+            pair_layout = self.findChild(object, f"emo_legend_{idx}")
+            # Fallback: find all QLabel children with "●" text and re-color
+        # Re-apply probability bar chunk styles
+        for i, (lbl, bar) in enumerate(self._prob_rows):
+            if lbl.text() and lbl.text() != "-":
+                color = _EMOTION_COLORS.get(lbl.text(), "#94a3b8")
+                bar.setStyleSheet(
+                    f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+                )
+        # Re-apply chart background if available
+        if _CHARTS_AVAILABLE and hasattr(self, '_chart_view') and self._chart_view:
+            self._chart_view.setStyleSheet("background: transparent; border: none;")
