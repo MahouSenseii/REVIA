@@ -30,11 +30,16 @@ QGroupBox, QTextEdit, QPlainTextEdit, QListWidget, QTableWidget {{
     border-radius: 6px;
 }}
 
+QGroupBox {{
+    margin-top: 18px;
+    padding: 22px 14px 14px 14px;
+}}
+
 QGroupBox::title {{
     color: {t["SecondaryText"]};
     subcontrol-origin: margin;
-    left: 8px;
-    padding: 0 4px;
+    left: 10px;
+    padding: 0 6px;
 }}
 
 QLabel {{
@@ -127,7 +132,8 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     color: {t["PrimaryText"]};
     border: 1px solid {t["Border"]};
     border-radius: 4px;
-    padding: 5px 7px;
+    padding: 7px 10px;
+    min-height: 18px;
 }}
 
 QPushButton {{
@@ -135,7 +141,18 @@ QPushButton {{
     color: {t["PrimaryText"]};
     border: 1px solid {t["Border"]};
     border-radius: 5px;
-    padding: 6px 10px;
+    padding: 8px 14px;
+    min-height: 18px;
+}}
+
+QCheckBox {{
+    spacing: 10px;
+    padding: 3px 0;
+}}
+
+QCheckBox::indicator {{
+    width: 18px;
+    height: 18px;
 }}
 
 QPushButton:hover {{
@@ -247,14 +264,14 @@ QWidget#rightPanel QTabWidget::pane {{
 
 /* Sections within right-panel tabs get consistent card spacing */
 QWidget#rightPanel QGroupBox {{
-    margin-top: 8px;
-    padding: 10px 8px 8px 8px;
+    margin-top: 16px;
+    padding: 22px 14px 14px 14px;
 }}
 
 QWidget#rightPanel QGroupBox::title {{
-    top: -6px;
-    left: 8px;
-    padding: 0 4px;
+    top: -8px;
+    left: 10px;
+    padding: 0 6px;
 }}
 
 /* Ensure scroll areas in right panel fill available space cleanly */

@@ -214,7 +214,8 @@ class ProfileTab(QScrollArea):
         layout.addStretch()
         self.setWidget(container)
         self.event_bus.connection_changed.connect(self._on_core_connection)
-        QTimer.singleShot(1200, lambda: self._on_core_connection(True))
+        if getattr(self.client, "connected", False):
+            QTimer.singleShot(0, lambda: self._on_core_connection(True))
 
     # --- Helpers ---
 

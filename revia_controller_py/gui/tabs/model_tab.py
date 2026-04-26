@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QStackedWidget, QCheckBox,
 )
 from PySide6.QtGui import QFont
-from PySide6.QtCore import QProcess, QTimer
+from PySide6.QtCore import QProcess, QTimer, Signal
 
 from app.ui_status import apply_status_style, clear_status_role
 
@@ -22,6 +23,8 @@ _SECRET_SETTINGS_FILE = Path(__file__).resolve().parents[3] / "model_settings.lo
 
 
 class ModelTab(QScrollArea):
+    connection_test_completed = Signal(object)
+
     def __init__(self, event_bus, client, parent=None):
         super().__init__(parent)
         self.event_bus = event_bus
@@ -330,6 +333,7 @@ class ModelTab(QScrollArea):
 
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self.event_bus.telemetry_updated.connect(self._on_runtime_status)
+        self.connection_test_completed.connect(self._apply_connection_test_result)
         self._on_source_changed(0)
         self._on_provider_changed(self.api_provider.currentText())
         self._load_settings()  # restore previous session settings
@@ -414,34 +418,91 @@ class ModelTab(QScrollArea):
             self.llm_exe_path.setText(path)
             self._save_settings()
 
-    def _kill_port_listener(self, port):
+    def _find_port_holders(self, port):
         if sys.platform != "win32":
-            return
+            return {}
         try:
             out = subprocess.check_output(
-                ["netstat", "-ano"], text=True, timeout=5
+                ["netstat", "-ano"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
             )
         except Exception as e:
             logger.debug(f"Error listing port listeners: {e}")
-            return
-        for line in out.splitlines():
-            if f":{port} " not in line or "LISTEN" not in line.upper():
+            return {}
+
+        holders = {}
+        port_suffix = f":{port}"
+        for raw_line in out.splitlines():
+            line = raw_line.strip()
+            if not line:
                 continue
             parts = line.split()
-            if not parts:
+            if len(parts) < 4:
+                continue
+            proto = parts[0].upper()
+            if proto not in {"TCP", "UDP"}:
+                continue
+            local_addr = parts[1]
+            if not local_addr.endswith(port_suffix):
                 continue
             pid = parts[-1]
-            if pid.isdigit() and int(pid) != os.getpid():
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", pid],
-                        capture_output=True, timeout=5,
-                    )
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            state = parts[-2].upper() if proto == "TCP" and len(parts) >= 5 else "BOUND"
+            holders.setdefault(int(pid), set()).add(state)
+        return holders
+
+    @staticmethod
+    def _describe_port_holders(holders):
+        if not holders:
+            return "none"
+        details = []
+        for pid in sorted(holders):
+            details.append(f"PID {pid} [{', '.join(sorted(holders[pid]))}]")
+        return "; ".join(details)
+
+    def _kill_port_listener(self, port):
+        if sys.platform != "win32":
+            return
+        holders = self._find_port_holders(port)
+        if not holders:
+            return
+        self.event_bus.log_entry.emit(
+            f"[LLM] Port {port} held by {self._describe_port_holders(holders)}"
+        )
+        for pid in sorted(holders):
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
                     self.event_bus.log_entry.emit(
                         f"[LLM] Killed stale process PID {pid} on port {port}"
                     )
-                except Exception as e:
+                else:
+                    logger.debug(
+                        "taskkill for PID %s returned %s: %s",
+                        pid,
+                        result.returncode,
+                        (result.stderr or result.stdout or "").strip(),
+                    )
+            except Exception as e:
+                try:
                     logger.debug(f"Error killing process {pid}: {e}")
+                except Exception:
+                    pass
+        remaining = self._find_port_holders(port)
+        if remaining:
+            self.event_bus.log_entry.emit(
+                f"[LLM] Port {port} still occupied by "
+                f"{self._describe_port_holders(remaining)}"
+            )
 
     def _build_server_command(self, server, model_file, port, ctx, gpu_layers):
         server_l = (server or "").strip().lower()
@@ -984,22 +1045,67 @@ class ModelTab(QScrollArea):
         self.conn_status.setText("Status: Connecting...")
         apply_status_style(self.conn_status, "color: #ccaa00;")
         self.connect_btn.setEnabled(False)
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self._do_test)
+        payload = self._build_connection_test_payload()
+        threading.Thread(
+            target=self._run_connection_test,
+            args=(payload,),
+            daemon=True,
+            name="revia-model-test",
+        ).start()
 
-    def _do_test(self):
+    def _build_connection_test_payload(self):
         is_online = self.source_type.currentIndex() == 1
-
+        payload = {
+            "source": "online" if is_online else "local",
+        }
         if is_online:
-            self._test_online()
+            payload.update(
+                {
+                    "endpoint": self.api_endpoint.text().strip(),
+                    "key": self.api_key.text().strip(),
+                    "model": self.api_model.currentText().strip(),
+                    "provider": self.api_provider.currentText(),
+                }
+            )
         else:
-            self._test_local()
+            payload.update(
+                {
+                    "server": self.local_server.currentText(),
+                    "server_url": self.local_server_url.text().strip(),
+                    "path": self.local_path.text().strip(),
+                    "core_url": self.client.BASE_URL,
+                }
+            )
+        return payload
 
+    def _run_connection_test(self, payload):
+        if payload.get("source") == "online":
+            result = self._test_online(payload)
+        else:
+            result = self._test_local(payload)
+        self.connection_test_completed.emit(result)
+
+    def _apply_connection_test_result(self, result):
         self.connect_btn.setEnabled(True)
+        if not isinstance(result, dict):
+            self.conn_status.setText("Status: Connection test failed")
+            apply_status_style(self.conn_status, "color: #cc3040;")
+            self.disconnect_btn.setEnabled(False)
+            return
+        if result.get("push_config"):
+            self._push_config_to_core(
+                result.get("source", "local"),
+                verified=bool(result.get("verified")),
+            )
+        self.conn_status.setText(str(result.get("status_text", "Status: Error")))
+        apply_status_style(
+            self.conn_status,
+            str(result.get("status_style", "color: #cc3040;")),
+        )
+        self.disconnect_btn.setEnabled(bool(result.get("disconnect_enabled")))
 
     def _push_config_to_core(self, source, verified=False):
         self._save_settings()
-        import threading
         cfg = {
             "source": source,
             "temperature": self.temperature.value(),
@@ -1039,30 +1145,33 @@ class ModelTab(QScrollArea):
                 )
         threading.Thread(target=_do, daemon=True).start()
 
-    def _test_local(self):
-        server = self.local_server.currentText()
-        server_url = self.local_server_url.text().strip()
-        path = self.local_path.text().strip()
+    def _test_local(self, payload):
+        server = str(payload.get("server", "") or "")
+        server_url = str(payload.get("server_url", "") or "").strip()
+        path = str(payload.get("path", "") or "").strip()
+        core_url = str(payload.get("core_url", self.client.BASE_URL) or self.client.BASE_URL).strip()
 
         if not server_url:
-            self.conn_status.setText("Status: No server URL specified")
-            apply_status_style(self.conn_status, "color: #cc3040;")
-            return
+            return {
+                "source": "local",
+                "push_config": False,
+                "verified": False,
+                "status_text": "Status: No server URL specified",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
 
         llm_ok, models = self._probe_local_server(server_url)
         llm_detail = ", ".join(models[:3]) if models else "connected"
         if not llm_ok:
             llm_detail = "not running"
 
-        # Push config to REVIA core
-        self._push_config_to_core("local", verified=llm_ok)
-
         # Check REVIA core
         core_ok = False
         try:
             import requests
             r = requests.get(
-                f"{self.client.BASE_URL}/api/status", timeout=2
+                f"{core_url}/api/status", timeout=2
             )
             core_ok = r.ok
         except Exception as e:
@@ -1073,32 +1182,50 @@ class ModelTab(QScrollArea):
             if path and os.path.isfile(path):
                 size_mb = os.path.getsize(path) / (1024 * 1024)
                 file_info = f" | File: {size_mb:.0f} MB"
-            self.conn_status.setText(
-                f"Status: {server} OK ({llm_detail}){file_info} | "
-                f"Core: {'Online' if core_ok else 'Offline'}"
-            )
-            apply_status_style(self.conn_status, "color: #00aa40;")
-            self.disconnect_btn.setEnabled(True)
-        else:
-            self.conn_status.setText(
-                f"Status: {server} at {server_url} - {llm_detail}"
-            )
-            apply_status_style(self.conn_status, "color: #cc3040;")
+            return {
+                "source": "local",
+                "push_config": True,
+                "verified": True,
+                "status_text": (
+                    f"Status: {server} OK ({llm_detail}){file_info} | "
+                    f"Core: {'Online' if core_ok else 'Offline'}"
+                ),
+                "status_style": "color: #00aa40;",
+                "disconnect_enabled": True,
+            }
+        return {
+            "source": "local",
+            "push_config": True,
+            "verified": False,
+            "status_text": f"Status: {server} at {server_url} - {llm_detail}",
+            "status_style": "color: #cc3040;",
+            "disconnect_enabled": False,
+        }
 
-    def _test_online(self):
-        endpoint = self.api_endpoint.text().strip()
-        key = self.api_key.text().strip()
-        model = self.api_model.currentText().strip()
-        provider = self.api_provider.currentText()
+    def _test_online(self, payload):
+        endpoint = str(payload.get("endpoint", "") or "").strip()
+        key = str(payload.get("key", "") or "").strip()
+        model = str(payload.get("model", "") or "").strip()
+        provider = str(payload.get("provider", "") or "")
 
         if not endpoint:
-            self.conn_status.setText("Status: No endpoint specified")
-            apply_status_style(self.conn_status, "color: #cc3040;")
-            return
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": "Status: No endpoint specified",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
         if not key:
-            self.conn_status.setText("Status: No API key provided")
-            apply_status_style(self.conn_status, "color: #cc3040;")
-            return
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": "Status: No API key provided",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
 
         try:
             import requests
@@ -1135,34 +1262,67 @@ class ModelTab(QScrollArea):
                 )
 
             if r.ok:
-                self._push_config_to_core("online", verified=True)
-                self.conn_status.setText(
-                    f"Status: Connected to {provider} | Model: {model}"
-                )
-                apply_status_style(self.conn_status, "color: #00aa40;")
-                self.disconnect_btn.setEnabled(True)
-            elif r.status_code == 401:
-                self.conn_status.setText("Status: Invalid API key (401)")
-                apply_status_style(self.conn_status, "color: #cc3040;")
-            elif r.status_code == 403:
-                self.conn_status.setText(
-                    "Status: Access denied (403) - check key permissions"
-                )
-                apply_status_style(self.conn_status, "color: #cc3040;")
-            else:
-                self.conn_status.setText(
-                    f"Status: API returned {r.status_code}"
-                )
-                apply_status_style(self.conn_status, "color: #cc8800;")
+                return {
+                    "source": "online",
+                    "push_config": True,
+                    "verified": True,
+                    "status_text": f"Status: Connected to {provider} | Model: {model}",
+                    "status_style": "color: #00aa40;",
+                    "disconnect_enabled": True,
+                }
+            if r.status_code == 401:
+                return {
+                    "source": "online",
+                    "push_config": False,
+                    "verified": False,
+                    "status_text": "Status: Invalid API key (401)",
+                    "status_style": "color: #cc3040;",
+                    "disconnect_enabled": False,
+                }
+            if r.status_code == 403:
+                return {
+                    "source": "online",
+                    "push_config": False,
+                    "verified": False,
+                    "status_text": "Status: Access denied (403) - check key permissions",
+                    "status_style": "color: #cc3040;",
+                    "disconnect_enabled": False,
+                }
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": f"Status: API returned {r.status_code}",
+                "status_style": "color: #cc8800;",
+                "disconnect_enabled": False,
+            }
         except requests.exceptions.Timeout:
-            self.conn_status.setText("Status: Connection timed out")
-            apply_status_style(self.conn_status, "color: #cc3040;")
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": "Status: Connection timed out",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
         except requests.exceptions.ConnectionError:
-            self.conn_status.setText("Status: Cannot reach endpoint")
-            apply_status_style(self.conn_status, "color: #cc3040;")
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": "Status: Cannot reach endpoint",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
         except Exception as e:
-            self.conn_status.setText(f"Status: Error - {e}")
-            apply_status_style(self.conn_status, "color: #cc3040;")
+            return {
+                "source": "online",
+                "push_config": False,
+                "verified": False,
+                "status_text": f"Status: Error - {e}",
+                "status_style": "color: #cc3040;",
+                "disconnect_enabled": False,
+            }
 
     def _disconnect(self):
         self.conn_status.setText("Status: Not connected")

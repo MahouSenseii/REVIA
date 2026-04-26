@@ -7,7 +7,7 @@ Usage:
     (REST on :8123, WebSocket on :8124)
 """
 
-import json, time, threading, asyncio, os, subprocess, sys, math, re, hashlib
+import json, time, threading, asyncio, os, subprocess, sys, math, re, hashlib, socket
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -238,6 +238,8 @@ from runtime_models import (
 from runtime_status import RuntimeStatusManager
 from reinforcement_learner import ReinforcementLearner, RewardSignal
 from vllm_backend import VLLMEnhancer, classify_prompt_complexity
+from human_feel_layer import HumanFeelLayer
+from answer_validation import AnswerValidationSystem
 
 # ---------------------------------------------------------------------------
 # Optional Redis client for Docker-backed long-term memory
@@ -299,6 +301,27 @@ def _get_redis():
 # 2 s ping timeout) before app.run() was reached, causing the UI health-
 # check poll to time out before the REST endpoint became available.
 threading.Thread(target=_init_redis, daemon=True).start()
+
+
+def _redis_reconnect_loop():
+    """Background reconnect attempts on a slow schedule.
+
+    Runs every 60s while Redis is down so a delayed Docker/Redis start
+    eventually wins, without blocking any request handler. Sleeps quietly
+    forever once a connection is established.
+    """
+    import time as _time
+    while True:
+        _time.sleep(60.0)
+        if _get_redis() is not None:
+            continue  # already connected
+        try:
+            _init_redis()
+        except Exception:
+            pass
+
+
+threading.Thread(target=_redis_reconnect_loop, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Emotion history (in-memory ring buffer)
@@ -609,6 +632,14 @@ rl_engine.load()
 profile_engine = ProfileEngine(log_fn=_revia_log)
 
 # ---------------------------------------------------------------------------
+# Human Feel Layer + Answer Validation — wired into the live pipeline so
+# replies get prosody-aware prompts, optional thinking pauses, and a
+# background quality score that feeds back into the RL reward signal.
+# ---------------------------------------------------------------------------
+human_feel = HumanFeelLayer(profile_engine=profile_engine)
+avs_engine = AnswerValidationSystem(profile_engine=profile_engine)
+
+# ---------------------------------------------------------------------------
 # LLM Backend -- routes to local (llama.cpp server) or online API
 # ---------------------------------------------------------------------------
 
@@ -626,21 +657,11 @@ class LLMBackend:
     def __init__(self):
         self._lock = threading.Lock()          # protects attribute mutation
         self._generate_lock = threading.Lock() # serializes all LLM generations
-        # Persistent HTTP session -- reuses TCP connections for lower latency
-        self._session = requests.Session()
-        try:
-            from urllib3.util.retry import Retry as _Retry
-            _retry_strategy = _Retry(
-                total=2, backoff_factor=0.3,
-                status_forcelist=[502, 503, 504],
-            )
-        except ImportError:
-            _retry_strategy = 0  # no retries if urllib3 is unavailable
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=16, pool_maxsize=32, max_retries=_retry_strategy
-        )
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        # Persistent HTTP session -- reuses TCP connections for lower latency.
+        # Health probes use a separate no-retry session so /api/status stays fast
+        # when the local model endpoint is down.
+        self._session = self._build_http_session(retries=2)
+        self._health_session = self._build_http_session(retries=0)
         self.source = "none"
         self.local_path = ""
         self.local_backend = "CPU"
@@ -699,6 +720,27 @@ class LLMBackend:
                 "Be upbeat, engaging, and entertaining. No markdown.]"
             ),
         }
+
+    @staticmethod
+    def _build_http_session(*, retries):
+        session = requests.Session()
+        try:
+            from urllib3.util.retry import Retry as _Retry
+            retry_config = _Retry(
+                total=retries,
+                backoff_factor=0.3 if retries else 0.0,
+                status_forcelist=[502, 503, 504],
+            )
+        except ImportError:
+            retry_config = 0
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=16,
+            pool_maxsize=32,
+            max_retries=retry_config,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
     def request_interrupt(self, reason="user"):
         """Signal the LLM to stop generating tokens immediately. Thread-safe."""
@@ -868,7 +910,15 @@ class LLMBackend:
     def connection_snapshot(self):
         with self._lock:
             source = self.source
-            model_name = self.api_model or os.path.basename(self.local_path) or telemetry.system.get("model", "None")
+            if source == "local":
+                model_name = (
+                    os.path.basename(self.local_path)
+                    or telemetry.system.get("model", "None")
+                )
+            elif source == "online":
+                model_name = self.api_model or telemetry.system.get("model", "None")
+            else:
+                model_name = telemetry.system.get("model", "None")
             configured_local = bool(self.local_path or self.local_server_url)
             configured_online = bool(self.api_endpoint and self.api_key)
             state = self._connection_state
@@ -924,14 +974,43 @@ class LLMBackend:
             return bool(cached.get("ok", False))
         ok = False
         try:
-            r = self._session.get(base_url + "/models", timeout=(0.35, 0.9))
+            r = self._health_session.get(base_url + "/models", timeout=(0.2, 0.4))
             ok = bool(r.ok)
         except Exception:
             ok = False
-        self._local_health_cache = {"ok": ok, "ts": now}
+        self._local_health_cache = {"ok": ok, "ts": time.monotonic()}
         if ok:
             self._note_connection_ready(f"{self.local_server} is ready.")
         return ok
+
+    def _build_local_error_response(
+        self,
+        *,
+        detail: str,
+        error_type: str,
+        server_name: str = "",
+        endpoint: str = "",
+        retryable: bool = True,
+        metadata: dict | None = None,
+    ) -> AssistantResponse:
+        meta = dict(metadata or {})
+        if detail:
+            meta.setdefault("detail", detail)
+        if server_name:
+            meta.setdefault("server", server_name)
+        if endpoint:
+            meta.setdefault("endpoint", endpoint.replace("http://", ""))
+        return AssistantResponse(
+            text="",
+            response_mode=ResponseMode.ERROR_RESPONSE.value,
+            success=False,
+            error_type=error_type,
+            retryable=retryable,
+            speakable=False,
+            commit_to_history=False,
+            commit_to_memory=False,
+            metadata=meta,
+        )
 
     def _trim_conversation(self, conversation):
         """Trim conversation history while preserving maximum context.
@@ -1028,6 +1107,27 @@ class LLMBackend:
         if mood_baseline:
             behavior_params["mood_baseline"] = mood_baseline
 
+        # Merge RL-tuned parameters so what the bandit learns actually shapes
+        # the prompt. Without this, RL only ever moved the temperature dial.
+        try:
+            if rl_engine.enabled:
+                _rl_params = rl_engine.get_params() or {}
+                if "verbosity" in _rl_params:
+                    behavior_params["verbosity"] = _rl_params["verbosity"]
+                if "humor_frequency" in _rl_params:
+                    behavior_params["humor_tendency"] = _rl_params["humor_frequency"]
+                if "formality" in _rl_params:
+                    behavior_params["formality"] = _rl_params["formality"]
+                if "emoji_density" in _rl_params:
+                    behavior_params["emoji_density"] = _rl_params["emoji_density"]
+                if "topic_depth" in _rl_params:
+                    behavior_params["topic_depth"] = _rl_params["topic_depth"]
+        except Exception:
+            pass
+
+        # HFL prosody hints, if the pipeline staged any for this turn.
+        _prosody_hints = getattr(self, "_current_prosody_hints", None)
+
         system_text = prompt_assembly_manager.build_full_prompt_context(
             profile=_active_profile,
             runtime_context=runtime_context,
@@ -1036,6 +1136,7 @@ class LLMBackend:
             response_mode=str(response_mode or ResponseMode.NORMAL_RESPONSE.value),
             vision_context=vision_context,
             behavior_params=behavior_params,
+            hfl_prosody_hints=_prosody_hints,
         )
         messages = [{"role": "system", "content": system_text}]
 
@@ -1071,37 +1172,44 @@ class LLMBackend:
         *,
         image_b64=None,
         response_mode=ResponseMode.NORMAL_RESPONSE.value,
+        hfl_prosody_hints=None,
     ):
         with self._generate_lock:
             # Reset interrupt flag from any previous request
             self.clear_interrupt()
-            with self._lock:
-                source = self.source
-                base_conversation = list(self.conversation)
+            # Stash prosody hints so _build_messages can pick them up without
+            # threading the parameter through every internal generation path.
+            self._current_prosody_hints = hfl_prosody_hints
+            try:
+                with self._lock:
+                    source = self.source
+                    base_conversation = list(self.conversation)
 
-            pending_conversation = self._trim_conversation(
-                base_conversation + [{"role": "user", "content": text}]
-            )
+                pending_conversation = self._trim_conversation(
+                    base_conversation + [{"role": "user", "content": text}]
+                )
 
-            if not _requests_available:
+                if not _requests_available:
+                    return self._generate_stub(text)
+                if source == "online" and self.api_key:
+                    messages = self._build_messages(
+                        pending_conversation,
+                        text,
+                        response_mode,
+                        image_b64=image_b64,
+                    )
+                    return self._generate_online(messages, broadcast_fn)
+                if source == "local" and (self.local_path or self.local_server_url):
+                    return self._generate_local(
+                        pending_conversation,
+                        text,
+                        broadcast_fn,
+                        image_b64=image_b64,
+                        response_mode=response_mode,
+                    )
                 return self._generate_stub(text)
-            if source == "online" and self.api_key:
-                messages = self._build_messages(
-                    pending_conversation,
-                    text,
-                    response_mode,
-                    image_b64=image_b64,
-                )
-                return self._generate_online(messages, broadcast_fn)
-            if source == "local" and (self.local_path or self.local_server_url):
-                return self._generate_local(
-                    pending_conversation,
-                    text,
-                    broadcast_fn,
-                    image_b64=image_b64,
-                    response_mode=response_mode,
-                )
-            return self._generate_stub(text)
+            finally:
+                self._current_prosody_hints = None
 
     def generate_streaming(self, text, broadcast_fn, image_b64=None):
         response = self.generate_response(
@@ -1454,12 +1562,12 @@ class LLMBackend:
                 elif vr.success and not vr.text:
                     detail = f"vLLM returned empty ({vr.finish_reason})"
                     self._note_connection_error(detail)
-                    return AssistantResponse(
-                        text="Hmm, my local model returned an empty reply.",
-                        response_mode=ResponseMode.ERROR_RESPONSE.value,
-                        success=False, error_type="empty_response",
-                        retryable=True, speakable=False,
-                        commit_to_history=False, commit_to_memory=False,
+                    return self._build_local_error_response(
+                        detail=detail,
+                        error_type="empty_response",
+                        server_name="vLLM",
+                        endpoint=base_url,
+                        metadata={"finish_reason": vr.finish_reason or ""},
                     )
                 else:
                     # vLLM call failed -- fall through to standard path
@@ -1611,15 +1719,11 @@ class LLMBackend:
                     "so I could not complete that answer."
                 )
                 self._note_connection_error(detail)
-                return AssistantResponse(
-                    text=detail,
-                    response_mode=ResponseMode.ERROR_RESPONSE.value,
-                    success=False,
+                return self._build_local_error_response(
+                    detail=detail,
                     error_type="empty_response",
-                    retryable=True,
-                    speakable=False,
-                    commit_to_history=False,
-                    commit_to_memory=False,
+                    server_name=server_name,
+                    endpoint=base_url,
                 )
 
             self._local_health_cache = {"ok": True, "ts": time.monotonic()}
@@ -1629,15 +1733,11 @@ class LLMBackend:
             self._local_health_cache = {"ok": False, "ts": time.monotonic()}
             detail = "My local model did not respond in time, so I could not complete that answer."
             self._note_connection_error(detail)
-            return AssistantResponse(
-                text=detail,
-                response_mode=ResponseMode.ERROR_RESPONSE.value,
-                success=False,
+            return self._build_local_error_response(
+                detail=detail,
                 error_type="timeout",
-                retryable=True,
-                speakable=False,
-                commit_to_history=False,
-                commit_to_memory=False,
+                server_name=server_name,
+                endpoint=base_url,
             )
         except requests.exceptions.ConnectionError:
             self._local_health_cache = {"ok": False, "ts": time.monotonic()}
@@ -1646,16 +1746,11 @@ class LLMBackend:
                 f"My local LLM endpoint is configured at {short_url}, but it is currently unreachable."
             )
             self._note_connection_error(detail)
-            return AssistantResponse(
-                text=detail,
-                response_mode=ResponseMode.ERROR_RESPONSE.value,
-                success=False,
+            return self._build_local_error_response(
+                detail=detail,
                 error_type="connection_error",
-                retryable=True,
-                speakable=False,
-                commit_to_history=False,
-                commit_to_memory=False,
-                metadata={"endpoint": short_url, "server": server_name},
+                server_name=server_name,
+                endpoint=short_url,
             )
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
@@ -1690,15 +1785,15 @@ class LLMBackend:
             )
             self._note_connection_error(err)
             self._local_health_cache = {"ok": False, "ts": time.monotonic()}
-            return AssistantResponse(
-                text=err,
-                response_mode=ResponseMode.ERROR_RESPONSE.value,
-                success=False,
+            return self._build_local_error_response(
+                detail=err,
                 error_type="http_error",
-                retryable=True,
-                speakable=False,
-                commit_to_history=False,
-                commit_to_memory=False,
+                server_name=server_name,
+                endpoint=short_url,
+                metadata={
+                    "status": status,
+                    "vision_request": bool(image_b64),
+                },
             )
         except Exception as e:
             self._local_health_cache = {"ok": False, "ts": time.monotonic()}
@@ -1707,15 +1802,11 @@ class LLMBackend:
                 f"My local model request failed for {server_name} at {short_url}: {e}"
             )
             self._note_connection_error(err)
-            return AssistantResponse(
-                text=err,
-                response_mode=ResponseMode.ERROR_RESPONSE.value,
-                success=False,
+            return self._build_local_error_response(
+                detail=err,
                 error_type="llm_error",
-                retryable=True,
-                speakable=False,
-                commit_to_history=False,
-                commit_to_memory=False,
+                server_name=server_name,
+                endpoint=short_url,
             )
 
     def _generate_stub(self, text):
@@ -1829,7 +1920,10 @@ def _auto_load_model_settings():
     }
 
     llm_backend.configure(cfg)
-    label = cfg.get("api_model") or os.path.basename(cfg.get("local_path", "")) or "?"
+    if source == "local":
+        label = os.path.basename(cfg.get("local_path", "")) or "?"
+    else:
+        label = cfg.get("api_model") or "?"
     print(f"[REVIA Core] Auto-loaded model settings: {source} / {label}")
 
 
@@ -2719,26 +2813,37 @@ class MemoryStore:
 
     @property
     def redis_available(self):
+        """Fast-path Redis health check.
+
+        CRITICAL: this property is called from /api/status, which the UI
+        polls every 2s. We must NEVER call _init_redis() inline here — that
+        does a synchronous socket connect with 2s+2s timeouts and will hang
+        the entire status endpoint when Redis is down. Reconnection retries
+        are handled by the background thread spawned at module init plus
+        the periodic reconnect_thread below; this property only reads the
+        cached state.
+        """
         global _redis_client
         now = time.monotonic()
         if (now - self._redis_checked_ts) < self._redis_status_ttl_s:
             return self._redis_available_cache
-        # If not connected yet, try to connect now (handles Docker starting after server)
+        # Stale cache — refresh from the existing client only. Do NOT call
+        # _init_redis() here. If the client is None, return False fast.
         client = _get_redis()
-        if client is None:
-            _init_redis()
-            client = _get_redis()
         if client is None:
             self._redis_available_cache = False
             self._redis_checked_ts = now
             return False
         try:
+            # Cheap PING (1s timeout already configured on the client) to
+            # confirm the connection is still live.
             client.ping()
             self._redis_available_cache = True
             self._redis_checked_ts = now
             return True
         except Exception:
-            # Connection dropped -- reset so next check retries
+            # Connection dropped — clear the client so the background
+            # reconnect thread will rebuild it. This call returns fast.
             with _redis_lock:
                 _redis_client = None
             self._redis_available_cache = False
@@ -3730,6 +3835,90 @@ class _PipelineInterrupted(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Repeat detection — keeps Revia from going silent on user repeats and from
+# saying the exact same line back-to-back.
+# ---------------------------------------------------------------------------
+
+def _normalize_for_repeat(text: str) -> str:
+    """Lowercased, whitespace-collapsed, punctuation-stripped form for cheap
+    similarity checks. Two short greetings like 'hello' and 'hello!!' should
+    match; a substantive message with a different ending should not."""
+    import re as _re
+    cleaned = _re.sub(r"[^a-z0-9 ]+", " ", str(text or "").lower())
+    cleaned = _re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _detect_user_repeat(current_text: str, recent_messages, max_lookback: int = 6) -> int:
+    """Count how many of the user's recent messages are near-identical to the
+    current one. Returns 0 when the message is novel.
+
+    We use a simple word-Jaccard similarity instead of pulling in difflib on
+    the hot path. Works well for short greetings ('hi', 'hello', 'you there?')
+    where a tiny edit shouldn't matter, and for longer messages where the
+    bag-of-words overlap is the right signal anyway.
+    """
+    cur = _normalize_for_repeat(current_text)
+    if not cur:
+        return 0
+    cur_words = set(cur.split())
+    if not cur_words:
+        return 0
+
+    matches = 0
+    seen = 0
+    for msg in reversed(list(recent_messages or [])):
+        if seen >= max_lookback:
+            break
+        if str(msg.get("role", "")) != "user":
+            continue
+        seen += 1
+        prev = _normalize_for_repeat(msg.get("content", ""))
+        if not prev or prev == cur and seen == 1:
+            # The first reverse-iteration hit may be the message we just added
+            # for the current turn; don't count that as a repeat of itself.
+            continue
+        if prev == cur:
+            matches += 1
+            continue
+        prev_words = set(prev.split())
+        if not prev_words:
+            continue
+        overlap = len(cur_words & prev_words)
+        union = len(cur_words | prev_words)
+        if union and overlap / union >= 0.75:
+            matches += 1
+    return matches
+
+
+def _detect_assistant_self_repeat(recent_messages, lookback: int = 4) -> str:
+    """If Revia's most recent reply is highly similar to one of her earlier
+    replies in the same recent window, return that prior reply (so we can
+    quote it in the prompt and tell the LLM not to do it again). Otherwise
+    return empty string.
+    """
+    asst_msgs = [m for m in (recent_messages or []) if str(m.get("role", "")) == "assistant"]
+    if len(asst_msgs) < 2:
+        return ""
+    last = _normalize_for_repeat(asst_msgs[-1].get("content", ""))
+    if not last or len(last.split()) < 2:
+        return ""
+    last_words = set(last.split())
+    for older in reversed(asst_msgs[:-1][-lookback:]):
+        prev = _normalize_for_repeat(older.get("content", ""))
+        if not prev:
+            continue
+        prev_words = set(prev.split())
+        if not prev_words:
+            continue
+        union = len(last_words | prev_words)
+        overlap = len(last_words & prev_words)
+        if union and overlap / union >= 0.80:
+            return str(older.get("content", "")).strip()
+    return ""
+
+
 def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, turn=None):
     trigger = trigger or TriggerRequest(
         source=TriggerSource.USER_MESSAGE.value,
@@ -3836,42 +4025,113 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         """Return True if an interrupt was requested since this turn started."""
         return llm_backend._is_interrupted() or not turn_manager.is_current(turn.request_id)
 
-    _set_turn_stage(turn, RequestLifecycleState.THINKING, "emotion_analysis")
-    s = telemetry.begin_span("emotion_analysis")
+    # === Lane 1 — Perception (emotion + router run concurrently) =============
+    # Previously these were serial: emotion (~25ms) -> interrupt -> router
+    # (~10ms) -> interrupt -> memory_update. They have no data dependency
+    # between them, so we run emotion + router in parallel inside the
+    # perception lane. Memory write stays serial since it has to see the
+    # final emotion label before stamping the user message metadata.
+    _set_turn_stage(turn, RequestLifecycleState.THINKING, "perception_lane")
+    s_perception = telemetry.begin_span("perception_lane")
     with telemetry._lock:
         prev_emotion = dict(telemetry.emotion)
-    emo = emotion_net.infer(
-        text,
-        recent_messages=memory_store.get_short_term(limit=8),
-        prev_emotion=prev_emotion,
-        profile_name=memory_store._profile_name,
-        profile_state=profile,
-    )
+    recent_messages = memory_store.get_short_term(limit=8)
+
+    def _perception_run():
+        if parallel_pipeline is not None:
+            emo, route = parallel_pipeline.run_fanout(
+                [
+                    (
+                        emotion_net.infer,
+                        (text,),
+                        {
+                            "recent_messages": recent_messages,
+                            "prev_emotion": prev_emotion,
+                            "profile_name": memory_store._profile_name,
+                            "profile_state": profile,
+                        },
+                    ),
+                    (router_cls.classify, (text,), {}),
+                ]
+            )
+        else:
+            emo = emotion_net.infer(
+                text,
+                recent_messages=recent_messages,
+                prev_emotion=prev_emotion,
+                profile_name=memory_store._profile_name,
+                profile_state=profile,
+            )
+            route = router_cls.classify(text)
+        return {
+            "emotion": emo,
+            "route": route,
+        }
+
+    try:
+        if parallel_pipeline is not None:
+            _lane_result = parallel_pipeline.submit_perception(_perception_run).result()
+            if getattr(_lane_result, "data", None):
+                _perc = _lane_result.data
+            else:
+                # Lane errored — fall back to a direct call so the turn still runs.
+                _perc = _perception_run()
+        else:
+            _perc = _perception_run()
+    except Exception as _perc_exc:
+        _revia_log(f"Perception lane exception, falling back to serial: {_perc_exc}")
+        _perc = _perception_run()
+
+    emo = _perc["emotion"]
+    route = _perc["route"]
     with telemetry._lock:
         telemetry.emotion = emo
-    _record_emotion(emo)
-    telemetry.end_span(s)
-
-    # Interrupt gate: abort early if an interrupt arrived during emotion analysis
-    if _pipeline_interrupted():
-        _revia_log(f"Pipeline interrupted after emotion_analysis | request_id={turn.request_id}")
-        turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted_early")
-        _set_runtime_state(ReviaState.IDLE, "interrupted during pipeline", force=True, broadcast=True)
-        return ""
-
-    _set_turn_stage(turn, RequestLifecycleState.THINKING, "router_classify")
-    s = telemetry.begin_span("router_classify")
-    route = router_cls.classify(text)
-    with telemetry._lock:
         telemetry.router = route
-    telemetry.end_span(s)
+    _record_emotion(emo)
+    telemetry.end_span(s_perception)
 
-    # Interrupt gate: abort early if an interrupt arrived during routing
+    # Interrupt gate: abort early if an interrupt arrived during perception
     if _pipeline_interrupted():
-        _revia_log(f"Pipeline interrupted after router_classify | request_id={turn.request_id}")
+        _revia_log(f"Pipeline interrupted after perception_lane | request_id={turn.request_id}")
         turn_manager.finish_turn(turn.request_id, lifecycle_state=RequestLifecycleState.IDLE, reason="interrupted_early")
         _set_runtime_state(ReviaState.IDLE, "interrupted during pipeline", force=True, broadcast=True)
         return ""
+
+    # === Human Feel — compute prosody + maybe emit a thinking-pause sentence
+    # The pause is the cheapest way to make TTS feel less robotic: a tiny
+    # "Hmm…" or "Let me think…" plays while the LLM is still warming up,
+    # masking ~0.3-0.7s of first-token latency with something natural.
+    _emo_label = str(emo.get("label", "neutral")).lower()
+    try:
+        _prosody_hints = human_feel.compute_prosody(_emo_label).to_dict()
+    except Exception:
+        _prosody_hints = None
+
+    # Only emit thinking pauses for genuine user-driven chat turns. Skip for
+    # autonomous nudges, status replies, error responses — those need to be
+    # crisp.
+    if _is_user_driven and trigger.kind == TriggerKind.RESPONSE.value:
+        try:
+            _pause_prob = float(profile_engine.thinking_pause_probability)
+        except Exception:
+            _pause_prob = 0.20
+        if _pause_prob > 0.0:
+            import random as _hfl_rand
+            if _hfl_rand.random() < _pause_prob:
+                _pause_choices = [
+                    "Hmm…", "Let me think…", "Okay…", "Right, so…",
+                    "Let's see…", "Good question — ", "One sec —",
+                ]
+                _pause_text = _hfl_rand.choice(_pause_choices)
+                # Emit as a chat_sentence so TTS speaks it; mark with a flag so
+                # the UI can render it differently if it wants.
+                broadcast_json({
+                    "type": "chat_sentence",
+                    "sentence": _pause_text,
+                    "request_id": turn.request_id,
+                    "turn_id": turn.turn_id,
+                    "is_thinking_pause": True,
+                })
 
     _set_turn_stage(turn, RequestLifecycleState.THINKING, "memory_update")
     meta = {"emotion": emo.get("label", "")}
@@ -3943,9 +4203,43 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 )
             else:
                 llm_input = text
+
+                # Repeat-aware hinting. If the user just repeated themselves,
+                # tell the LLM to *acknowledge* (in character) instead of
+                # generating yet another stock greeting — silence is the
+                # worst outcome here. If Revia's own last reply was nearly
+                # identical to an older one, ask the LLM to vary phrasing.
+                _recent_for_repeat = memory_store.get_short_term(limit=10)
+                _user_repeat_count = _detect_user_repeat(text, _recent_for_repeat)
+                _self_repeat_prior = _detect_assistant_self_repeat(_recent_for_repeat)
+
+                _repeat_hints = []
+                if _user_repeat_count >= 1:
+                    _repeat_hints.append(
+                        "[Pipeline note: the user has just sent a near-identical "
+                        f"message ({_user_repeat_count} prior repeat"
+                        f"{'s' if _user_repeat_count > 1 else ''} in their recent "
+                        "turns). Do NOT stay silent and do NOT echo your previous "
+                        "reply word-for-word. Acknowledge them in character — they "
+                        "may think you didn't hear them. Short, natural beats like "
+                        "'I'm here', 'yeah, hi again', 'I heard you the first time' "
+                        "are appropriate; pick one that fits your persona and the "
+                        "current emotion. Stay grounded — don't ramble.]"
+                    )
+                if _self_repeat_prior:
+                    _quote = _self_repeat_prior[:160].replace("\n", " ")
+                    _repeat_hints.append(
+                        f"[Pipeline note: your last reply was very close to an "
+                        f"earlier reply you already gave ({_quote!r}). Vary your "
+                        "phrasing this turn — different opener, different angle, "
+                        "different verbs. Do not paraphrase that prior reply.]"
+                    )
+                if _repeat_hints:
+                    llm_input = "\n".join(_repeat_hints) + "\n\n" + llm_input
+
                 if vision_context:
                     llm_input = (
-                        f"{text}\n\n"
+                        f"{llm_input}\n\n"
                         f"[Live vision context]\n{vision_context}\n"
                         "Use this visual context when relevant, especially when the user asks what you can see."
                     )
@@ -4001,17 +4295,67 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 if _rl_temp is not None and rl_engine.enabled:
                     llm_backend.temperature = _rl_temp
 
-                _revia_log(f"Model call started | request_id={turn.request_id} | source={trigger.source} | rl_temp={llm_backend.temperature:.3f}")
+                # Bound max_tokens to a verbosity-aware budget so a slow local
+                # model (e.g. 7B-Q5 at ~5-10 tok/s) can't spend 80s generating
+                # a single overlong reply. Without this cap, the model runs
+                # the clock to max_tokens (often 256+) on every turn and the
+                # turn watchdog (100s) eventually trips. Mapping:
+                #   verbosity < 0.30  -> 90  tokens (~ <40 words, 9-18s)
+                #   verbosity < 0.50  -> 140 tokens (~  60 words, 14-28s)
+                #   verbosity < 0.70  -> 200 tokens (~ 100 words, 20-40s)
+                #   verbosity >= 0.70 -> 320 tokens (~ 160 words, 32-64s)
+                _rl_verb = _rl_params.get("verbosity")
+                _original_max_tokens = llm_backend.max_tokens
+                try:
+                    _verb_f = float(_rl_verb) if _rl_verb is not None else 0.55
+                except (TypeError, ValueError):
+                    _verb_f = 0.55
+                if _verb_f < 0.30:
+                    _budget = 90
+                elif _verb_f < 0.50:
+                    _budget = 140
+                elif _verb_f < 0.70:
+                    _budget = 200
+                else:
+                    _budget = 320
+                llm_backend.max_tokens = min(int(_original_max_tokens or _budget), _budget)
+
+                _revia_log(f"Model call started | request_id={turn.request_id} | source={trigger.source} | rl_temp={llm_backend.temperature:.3f} | tok_budget={llm_backend.max_tokens}")
                 s = telemetry.begin_span("llm_decode", device=_device)
-                response = llm_backend.generate_response(
-                    llm_input,
-                    _pipeline_broadcast,
-                    image_b64=image_b64,
-                    response_mode=ResponseMode.NORMAL_RESPONSE.value,
-                )
+
+                # === Lane 2 — Cognition (LLM generation) =====================
+                # Wrapping the call in submit_cognition lights up the lane
+                # indicator and makes the parallel-pipeline status panel
+                # actually reflect what's happening. Generation itself is
+                # still synchronous from the pipeline's POV — streaming
+                # tokens already flow out via _pipeline_broadcast as the
+                # LLM produces them, so nothing is blocked unnecessarily.
+                def _cognition_run():
+                    return {
+                        "response": llm_backend.generate_response(
+                            llm_input,
+                            _pipeline_broadcast,
+                            image_b64=image_b64,
+                            response_mode=ResponseMode.NORMAL_RESPONSE.value,
+                            hfl_prosody_hints=_prosody_hints,
+                        )
+                    }
+                if parallel_pipeline is not None:
+                    try:
+                        _cog_lane = parallel_pipeline.submit_cognition(_cognition_run).result()
+                        response = _cog_lane.data.get("response") if getattr(_cog_lane, "data", None) else None
+                        if response is None:
+                            # Lane errored — fall back to direct call.
+                            response = _cognition_run()["response"]
+                    except Exception as _cog_exc:
+                        _revia_log(f"Cognition lane exception, falling back to direct: {_cog_exc}")
+                        response = _cognition_run()["response"]
+                else:
+                    response = _cognition_run()["response"]
                 telemetry.end_span(s)
-                # Restore original temperature
+                # Restore original temperature + max_tokens
                 llm_backend.temperature = _original_temp
+                llm_backend.max_tokens = _original_max_tokens
                 _revia_log(
                     f"Model call completed | request_id={turn.request_id} | success={response.success} "
                     f"| mode={response.response_mode} | error_type={response.error_type or 'none'}"
@@ -4167,35 +4511,90 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     if conversation_manager.current_state == ReviaState.IDLE.value:
         _broadcast_runtime_status()
 
-    # Reinforcement Learning: record reward signal for this interaction
-    try:
-        _avs_composite = conversation_manager.state_machine.answer_confidence_last
-        _loop_risk = conversation_manager.state_machine.loop_risk_score
-        _was_interrupted = str(response.error_type or "") == "interrupted"
-        _was_corrected = bool(
-            route and route.get("suggested_tool") == "correction"
-        ) if 'route' in dir() else False
-        _rl_signal = RewardSignal(
-            avs_composite=_avs_composite,
-            user_msg_length=len(text.split()),
-            user_followed_up=False,  # updated retroactively on next message
-            emotion_delta=0.0,       # computed below if possible
-            was_interrupted=_was_interrupted,
-            loop_detected=_loop_risk > 0.6,
-            was_corrected=_was_corrected,
-            context_emotion=emo.get("label", "neutral"),
-            context_topic=route.get("primary_route", "general") if route else "general",
+    # === Lane 3 — Expression (post-output: AVS scoring + RL reward) =========
+    # Both run in the background so the main pipeline returns immediately
+    # after delivery. AVS scoring takes ~5-15ms; on the critical path that
+    # delays the next user message accepting, off the path it's free.
+    #
+    # AVS is now a *real* quality score (intent coverage, factual coherence,
+    # emotional alignment, novelty, length, entertainment) instead of the
+    # FSM's answer_confidence_last heuristic. It feeds RL so the bandit
+    # actually learns from output quality rather than from runtime state.
+    _captured_response = response
+    _captured_route = route if 'route' in dir() else None
+    _captured_text = text
+    _captured_emo = emo
+    _captured_prev_emo = prev_emotion
+    _captured_request_id = turn.request_id
+
+    def _expression_finalize():
+        avs_composite = float(
+            getattr(conversation_manager.state_machine, "answer_confidence_last", 0.5) or 0.5
         )
-        # Compute emotion delta from prev_emotion
         try:
-            _prev_valence = float(prev_emotion.get("valence", 0.0))
-            _cur_valence = float(emo.get("valence", 0.0))
-            _rl_signal.emotion_delta = _cur_valence - _prev_valence
-        except (ValueError, TypeError):
-            pass
-        rl_engine.record_reward(_rl_signal)
-    except Exception as _rl_exc:
-        _revia_log(f"[RL] Reward recording failed (non-fatal): {_rl_exc}")
+            if _captured_response.text and _captured_response.success and avs_engine is not None:
+                _recent = [
+                    m.get("content", "")
+                    for m in memory_store.get_short_term(limit=8)
+                    if m.get("role") == "assistant"
+                ]
+                _avs_result = avs_engine.validate(
+                    reply=_captured_response.text,
+                    user_utterance=_captured_text,
+                    emotion_label=str(_captured_emo.get("label", "neutral")),
+                    recent_replies=_recent,
+                )
+                avs_composite = float(_avs_result.scores.composite)
+                # Surface the real quality score in telemetry so UI shows it.
+                try:
+                    conversation_manager.state_machine.answer_confidence_last = avs_composite
+                except Exception:
+                    pass
+        except Exception as _avs_exc:
+            _revia_log(f"[AVS] Background scoring failed (non-fatal): {_avs_exc}")
+
+        try:
+            _loop_risk = float(
+                getattr(conversation_manager.state_machine, "loop_risk_score", 0.0) or 0.0
+            )
+            _was_interrupted = str(_captured_response.error_type or "") == "interrupted"
+            _was_corrected = bool(
+                _captured_route and _captured_route.get("suggested_tool") == "correction"
+            )
+            _rl_signal = RewardSignal(
+                avs_composite=avs_composite,
+                user_msg_length=len(_captured_text.split()),
+                user_followed_up=False,  # updated retroactively on next message
+                emotion_delta=0.0,
+                was_interrupted=_was_interrupted,
+                loop_detected=_loop_risk > 0.6,
+                was_corrected=_was_corrected,
+                context_emotion=str(_captured_emo.get("label", "neutral")),
+                context_topic=(
+                    _captured_route.get("primary_route", "general")
+                    if _captured_route else "general"
+                ),
+            )
+            try:
+                _prev_v = float(_captured_prev_emo.get("valence", 0.0))
+                _cur_v = float(_captured_emo.get("valence", 0.0))
+                _rl_signal.emotion_delta = _cur_v - _prev_v
+            except (ValueError, TypeError):
+                pass
+            rl_engine.record_reward(_rl_signal)
+        except Exception as _rl_exc:
+            _revia_log(f"[RL] Reward recording failed (non-fatal): {_rl_exc}")
+
+        return {"avs_composite": avs_composite}
+
+    if parallel_pipeline is not None:
+        try:
+            parallel_pipeline.submit_expression(_expression_finalize)
+        except Exception as _exp_exc:
+            _revia_log(f"Expression lane submit failed, running inline: {_exp_exc}")
+            _expression_finalize()
+    else:
+        _expression_finalize()
 
     return response.text
 
@@ -4265,7 +4664,9 @@ def process_pipeline_integration(text: str) -> str:
     else:
         platform = None
 
-    memory_store.add_short_term("user", text, {"platform": platform or "unknown"})
+    use_shared_memory = platform is None
+    if use_shared_memory:
+        memory_store.add_short_term("user", text, {"platform": platform or "unknown"})
 
     try:
         if platform:
@@ -4275,12 +4676,20 @@ def process_pipeline_integration(text: str) -> str:
     except Exception as exc:
         full_text = f"[Error: {exc}]"
 
-    memory_store.add_short_term("assistant", full_text, {"platform": platform or "unknown"})
+    if use_shared_memory:
+        memory_store.add_short_term(
+            "assistant",
+            full_text,
+            {"platform": platform or "unknown"},
+        )
+        with memory_store._lock:
+            message_count = len(memory_store.short_term)
+    else:
+        with llm_backend._lock:
+            message_count = len(llm_backend._platform_conversations.get(platform, []))
 
     # Auto-save summary every 20 messages (same policy as main pipeline)
-    with memory_store._lock:
-        _st_len = len(memory_store.short_term)
-    if _st_len > 0 and _st_len % 20 == 0:
+    if message_count > 0 and message_count % 20 == 0:
         summary = (
             f"Platform exchange ({platform or 'unknown'}): "
             f"User said '{text[:100]}', Assistant replied '{full_text[:100]}'"
@@ -4703,11 +5112,13 @@ def api_chat():
         conversation_manager.current_state,
     )
     if not decision.allowed:
+        fallback_text = _get_error_fallback_text(profile)
         return jsonify({
             "error": "conversation_not_ready",
             "decision": decision.to_dict(),
             "conversation_readiness": readiness.to_dict(),
             "state": conversation_manager.current_state,
+            "fallback_text": fallback_text,
         }), 503
     requested_mode = (
         ResponseMode.SYSTEM_STATUS_RESPONSE.value
@@ -5375,16 +5786,38 @@ REST_HOST = os.environ.get("REVIA_REST_HOST", os.environ.get("REVIA_HOST", "127.
 WS_HOST = os.environ.get("REVIA_WS_HOST", os.environ.get("REVIA_HOST", "127.0.0.1"))
 REST_PORT = _env_port("REVIA_REST_PORT", 8123)
 WS_PORT = _env_port("REVIA_WS_PORT", 8124)
+_ws_start_event = threading.Event()
+_ws_start_error = ""
+
+
+def _assert_tcp_port_available(host: str, port: int, label: str) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"{label} port {host}:{port} is unavailable: {exc}"
+        ) from exc
+    finally:
+        sock.close()
 
 async def start_ws_server():
-    global ws_loop
+    global ws_loop, _ws_start_error
     ws_loop = asyncio.get_event_loop()
     async with websockets.server.serve(ws_handler, WS_HOST, WS_PORT):
+        _ws_start_error = ""
+        _ws_start_event.set()
         print(f"[REVIA Core] WebSocket server on ws://{WS_HOST}:{WS_PORT}")
         await asyncio.Future()
 
 def run_ws():
-    asyncio.run(start_ws_server())
+    global _ws_start_error
+    try:
+        asyncio.run(start_ws_server())
+    except Exception as exc:
+        _ws_start_error = f"{type(exc).__name__}: {exc}"
+        _ws_start_event.set()
+        print(f"[REVIA Core] WebSocket startup failed: {_ws_start_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -5573,14 +6006,25 @@ turn_watchdog = TurnWatchdog(
 
 
 def main():
+    global _ws_start_error
     print("=" * 50)
     print("  REVIA Core (Python)  v1.2.0")
     print("=" * 50)
     conversation_manager.mark_initializing("Starting core services")
     telemetry.state = conversation_manager.current_state
+    _assert_tcp_port_available(REST_HOST, REST_PORT, "REST")
+    _assert_tcp_port_available(WS_HOST, WS_PORT, "WebSocket")
+    _ws_start_error = ""
+    _ws_start_event.clear()
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
-    time.sleep(0.3)
+    if not _ws_start_event.wait(3.0):
+        raise RuntimeError(
+            f"WebSocket server did not report ready within 3.0s on "
+            f"ws://{WS_HOST}:{WS_PORT}"
+        )
+    if _ws_start_error:
+        raise RuntimeError(_ws_start_error)
 
     # Watchdog: force-stops any turn stuck in THINKING/GENERATING > timeout.
     # Without this, a hung LLM call pins conversation_manager.current_state

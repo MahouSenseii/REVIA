@@ -67,6 +67,25 @@ class TestPersonaPipeline(unittest.TestCase):
         self.assertAlmostEqual(profile["behavior"]["verbosity"], 0.85)
         self.assertAlmostEqual(profile["emotion"]["emotion_intensity"], 0.30)
 
+    def test_diana_inspired_preset_carries_examples_into_context(self):
+        manager = CharacterProfileManager(log_fn=lambda _msg: None)
+        profile = normalize_profile(
+            {
+                "persona_preset": "diana_inspired",
+                "character_name": "Revia",
+            }
+        )
+
+        self.assertEqual(profile["persona_definition"]["preset"], "diana_inspired")
+        modules = profile["persona_definition"]["modules"]
+        self.assertTrue(any(m.get("name") == "technical examples" for m in modules))
+
+        context = manager.build_character_context(profile)
+        self.assertIn("my service starts then dies", context)
+        self.assertIn("I'm fried. I can't think anymore.", context)
+        self.assertIn("close field partner", context)
+        self.assertIn("You do not need confidence right now. You need order.", context)
+
 
 if __name__ == "__main__":
     unittest.main()

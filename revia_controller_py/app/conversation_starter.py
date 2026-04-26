@@ -17,6 +17,8 @@ class ConversationStarter(QObject):
         self._startup_delay_ms = 4000
         self._startup_scheduled = False
         self._startup_sent = False
+        self._startup_cancelled_by_user = False
+        self._startup_token = 0
 
         self._timer = QTimer(self)
         self._timer.setInterval(interval_ms)
@@ -48,6 +50,10 @@ class ConversationStarter(QObject):
 
     def record_user_activity(self):
         self._last_activity = time.monotonic()
+        if not self._startup_sent:
+            self._startup_cancelled_by_user = True
+            self._startup_scheduled = False
+            self._startup_token += 1
 
     def greet_on_startup(self, delay_ms=4_000):
         self._startup_delay_ms = int(delay_ms)
@@ -70,13 +76,20 @@ class ConversationStarter(QObject):
         self._maybe_schedule_startup(data)
 
     def _maybe_schedule_startup(self, data=None):
-        if not self._enabled or self._startup_sent or self._startup_scheduled:
+        if (
+            not self._enabled
+            or self._startup_sent
+            or self._startup_scheduled
+            or self._startup_cancelled_by_user
+        ):
             return
         snapshot = data if isinstance(data, dict) else self._client.get_status_snapshot()
         readiness = (snapshot.get("conversation_readiness", {}) or {})
         if not readiness.get("can_auto_initiate", False):
             return
         self._startup_scheduled = True
+        self._startup_token += 1
+        token = self._startup_token
         self._event_bus.log_entry.emit("[Revia] Startup autonomous line armed.")
         QTimer.singleShot(
             self._startup_delay_ms,
@@ -85,12 +98,20 @@ class ConversationStarter(QObject):
                 reason="startup warmup complete",
                 force=False,
                 startup=True,
+                startup_token=token,
             ),
         )
 
-    def _trigger(self, source, reason, force=False, startup=False):
+    def _trigger(self, source, reason, force=False, startup=False, startup_token=None):
         if not self._enabled:
             return
+        if startup:
+            if self._startup_cancelled_by_user:
+                self._startup_scheduled = False
+                return
+            if startup_token is not None and startup_token != self._startup_token:
+                self._startup_scheduled = False
+                return
         decision = self._behavior.should_initiate_conversation(
             source=source,
             reason=reason,

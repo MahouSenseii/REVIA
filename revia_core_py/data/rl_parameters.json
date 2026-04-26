@@ -1,0 +1,56 @@
+{
+  "interaction_count": 12,
+  "cumulative_reward": 1.3565,
+  "last_reward": 0.1017,
+  "saved_at": "2026-04-26T15:01:43",
+  "parameters": {
+    "temperature": {
+      "value": 0.797734,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "verbosity": {
+      "value": 0.552266,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "humor_frequency": {
+      "value": 0.302266,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "formality": {
+      "value": 0.397384,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "emoji_density": {
+      "value": 0.047582,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "proactivity": {
+      "value": 0.502616,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "interrupt_sensitivity": {
+      "value": 0.547734,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    },
+    "topic_depth": {
+      "value": 0.602418,
+      "mu": 0.411764,
+      "sigma": 0.13271,
+      "n": 3
+    }
+  }
+}

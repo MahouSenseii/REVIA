@@ -279,8 +279,7 @@ class ControllerClient(QObject):
     def _on_ws_disconnected(self):
         self.ws_connected = False
         self.ws_connection_timer.stop()
-        if not self.rest_reachable:
-            self._set_core_reachability(False)
+        self._set_core_reachability(False)
 
     def _on_ws_error(self, error):
         _log.debug("[ControllerClient] WebSocket error: %s", error)
@@ -413,9 +412,10 @@ class ControllerClient(QObject):
         if data:
             self.rest_reachable = True
             self._last_status = data
-            self._set_core_reachability(True)
             if not self.ws_connected:
                 self._try_connect()
+            else:
+                self._set_core_reachability(True)
             state = data.get("state", "")
             if state:
                 self.event_bus.status_changed.emit(state)
@@ -484,7 +484,9 @@ class ControllerClient(QObject):
                     detail = (
                         data.get("decision", {}) or {}
                     ).get("reason") or (reasons[0] if reasons else f"HTTP {r.status_code}")
-                    message = f"Conversation unavailable right now: {detail}"
+                    message = str(data.get("fallback_text") or "").strip()
+                    if not message:
+                        message = f"Conversation unavailable right now: {detail}"
                     payload = {
                         "text": message,
                         "request_id": "",

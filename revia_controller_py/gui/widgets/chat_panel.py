@@ -74,6 +74,7 @@ class ChatPanel(QFrame):
         self._pending_request_id = ""
         self._current_request_id = ""
         self._last_completed_text = ""
+        self._ignored_request_ids = []
         self._tts_session_interrupted = False
         self._server_sentence_streaming = False  # Set True when chat_sentence events arrive
         # Each item: (text, image_b64, vision_context, stack_index, stack_total, source)
@@ -566,12 +567,25 @@ class ChatPanel(QFrame):
         self._pending_request_id = str(payload.get("request_id", "") or "")
         self._begin_activity_request()
 
+    def _remember_ignored_request(self, request_id):
+        rid = str(request_id or "").strip()
+        if not rid or rid in self._ignored_request_ids:
+            return
+        self._ignored_request_ids.append(rid)
+        if len(self._ignored_request_ids) > 32:
+            del self._ignored_request_ids[:-32]
+
     def _on_token_payload(self, payload):
         if not isinstance(payload, dict):
             return
         token = str(payload.get("token", "") or "")
         request_id = str(payload.get("request_id", "") or "")
         if not token:
+            return
+        if request_id and request_id in self._ignored_request_ids:
+            self.event_bus.log_entry.emit(
+                f"[Revia] Ignored token payload for canceled request {request_id}"
+            )
             return
         if self._current_request_id and request_id and request_id != self._current_request_id:
             self.event_bus.log_entry.emit(
@@ -867,9 +881,6 @@ class ChatPanel(QFrame):
     def _on_complete_payload(self, payload):
         if not isinstance(payload, dict):
             return
-        # Always disarm the thinking watchdog first — the response arrived, so
-        # the timeout must not fire regardless of which code path follows.
-        self._thinking_watchdog.stop()
         text = str(payload.get("text", "") or "")
         request_id = str(payload.get("request_id", "") or "")
         speakable = bool(payload.get("speakable", True))
@@ -877,6 +888,11 @@ class ChatPanel(QFrame):
         success = bool(payload.get("success", True))
         error_type = str(payload.get("error_type", "") or "")
         metadata = payload.get("metadata", {}) or {}
+        if request_id and request_id in self._ignored_request_ids:
+            self.event_bus.log_entry.emit(
+                f"[Revia] Ignored completion payload for canceled request {request_id}"
+            )
+            return
         if self._current_request_id and request_id and request_id != self._current_request_id:
             self.event_bus.log_entry.emit(
                 f"[Revia] Ignored stale completion payload for request {request_id}"
@@ -890,6 +906,9 @@ class ChatPanel(QFrame):
         if request_id and not self._current_request_id:
             self._current_request_id = request_id
 
+        # This completion belongs to the active request, so the watchdog can
+        # be safely disarmed now.
+        self._thinking_watchdog.stop()
         self._finish_activity_request()
         # Always clear any lingering inline status block before rendering output
         self._clear_inline_status()
@@ -1247,11 +1266,17 @@ class ChatPanel(QFrame):
         if not self._awaiting_reply:
             return  # Already resolved — nothing to do
         logger.warning("[ChatPanel] Thinking watchdog fired — no response after timeout, clearing state")
+        self._remember_ignored_request(self._current_request_id)
+        self._remember_ignored_request(self._pending_request_id)
+        try:
+            self.client.send_interrupt()
+        except Exception as exc:
+            logger.warning("[ChatPanel] Failed to interrupt timed-out request: %s", exc)
         self._clear_inline_status()
         self._append_system_note("Response timed out — backend took too long. Try again.")
         self._finish_activity_request()
         self._clear_reply_tracking()
-        self._schedule_next_queued_request(delay_ms=500)
+        self._schedule_next_queued_request(delay_ms=900)
 
     def _schedule_next_queued_request(self, delay_ms=900):
         if not self._outbound_queue:

@@ -84,7 +84,9 @@ class CharacterProfileManager:
             module_name = str(module.get("name", "")).strip().lower()
             if module_name in {"identity", "style", "collaboration"}:
                 continue
-            module_text = self._sanitize_profile_field(module.get("content", ""), 800)
+            # Persona exemplars can be multi-turn and lose their value if we clip
+            # them too aggressively.
+            module_text = self._sanitize_profile_field(module.get("content", ""), 2200)
             if module_text:
                 extra_modules.append((module_name, module_text))
 
@@ -376,6 +378,33 @@ class PromptAssemblyManager:
         sarcasm = bp.get("sarcasm_ceiling", None)
         if sarcasm is not None and _safe_float(sarcasm, 0.0) > 0.15:
             lines.append("Sarcasm is okay in moderation when context calls for it.")
+
+        # Formality register (RL-tunable)
+        formality = bp.get("formality", None)
+        if formality is not None:
+            f = _safe_float(formality, 0.4)
+            if f < 0.30:
+                lines.append("Tone register: casual, conversational — like talking to a friend.")
+            elif f > 0.65:
+                lines.append("Tone register: more formal — measured language, polite phrasing.")
+
+        # Emoji density (RL-tunable)
+        emoji = bp.get("emoji_density", None)
+        if emoji is not None:
+            e = _safe_float(emoji, 0.0)
+            if e > 0.20:
+                lines.append("Emojis: occasional emojis are fine when they add warmth (1-2 per reply max).")
+            else:
+                lines.append("Emojis: avoid emojis in text replies.")
+
+        # Topic depth (RL-tunable) — how surface-level vs. deep to engage
+        depth = bp.get("topic_depth", None)
+        if depth is not None:
+            d = _safe_float(depth, 0.5)
+            if d > 0.65:
+                lines.append("Engagement depth: explore topics with substance — go a layer deeper than surface chat.")
+            elif d < 0.30:
+                lines.append("Engagement depth: keep replies conversational and surface-level rather than deep-dive.")
 
         # Speech quirks and catchphrases
         quirks = prof.get("speech_quirks", [])

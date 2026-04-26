@@ -363,31 +363,129 @@ class SystemTab(QScrollArea):
                 return str(candidate)
         return sys.executable
 
-    def _kill_port_holder(self, port):
-        """Kill any process already listening on this port (Windows).
-        Returns True if anything was killed."""
+    def _find_port_holders(self, port):
+        """Return {pid: {states}} for any process using local `port`. Windows-only."""
         if sys.platform != "win32":
-            return False
-        killed = False
+            return {}
         try:
             out = subprocess.check_output(
-                ["netstat", "-ano"], text=True, timeout=5
+                ["netstat", "-ano"],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
             )
-            for line in out.splitlines():
-                if f":{port} " in line and "LISTEN" in line:
-                    parts = line.split()
-                    pid = parts[-1]
-                    if pid.isdigit() and int(pid) != os.getpid():
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", pid],
-                            capture_output=True, timeout=5,
-                        )
+        except Exception as e:
+            self.event_bus.log_entry.emit(
+                f"[Core] netstat lookup failed: {type(e).__name__}: {e}"
+            )
+            return {}
+
+        holders = {}
+        port_suffix = f":{port}"
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            proto = parts[0].upper()
+            if proto not in {"TCP", "UDP"}:
+                continue
+            local_addr = parts[1]
+            if not local_addr.endswith(port_suffix):
+                continue
+            pid_str = parts[-1]
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == os.getpid():
+                continue
+            state = parts[-2].upper() if proto == "TCP" and len(parts) >= 5 else "BOUND"
+            holders.setdefault(pid, set()).add(state)
+        return holders
+
+    @staticmethod
+    def _describe_port_holders(holders):
+        if not holders:
+            return "none"
+        details = []
+        for pid in sorted(holders):
+            states = ", ".join(sorted(holders[pid]))
+            details.append(f"PID {pid} [{states}]")
+        return "; ".join(details)
+
+    def _find_port_listener_pids(self, port):
+        holders = self._find_port_holders(port)
+        listeners = set()
+        for pid, states in holders.items():
+            if "LISTENING" in states or "BOUND" in states:
+                listeners.add(pid)
+        return listeners
+
+    def _kill_port_holder(self, port):
+        """Kill any process using this port and verify the port released.
+
+        Surfaces every failure to the Logs tab so the user can see exactly why
+        a previous attempt left a zombie behind. Retries up to 3 times with a
+        short wait between each — Windows occasionally needs a second pass to
+        actually let go of the socket.
+        """
+        if sys.platform != "win32":
+            return False
+
+        import time as _time
+        killed = False
+        for attempt in range(1, 4):
+            holders = self._find_port_holders(port)
+            if not holders:
+                if killed:
+                    self.event_bus.log_entry.emit(
+                        f"[Core] Port {port} confirmed free after {attempt - 1} kill(s)"
+                    )
+                return killed
+            self.event_bus.log_entry.emit(
+                f"[Core] Port {port} held by {self._describe_port_holders(holders)} "
+                f"(cleanup pass {attempt}/3)"
+            )
+
+            for pid in sorted(holders):
+                try:
+                    result = subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0:
                         self.event_bus.log_entry.emit(
-                            f"[Core] Killed stale process PID {pid} on port {port}"
+                            f"[Core] Killed PID {pid} on port {port} (attempt {attempt})"
                         )
                         killed = True
-        except Exception as e:
-            logger.warning(f"Error killing port listener: {e}")
+                    else:
+                        err = (result.stderr or result.stdout or "").strip()
+                        self.event_bus.log_entry.emit(
+                            f"[Core] taskkill PID {pid} returned {result.returncode}: {err}"
+                        )
+                except Exception as e:
+                    self.event_bus.log_entry.emit(
+                        f"[Core] taskkill PID {pid} failed: {type(e).__name__}: {e}"
+                    )
+
+            # Give the OS a moment to release the listening socket before re-checking.
+            _time.sleep(0.6)
+
+        # Fell through all attempts — port still held.
+        final_holders = self._find_port_holders(port)
+        if not final_holders:
+            if killed:
+                self.event_bus.log_entry.emit(
+                    f"[Core] Port {port} confirmed free after 3 kill(s)"
+                )
+            return killed
+        self.event_bus.log_entry.emit(
+            f"[Core] Port {port} STILL held by {self._describe_port_holders(final_holders)} "
+            "after 3 kill attempts. Manual cleanup required."
+        )
         return killed
 
     def _start_core_server(self):
@@ -448,9 +546,13 @@ class SystemTab(QScrollArea):
     ):
         """Continue _start_core_server on the main thread after the pre-flight check."""
         if already_running:
+            rest_listener_pids = self._find_port_listener_pids(rest)
+            ws_listener_pids = self._find_port_listener_pids(ws)
+            shared_listener = bool(rest_listener_pids & ws_listener_pids)
+
             # If the running core is legacy (no architecture telemetry),
             # replace it so monitor + module status stay accurate.
-            if running_has_arch:
+            if running_has_arch and shared_listener:
                 self.server_status.setText(
                     "Server: Already running externally - connecting..."
                 )
@@ -463,12 +565,23 @@ class SystemTab(QScrollArea):
                 self._connect_core()
                 return
 
-            self.server_status.setText("Server: Legacy core detected - upgrading...")
-            apply_status_style(self.server_status, "color: #ccaa00;")
-            self.event_bus.log_entry.emit(
-                f"[Core] Existing server on port {rest} is legacy "
-                f"(v{running_version or '?'}). Replacing with current core."
-            )
+            if running_has_arch:
+                self.server_status.setText("Server: Existing core is degraded - restarting...")
+                apply_status_style(self.server_status, "color: #ccaa00;")
+                rest_detail = self._describe_port_holders(self._find_port_holders(rest))
+                ws_detail = self._describe_port_holders(self._find_port_holders(ws))
+                self.event_bus.log_entry.emit(
+                    f"[Core] Existing server on port {rest} answered REST but is not "
+                    f"healthy enough to reuse. REST listeners: {rest_detail}; "
+                    f"WS listeners: {ws_detail}. Replacing with current core."
+                )
+            else:
+                self.server_status.setText("Server: Legacy core detected - upgrading...")
+                apply_status_style(self.server_status, "color: #ccaa00;")
+                self.event_bus.log_entry.emit(
+                    f"[Core] Existing server on port {rest} is legacy "
+                    f"(v{running_version or '?'}). Replacing with current core."
+                )
 
         # Kill anything already on these ports that isn't responding.
         killed = self._kill_port_holder(rest)
@@ -482,6 +595,25 @@ class SystemTab(QScrollArea):
             # immediately after a taskkill, causing a silent crash → timeout.
             import time as _time
             _time.sleep(1.0)
+
+        rest_holders = self._find_port_holders(rest)
+        ws_holders = self._find_port_holders(ws)
+        if rest_holders or ws_holders:
+            if rest_holders:
+                self.event_bus.log_entry.emit(
+                    f"[Core] REST port {rest} still occupied by "
+                    f"{self._describe_port_holders(rest_holders)}"
+                )
+            if ws_holders:
+                self.event_bus.log_entry.emit(
+                    f"[Core] WS port {ws} still occupied by "
+                    f"{self._describe_port_holders(ws_holders)}"
+                )
+            self.server_status.setText("Server: Startup blocked by occupied port")
+            apply_status_style(self.server_status, "color: #cc3040;")
+            self.start_server_btn.setEnabled(True)
+            self.stop_server_btn.setEnabled(False)
+            return
 
         self._core_process = QProcess(self)
         self._core_process.setWorkingDirectory(str(Path(script).parent))
@@ -759,10 +891,16 @@ class SystemTab(QScrollArea):
                     state = r.json().get("state", "Unknown")
 
                     def _apply(v=ver, s=state):
-                        self.core_status.setText(
-                            f"Status: Connected | v{v} | State: {s}"
-                        )
-                        apply_status_style(self.core_status, "color: #00aa40;")
+                        if self.client.ws_connected:
+                            self.core_status.setText(
+                                f"Status: Connected | v{v} | State: {s}"
+                            )
+                            apply_status_style(self.core_status, "color: #00aa40;")
+                        else:
+                            self.core_status.setText(
+                                f"Status: REST online (WebSocket connecting) | v{v} | State: {s}"
+                            )
+                            apply_status_style(self.core_status, "color: #ccaa00;")
                         self.core_disconnect_btn.setEnabled(True)
                         self.core_connect_btn.setEnabled(True)
                 else:

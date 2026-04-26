@@ -94,6 +94,10 @@ class ParallelPipeline:
             max_workers=max_workers,
             thread_name_prefix="revia-lane",
         )
+        self._fanout_executor = ThreadPoolExecutor(
+            max_workers=max(2, max_workers),
+            thread_name_prefix="revia-fanout",
+        )
         self._lock = threading.Lock()
         self._active_lanes: dict[str, LaneState] = {
             "perception": LaneState.IDLE,
@@ -211,6 +215,19 @@ class ParallelPipeline:
             "any_running": self.any_lane_running(),
         }
 
+    def run_fanout(self, jobs: list[tuple[Callable, tuple, dict]]) -> list[Any]:
+        """Run small independent subtasks on a reusable executor.
+
+        This is for hot-path inner fan-out such as the perception lane's
+        emotion + router pair. Reusing a shared executor avoids spinning up
+        a new ThreadPoolExecutor on every request.
+        """
+        futures = [
+            self._fanout_executor.submit(fn, *args, **kwargs)
+            for fn, args, kwargs in jobs
+        ]
+        return [future.result() for future in futures]
+
     def _record_history(self, result: LaneResult):
         with self._lock:
             self._pipeline_history.append({
@@ -227,3 +244,7 @@ class ParallelPipeline:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             self._executor.shutdown(wait=False)
+        try:
+            self._fanout_executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._fanout_executor.shutdown(wait=False)

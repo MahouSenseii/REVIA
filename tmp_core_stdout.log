@@ -1,0 +1,23 @@
+[REVIA Core] Redis unavailable (ModuleNotFoundError: No module named 'redis'). Using local .jsonl files for long-term memory.
+[Revia] [RL] Loaded parameters | interactions=12 | cumulative_reward=1.36
+[REVIA Core] Auto-loaded model settings: local / Qwen2.5-Omni-7B-Q5_K_S.gguf
+[Revia] [NeuralRefiner] Loaded weights from neural_refiner.pt (step 14)
+[Revia] [NeuralRefiner] PyTorch refiner initialized (online learning active)
+[REVIA Core] Web search: duckduckgo_search ready (full results).
+[Revia] [ProfileEngine] Profile loaded: Revia-Diana-Inspired in 0.0 ms
+[REVIA Core] Loaded profile settings from profile_settings.json
+[Revia] [RL] Synced parameters from profile
+[Revia] State change: Booting -> Initializing (Loading profile, memory, and services)
+[REVIA Core] Integration manager ready (Discord + Twitch).
+==================================================
+  REVIA Core (Python)  v1.2.0
+==================================================
+[REVIA Core] WebSocket server on ws://127.0.0.1:8124
+[Revia] TurnWatchdog started | timeout=100s | check_interval=5.0s
+[Revia] Startup complete: readiness gate unlocked
+[Revia] State change: Initializing -> Idle (Core services online)
+[REVIA Core] REST server on http://127.0.0.1:8123
+[REVIA Core] Ready. Open the controller and click 'Connect'.
+
+ * Serving Flask app 'core_server'
+ * Debug mode: off
