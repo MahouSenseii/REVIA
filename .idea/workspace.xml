@@ -6,18 +6,22 @@
   <component name="ChangeListManager">
     <list default="true" id="1198d70f-367d-4e63-b54d-289021024c80" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/model_settings.json" beforeDir="false" afterPath="$PROJECT_DIR$/model_settings.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/profile_settings.json" beforeDir="false" afterPath="$PROJECT_DIR$/profile_settings.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_controller_py/app/assistant_status_manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/assistant_status_manager.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/revia_controller_py/app/controller_client.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/controller_client.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_controller_py/app/conversation_policy.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/conversation_policy.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_controller_py/app/conversation_starter.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/conversation_starter.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/revia_controller_py/app/test_tts_backend.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/test_tts_backend.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/revia_controller_py/app/tts_backend.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/tts_backend.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_controller_py/app/voice_manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/app/voice_manager.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_controller_py/gui/tabs/voice_tab.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/gui/tabs/voice_tab.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_controller_py/gui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/gui/main_window.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/revia_controller_py/gui/widgets/chat_panel.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/gui/widgets/chat_panel.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_controller_py/gui/widgets/inference_panel.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/gui/widgets/inference_panel.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_controller_py/gui/widgets/topbar.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/gui/widgets/topbar.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_controller_py/profiles/Revia.json" beforeDir="false" afterPath="$PROJECT_DIR$/revia_controller_py/profiles/Revia.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_core_py/autonomy/autonomy_loop.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/autonomy/autonomy_loop.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/revia_core_py/core_server.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/core_server.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/revia_core_py/profile_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/profile_engine.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_core_py/human_feel_layer.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/human_feel_layer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_core_py/neural_refiner.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/neural_refiner.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_core_py/prompt_assembly.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/prompt_assembly.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/revia_core_py/reinforcement_learner.py" beforeDir="false" afterPath="$PROJECT_DIR$/revia_core_py/reinforcement_learner.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -146,7 +150,10 @@
       <workItem from="1776454188931" duration="733000" />
       <workItem from="1776466309550" duration="3405000" />
       <workItem from="1777101573302" duration="23116000" />
-      <workItem from="1777255265327" duration="2719000" />
+      <workItem from="1777255265327" duration="3315000" />
+      <workItem from="1777290043247" duration="8058000" />
+      <workItem from="1777302554470" duration="89000" />
+      <workItem from="1777303702163" duration="4247000" />
     </task>
     <servers />
   </component>
@@ -155,6 +162,6 @@
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/REVIA$main__1_.coverage" NAME="main (1) Coverage Results" MODIFIED="1773036638229" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/revia_controller_py" />
-    <SUITE FILE_PATH="coverage/REVIA$main.coverage" NAME="main Coverage Results" MODIFIED="1777261158895" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/revia_controller_py" />
+    <SUITE FILE_PATH="coverage/REVIA$main.coverage" NAME="main Coverage Results" MODIFIED="1777303702729" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/revia_controller_py" />
   </component>
 </project>

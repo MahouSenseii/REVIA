@@ -1,6 +1,8 @@
+import os
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QTabWidget,
-    QSplitter, QSizePolicy,
+    QSplitter, QSizePolicy, QApplication,
 )
 from PySide6.QtCore import Qt, QTimer, QProcess
 
@@ -94,12 +96,12 @@ class MainWindow(QMainWindow):
         self.shell_splitter.addWidget(center)
 
         # Right panel - container gives the tab widget a fixed inset margin so
-        # content never bleeds to the splitter edge.
+        # content never bleeds to the splitter edge. Width is hard-locked
+        # below (after we know the screen width) so the right rail can never
+        # silently grow when an inner sub-tab demands more horizontal space.
         right_container = QWidget()
         right_container.setObjectName("rightPanel")
-        right_container.setMinimumWidth(280)
-        right_container.setMaximumWidth(660)
-        right_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        right_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         right_container_layout = QVBoxLayout(right_container)
         right_container_layout.setContentsMargins(6, 6, 6, 6)
         right_container_layout.setSpacing(0)
@@ -107,17 +109,22 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setObjectName("rightTabs")
         self.tabs.setDocumentMode(True)
-        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Preferred horizontal so the tabs only fill the locked container
+        # width and don't push it wider; vertical Expanding fills available
+        # window height.
+        self.tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         right_container_layout.addWidget(self.tabs)
 
         # ── Tab 1: Personality ────────────────────────────────────
         personality_container = QWidget()
+        personality_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         personality_layout = QVBoxLayout(personality_container)
         personality_layout.setContentsMargins(0, 4, 0, 0)
         personality_layout.setSpacing(0)
         self.personality_tabs = QTabWidget()
         self.personality_tabs.setDocumentMode(True)
         self.personality_tabs.setObjectName("categoryTabs")
+        self.personality_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         personality_layout.addWidget(self.personality_tabs)
         self.tabs.addTab(personality_container, "Persona")
 
@@ -137,12 +144,14 @@ class MainWindow(QMainWindow):
 
         # ── Tab 2: System ─────────────────────────────────────────
         system_container = QWidget()
+        system_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         system_layout = QVBoxLayout(system_container)
         system_layout.setContentsMargins(0, 4, 0, 0)
         system_layout.setSpacing(0)
         self.system_tabs = QTabWidget()
         self.system_tabs.setDocumentMode(True)
         self.system_tabs.setObjectName("categoryTabs")
+        self.system_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         system_layout.addWidget(self.system_tabs)
         self.tabs.addTab(system_container, "System")
 
@@ -169,12 +178,14 @@ class MainWindow(QMainWindow):
 
         # ── Tab 3: Advanced ────────────────────────────────────────
         advanced_container = QWidget()
+        advanced_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         advanced_layout = QVBoxLayout(advanced_container)
         advanced_layout.setContentsMargins(0, 4, 0, 0)
         advanced_layout.setSpacing(0)
         self.advanced_tabs = QTabWidget()
         self.advanced_tabs.setDocumentMode(True)
         self.advanced_tabs.setObjectName("categoryTabs")
+        self.advanced_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         advanced_layout.addWidget(self.advanced_tabs)
         self.tabs.addTab(advanced_container, "Advanced")
 
@@ -241,12 +252,31 @@ class MainWindow(QMainWindow):
         )
 
         self.shell_splitter.addWidget(right_container)
-        self.shell_splitter.setStretchFactor(0, 0)
-        self.shell_splitter.setStretchFactor(1, 4)
-        self.shell_splitter.setStretchFactor(2, 1)
-        # Give right panel a comfortable default width (380px) so content
-        # breathes without feeling cramped.
-        self.shell_splitter.setSizes([180, 740, 380])
+        self.shell_splitter.setStretchFactor(0, 0)  # sidebar: fixed
+        self.shell_splitter.setStretchFactor(1, 3)  # chat: most free space
+        self.shell_splitter.setStretchFactor(2, 0)  # right panel: hard-locked
+        # Set initial panel widths as a percentage of the available screen
+        # width so the layout scales correctly at any resolution. The right
+        # panel width is then HARD-LOCKED via setFixedWidth so neither the
+        # splitter nor any inner sub-tab can expand or shrink it.
+        screen = QApplication.primaryScreen()
+        screen_w = screen.availableGeometry().width() if screen else 1280
+        sidebar_w = 180
+        # Wider right rail so persona / system / advanced sub-tabs have room
+        # to breathe.  Range bumped from 300-420 to 420-640 with a 30%
+        # screen-width target (was 22%).  Override with REVIA_RIGHT_PANEL_W
+        # to pin a specific pixel width.
+        try:
+            override_w = int(os.environ.get("REVIA_RIGHT_PANEL_W", "0") or "0")
+        except (TypeError, ValueError):
+            override_w = 0
+        if override_w >= 280:
+            right_w = override_w
+        else:
+            right_w = max(420, min(640, int(screen_w * 0.30)))
+        center_w  = max(320, screen_w - sidebar_w - right_w)
+        right_container.setFixedWidth(right_w)
+        self.shell_splitter.setSizes([sidebar_w, center_w, right_w])
 
     def _current_mood_label(self):
         snapshot = self.client.get_status_snapshot()

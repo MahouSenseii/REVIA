@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .candidate_generator import CandidateGenerator, SelfInitiationCandidate, create_silence_candidate
+from .candidate_generator import CandidateGenerator, create_silence_candidate
 from .cooldown_manager import CooldownManager
 from .deep_processing_policy import should_use_deep_processing
 from .memory_retriever import MemoryRetriever

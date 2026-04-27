@@ -427,7 +427,12 @@ class ChatPanel(QFrame):
 
     def _send(self):
         text = self.input_field.text().strip()
-        if not text or len(text) > 10000:
+        if not text:
+            return
+        if len(text) > 10000:
+            self._append_system_note(
+                f"Message too long ({len(text)} chars; limit 10000) — not sent."
+            )
             return
         if self._handle_local_command(text):
             self._pending_input_source = "UserMessage"
@@ -442,6 +447,32 @@ class ChatPanel(QFrame):
             except Exception:
                 pass
             self._append_system_note("Interrupted previous speech for new message")
+
+        # Capture vision context (if enabled) BEFORE rendering the bubble so
+        # the "[+ vision frame]" note matches the captured frame.
+        image_b64 = None
+        vision_context = None
+        if self._vision_active:
+            image_b64 = self._capture_frame_b64()
+            if self.camera_service:
+                vision_context = self.camera_service.build_live_context()
+
+        # Always render the user's message FIRST and clear the input box.  We
+        # do this before the behavior-controller check and any conditional
+        # early-return below so that no matter what happens next (LLM error,
+        # blocked turn, queue overflow, etc.) the user can still see what
+        # they actually typed.  Without this, a blocked turn left the user
+        # staring at "Conversation unavailable: llm: Error" with no record
+        # of their own message — exactly the bug report from 2026-04-27.
+        if self._vision_active:
+            if image_b64:
+                self.chat_display.append(self._fmt_user(text, note="[+ vision frame]"))
+            else:
+                self.chat_display.append(self._fmt_user(text, note="[vision ctx]"))
+        else:
+            self.chat_display.append(self._fmt_user(text))
+        self.input_field.clear()
+
         if self._behavior_controller and not self._awaiting_reply:
             decision = self._behavior_controller.should_respond(
                 source=source,
@@ -461,28 +492,11 @@ class ChatPanel(QFrame):
         stacked_questions = self._split_stacked_questions(text)
         stack_total = len(stacked_questions)
 
-        image_b64 = None
-        vision_context = None
-        if self._vision_active:
-            image_b64 = self._capture_frame_b64()
-            if self.camera_service:
-                vision_context = self.camera_service.build_live_context()
-            if image_b64:
-                self.chat_display.append(
-                    self._fmt_user(text, note="[+ vision frame]")
-                )
-            else:
-                self.chat_display.append(
-                    self._fmt_user(text, note="[vision ctx]")
-                )
-        else:
-            self.chat_display.append(self._fmt_user(text))
         if stack_total > 1:
             self.chat_display.append(
                 self._fmt_system(f"Stack detected: {stack_total} questions — answering one-by-one")
             )
 
-        self.input_field.clear()
         if self._awaiting_reply:
             for idx, q in enumerate(stacked_questions, start=1):
                 if len(self._outbound_queue) >= self._OUTBOUND_QUEUE_MAX:

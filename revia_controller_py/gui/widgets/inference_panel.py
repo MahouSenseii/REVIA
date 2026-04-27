@@ -11,8 +11,10 @@ class InferencePanel(QFrame):
         super().__init__(parent)
         self.event_bus = event_bus
         self.setObjectName("inferencePanel")
-        self.setMinimumHeight(140)
-        self.setMaximumHeight(220)
+        # Height grows/shrinks with available space; no hard floor/ceiling so
+        # the panel scales properly when the window is resized.
+        self.setMinimumHeight(110)
+        self.setMaximumHeight(200)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         layout = QHBoxLayout(self)
@@ -54,7 +56,8 @@ class InferencePanel(QFrame):
 
         cam_frame = QFrame()
         cam_frame.setObjectName("webcamFrame")
-        cam_frame.setMinimumWidth(160)
+        # No hard minimum width — let the frame shrink proportionally with the
+        # panel so it never forces horizontal overflow.
         cam_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cam_layout = QVBoxLayout(cam_frame)
         cam_layout.setAlignment(Qt.AlignCenter)
@@ -68,7 +71,7 @@ class InferencePanel(QFrame):
         self.cam_view = QLabel("[No Camera Feed]")
         self.cam_view.setAlignment(Qt.AlignCenter)
         self.cam_view.setObjectName("webcamPlaceholder")
-        self.cam_view.setMinimumHeight(100)
+        self.cam_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cam_layout.addWidget(self.cam_view)
 
         layout.addWidget(cam_frame, stretch=1)

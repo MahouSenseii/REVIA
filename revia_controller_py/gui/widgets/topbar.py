@@ -11,8 +11,10 @@ class PillLabel(QLabel):
         self.setObjectName(object_name)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumHeight(28)
-        self.setMinimumWidth(80)
-        self.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        self.setMinimumWidth(70)
+        # Preferred: fits content without ballooning on wide windows.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.setMaximumWidth(200)
         self.setFont(QFont("Segoe UI", 9))
 
 
@@ -39,7 +41,8 @@ class TopBar(QFrame):
 
         title = PillLabel("\u2014 REVIA \u2014", "titlePill")
         title.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        title.setMinimumWidth(140)
+        title.setMinimumWidth(120)
+        title.setMaximumWidth(240)
         layout.addWidget(title)
 
         layout.addStretch()

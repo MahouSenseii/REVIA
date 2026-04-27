@@ -352,7 +352,6 @@ class HumanFeelLayer:
         """
         intensity    = self._get_emotion_intensity()
         affect_mode  = self._get_affect_display_mode()
-        baseline_val = self._get_baseline_valence()
         speech_rate  = self._get_speech_rate_modifier()
 
         # Base adjustments per emotion label

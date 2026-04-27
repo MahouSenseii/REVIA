@@ -65,17 +65,25 @@ class CharacterProfileManager:
             interaction.get("greeting") or prof.get("greeting", ""),
             200,
         )
+        # Identity / style / collaboration are user-authored persona fields.
+        # The previous caps (2000 / 1200 / 1200) silently truncated rich
+        # personality definitions to about a quarter of their length, which
+        # is why Revia "felt" generic during answers — the LLM only saw the
+        # first 2000 chars of an 8000-char character_prompt.  The injection
+        # regex inside _sanitize_profile_field still runs, so widening the
+        # cap does not reduce safety; it just stops cutting off legitimate
+        # persona content.
         char_prompt = self._sanitize_profile_field(
             persona_def.get("identity_prompt") or prof.get("character_prompt", ""),
-            2000,
+            12000,
         )
         style_prompt = self._sanitize_profile_field(
             persona_def.get("style_prompt", ""),
-            1200,
+            4000,
         )
         collaboration_prompt = self._sanitize_profile_field(
             persona_def.get("collaboration_prompt", ""),
-            1200,
+            4000,
         )
         extra_modules = []
         for module in persona_def.get("modules", []) or []:
@@ -86,7 +94,7 @@ class CharacterProfileManager:
                 continue
             # Persona exemplars can be multi-turn and lose their value if we clip
             # them too aggressively.
-            module_text = self._sanitize_profile_field(module.get("content", ""), 2200)
+            module_text = self._sanitize_profile_field(module.get("content", ""), 12000)
             if module_text:
                 extra_modules.append((module_name, module_text))
 

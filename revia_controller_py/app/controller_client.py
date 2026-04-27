@@ -275,11 +275,17 @@ class ControllerClient(QObject):
         # Reset exponential backoff - connection is healthy again.
         self._reconnect_attempt = 0
         self.reconnect_timer.setInterval(self._reconnect_base_ms)
+        # P-1: WS push delivers status_update events; REST polling is redundant.
+        # Suspend it to eliminate the 1.5 s background HTTP GET while connected.
+        self.poll_timer.stop()
 
     def _on_ws_disconnected(self):
         self.ws_connected = False
         self.ws_connection_timer.stop()
         self._set_core_reachability(False)
+        # P-1: WS is gone — fall back to REST polling so the UI stays live.
+        if not self.poll_timer.isActive():
+            self.poll_timer.start()
 
     def _on_ws_error(self, error):
         _log.debug("[ControllerClient] WebSocket error: %s", error)

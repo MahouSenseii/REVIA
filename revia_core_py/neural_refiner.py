@@ -21,11 +21,10 @@ Persistence:
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 _NEURAL_REFINER_DIR = Path(__file__).parent / "data"
 _NEURAL_REFINER_PATH = _NEURAL_REFINER_DIR / "neural_refiner.pt"

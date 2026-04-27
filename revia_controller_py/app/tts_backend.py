@@ -117,6 +117,12 @@ class QwenTTSBackend(QObject):
         self._engine_name = "qwen3-tts"
         self._qwen_url = ""  # custom Qwen3-TTS server URL (Gradio)
         self._qwen_clients = {}
+        # Cache of advertised API names per server URL. Populated by
+        # _get_qwen_api_names so we don't hit /gradio_api/info on every
+        # synthesis (which previously made each generate request appear
+        # to "hang" while the inspect call was in flight).
+        self._qwen_api_cache = {}
+        self._qwen_api_cache_lock = threading.Lock()
         self._pyttsx3_voice_id = None
         self._pyttsx3_engine = None
         self.last_metrics = TTSMetrics()
@@ -139,7 +145,17 @@ class QwenTTSBackend(QObject):
         self._engine_name = name
 
     def set_qwen_server(self, url):
-        self._qwen_url = url.rstrip("/") if url else ""
+        new_url = url.rstrip("/") if url else ""
+        if new_url != self._qwen_url:
+            # Drop cached clients + introspected API names: a different
+            # server may expose a different model (Base / CustomVoice /
+            # VoiceDesign) with different api_names per the QwenLM/Qwen3-TTS
+            # demo (qwen_tts/cli/demo.py).
+            with self._lock:
+                self._qwen_clients.clear()
+            with self._qwen_api_cache_lock:
+                self._qwen_api_cache.clear()
+        self._qwen_url = new_url
 
     def set_output_device(self, device, label: str = ""):
         """Route TTS playback to a specific output device.
@@ -537,25 +553,49 @@ class QwenTTSBackend(QObject):
             raise ConnectionError(f"Cannot connect to Qwen3-TTS at {url}: {e}")
 
     def _get_qwen_api_names(self, client=None):
-        """Return public Gradio API names exposed by the active Qwen server."""
+        """Return public Gradio API names exposed by the active Qwen server.
+
+        Cached per server URL so repeated synthesis calls don't pay the
+        introspection round-trip every time. The qwen-tts demo
+        (https://github.com/QwenLM/Qwen3-TTS, qwen_tts/cli/demo.py)
+        registers endpoints once at server startup and never adds more,
+        so a single successful probe is enough for the lifetime of the
+        connection.
+        """
+        url = (self._qwen_url or "").rstrip("/")
+        cache_key = url or "<default>"
+
+        with self._qwen_api_cache_lock:
+            cached = self._qwen_api_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         names = set()
 
-        if client is not None and hasattr(client, "view_api"):
+        # Prefer the lightweight HTTP info endpoint with a hard timeout.
+        # client.view_api() has no timeout in gradio_client and was the
+        # main reason synthesis appeared to hang on slow / starting servers.
+        if url.startswith(("http://", "https://")):
+            try:
+                with urllib.request.urlopen(url + "/gradio_api/info", timeout=2.0) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                names.update(self._extract_api_names(payload))
+            except Exception as exc:
+                _log.debug("[TTS] Could not inspect Gradio API info: %s", exc)
+
+        # Fall back to the SDK-side view_api only if the HTTP probe found
+        # nothing (e.g. when talking to the public HF Space and we only
+        # have a Client object, not a reachable HTTP URL).
+        if not names and client is not None and hasattr(client, "view_api"):
             try:
                 api = client.view_api(return_format="dict")
                 names.update(self._extract_api_names(api))
             except Exception as exc:
                 _log.debug("[TTS] Could not inspect Gradio client API: %s", exc)
 
-        url = (self._qwen_url or "").rstrip("/")
-        if url.startswith(("http://", "https://")):
-            try:
-                with urllib.request.urlopen(url + "/gradio_api/info", timeout=1.5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                names.update(self._extract_api_names(payload))
-            except Exception as exc:
-                _log.debug("[TTS] Could not inspect Gradio API info: %s", exc)
-
+        if names:
+            with self._qwen_api_cache_lock:
+                self._qwen_api_cache[cache_key] = names
         return names
 
     @staticmethod
@@ -593,8 +633,11 @@ class QwenTTSBackend(QObject):
         return None, msg
 
     def _qwen_design(self, text, voice_description, language, output_path):
-        # API: predict(text, language, voice_description, api_name="/generate_voice_design")
-        #   -> (generated_audio: filepath, status: str)
+        # Voice Design endpoints (signature: text, language, voice_description):
+        #   Local server (1.7B VoiceDesign): /run_voice_design
+        #   HF Space:                        /generate_voice_design
+        # CustomVoice servers expose /generate_custom_voice and are used as a
+        # style fallback when no design-specific endpoint is available.
         # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
         # _get_client uses self._lock internally; re-entering a non-reentrant Lock
         # from the same thread would block indefinitely.
@@ -608,14 +651,12 @@ class QwenTTSBackend(QObject):
         with self._synth_semaphore:
             try:
                 api_names = self._get_qwen_api_names(client)
-                api_name = "/generate_voice_design"
-                if api_names and "/generate_voice_design" not in api_names:
-                    if "/generate_custom_voice" not in api_names:
-                        return self._report_qwen_mode_unavailable(
-                            "Voice Design",
-                            "/generate_voice_design",
-                            api_names,
-                        )
+                api_name = None
+                if not api_names or "/run_voice_design" in api_names:
+                    api_name = "/run_voice_design"
+                elif "/generate_voice_design" in api_names:
+                    api_name = "/generate_voice_design"
+                elif "/generate_custom_voice" in api_names:
                     self.status_updated.emit(
                         "Voice Design endpoint unavailable; using CustomVoice style fallback."
                     )
@@ -623,9 +664,17 @@ class QwenTTSBackend(QObject):
                         "[TTS] Voice Design endpoint unavailable; using /generate_custom_voice"
                     )
                     api_name = "/generate_custom_voice"
+                else:
+                    return self._report_qwen_mode_unavailable(
+                        "Voice Design",
+                        "/run_voice_design or /generate_voice_design",
+                        api_names,
+                    )
 
                 t0 = time.perf_counter()
                 self.synthesis_started.emit()
+                _log.info("[TTS] Voice Design via %s lang=%s len=%d",
+                          api_name, language, len(text or ""))
                 if api_name == "/generate_custom_voice":
                     result = client.predict(
                         text,
@@ -636,12 +685,15 @@ class QwenTTSBackend(QObject):
                         api_name=api_name,
                     )
                 else:
+                    # Both /run_voice_design (local) and /generate_voice_design (HF)
+                    # accept (text, language, voice_description).
                     result = client.predict(
                         text,
                         language,
                         voice_description,
                         api_name=api_name,
                     )
+                _log.info("[TTS] Voice Design predict() returned in %.2fs", time.perf_counter() - t0)
                 wav_path = self._extract_wav(result, output_path)
                 m = self._build_metrics(t0, wav_path)
                 self.synthesis_finished.emit(m)
@@ -681,21 +733,27 @@ class QwenTTSBackend(QObject):
                 tts_text = _strip_leading_style_directives(target_text)
                 if style_instruction:
                     _log.debug("[TTS] Clone style hint kept out of spoken text: %s", style_instruction)
+                _log.info("[TTS] Voice Clone start lang=%s xvec=%s len=%d",
+                          language, bool(x_vector_only), len(tts_text or ""))
+                clone_t0 = time.perf_counter()
                 try:
                     result = client.predict(
                         ref, ref_text or "", x_vector_only,
                         tts_text, language,
                         api_name="/run_voice_clone",
                     )
-                    _log.debug("[TTS] Used /run_voice_clone (local)")
+                    _log.info("[TTS] /run_voice_clone (local) returned in %.2fs",
+                              time.perf_counter() - clone_t0)
                 except Exception as exc:
-                    _log.debug("[TTS] /run_voice_clone failed: %s, trying /generate_voice_clone", exc)
+                    _log.info("[TTS] /run_voice_clone failed (%s); falling back to /generate_voice_clone", exc)
+                    fallback_t0 = time.perf_counter()
                     result = client.predict(
                         ref, ref_text or "", tts_text, language,
                         x_vector_only, model_size,
                         api_name="/generate_voice_clone",
                     )
-                    _log.debug("[TTS] Used /generate_voice_clone (HF Space)")
+                    _log.info("[TTS] /generate_voice_clone (HF) returned in %.2fs",
+                              time.perf_counter() - fallback_t0)
 
                 wav_path = self._extract_wav(result, output_path)
                 m = self._build_metrics(t0, wav_path)
@@ -709,9 +767,11 @@ class QwenTTSBackend(QObject):
     def _qwen_custom(self, text, language, speaker, style_instruction,
                       model_size, output_path):
         text = _strip_leading_style_directives(text)
-        # API: predict(text, language, speaker, instruct, model_size,
-        #              api_name="/generate_custom_voice")
-        #   -> (generated_audio: filepath, status: str)
+        # CustomVoice endpoints (per QwenLM/Qwen3-TTS demo):
+        #   Local CustomVoice server: /run_instruct
+        #     signature: (text, language, speaker, instruct)        [no model_size]
+        #   HF Space (Qwen/Qwen3-TTS): /generate_custom_voice
+        #     signature: (text, language, speaker, instruct, model_size)
         # Resolve client BEFORE acquiring the synthesis lock to avoid deadlock.
         # _get_client uses self._lock internally; re-entering a non-reentrant Lock
         # from the same thread would block indefinitely.
@@ -725,22 +785,44 @@ class QwenTTSBackend(QObject):
         with self._synth_semaphore:
             try:
                 api_names = self._get_qwen_api_names(client)
-                if api_names and "/generate_custom_voice" not in api_names:
+                # Prefer the local server endpoint when present, otherwise
+                # fall back to the HF Space endpoint.
+                api_name = None
+                if not api_names or "/run_instruct" in api_names:
+                    api_name = "/run_instruct"
+                elif "/generate_custom_voice" in api_names:
+                    api_name = "/generate_custom_voice"
+                else:
                     return self._report_qwen_mode_unavailable(
                         "CustomVoice",
-                        "/generate_custom_voice",
+                        "/run_instruct or /generate_custom_voice",
                         api_names,
                     )
+
                 t0 = time.perf_counter()
                 self.synthesis_started.emit()
-                result = client.predict(
-                    text,
-                    language,
-                    speaker,
-                    style_instruction or "",
-                    model_size,
-                    api_name="/generate_custom_voice",
-                )
+                _log.info("[TTS] CustomVoice via %s lang=%s speaker=%s len=%d",
+                          api_name, language, speaker, len(text or ""))
+                if api_name == "/run_instruct":
+                    # Local Qwen3-TTS CustomVoice demo: 4 inputs, no model_size.
+                    result = client.predict(
+                        text,
+                        language,
+                        speaker,
+                        style_instruction or "",
+                        api_name=api_name,
+                    )
+                else:
+                    # HF Space: includes model_size as the 5th argument.
+                    result = client.predict(
+                        text,
+                        language,
+                        speaker,
+                        style_instruction or "",
+                        model_size,
+                        api_name=api_name,
+                    )
+                _log.info("[TTS] CustomVoice predict() returned in %.2fs", time.perf_counter() - t0)
                 wav_path = self._extract_wav(result, output_path)
                 m = self._build_metrics(t0, wav_path)
                 self.synthesis_finished.emit(m)

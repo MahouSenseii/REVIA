@@ -57,6 +57,36 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(statuses)
 
+    def test_voice_design_uses_local_run_endpoint_when_available(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+        client = FakeQwenClient(tmp_path)
+        errors = []
+        backend.error_occurred.connect(errors.append)
+        backend._get_client = lambda _space_key="design": client
+        backend._get_qwen_api_names = lambda _client=None: {
+            "/run_voice_design",
+        }
+
+        wav, _metrics = backend._qwen_design(
+            "hello",
+            "warm clear voice",
+            "Auto",
+            None,
+        )
+
+        self.assertEqual(wav, tmp_path)
+        self.assertEqual(client.calls[0][1], "/run_voice_design")
+        self.assertEqual(client.calls[0][0], (
+            "hello",
+            "Auto",
+            "warm clear voice",
+        ))
+        self.assertEqual(errors, [])
+
     def test_voice_design_uses_custom_endpoint_when_available(self):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -88,6 +118,68 @@ class TestQwenEndpointHandling(unittest.TestCase):
         ))
         self.assertEqual(errors, [])
         self.assertTrue(any("CustomVoice style fallback" in s for s in statuses))
+
+    def test_custom_voice_uses_local_run_instruct_when_available(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+        client = FakeQwenClient(tmp_path)
+        errors = []
+        backend.error_occurred.connect(errors.append)
+        backend._get_client = lambda _space_key="custom": client
+        backend._get_qwen_api_names = lambda _client=None: {"/run_instruct"}
+
+        wav, _metrics = backend._qwen_custom(
+            "hello",
+            "Auto",
+            "Ryan",
+            "say it cheerfully",
+            "0.6B",
+            None,
+        )
+
+        self.assertEqual(wav, tmp_path)
+        self.assertEqual(client.calls[0][1], "/run_instruct")
+        # Local /run_instruct takes 4 inputs (no model_size).
+        self.assertEqual(client.calls[0][0], (
+            "hello",
+            "Auto",
+            "Ryan",
+            "say it cheerfully",
+        ))
+        self.assertEqual(errors, [])
+
+    def test_custom_voice_falls_back_to_hf_endpoint(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+        client = FakeQwenClient(tmp_path)
+        backend._get_client = lambda _space_key="custom": client
+        backend._get_qwen_api_names = lambda _client=None: {"/generate_custom_voice"}
+
+        wav, _metrics = backend._qwen_custom(
+            "hello",
+            "Auto",
+            "Ryan",
+            "say it cheerfully",
+            "0.6B",
+            None,
+        )
+
+        self.assertEqual(wav, tmp_path)
+        self.assertEqual(client.calls[0][1], "/generate_custom_voice")
+        # HF Space /generate_custom_voice takes 5 inputs (with model_size).
+        self.assertEqual(client.calls[0][0], (
+            "hello",
+            "Auto",
+            "Ryan",
+            "say it cheerfully",
+            "0.6B",
+        ))
 
     def test_extract_wav_accepts_gradio_file_dict(self):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:

@@ -248,6 +248,27 @@ from autonomy.self_initiation_scorer import SelfInitiationScorer
 from autonomy.state_tracker import StateTracker
 from autonomy.topic_manager import TopicManager
 from reflex_responder import get_reflex_reply
+from agents import (
+    AgentContext,
+    AgentOrchestrator,
+    CancellationToken,
+    CriticAgent,
+    EmotionAgent,
+    FinalResponseBuilder,
+    IntentAgent,
+    MemoryAgent,
+    ModelRequirements,
+    ModelRouter,
+    QualityGate,
+    ReasoningAgent,
+    VoiceStyleAgent,
+)
+from runtime import (
+    HardwareAgent,
+    HardwareProfiler,
+    ProviderRegistry,
+    RuntimeScheduler,
+)
 
 # ---------------------------------------------------------------------------
 # Optional Redis client for Docker-backed long-term memory
@@ -977,7 +998,10 @@ class LLMBackend:
         if not base_url:
             return False
         now = time.monotonic()
-        cached = self._local_health_cache
+        # B-4: guard cache reads/writes with the instance lock to prevent a data
+        # race where one thread reads a stale ts while another is writing a new one.
+        with self._lock:
+            cached = dict(self._local_health_cache)
         if cached.get("ts") and (now - cached["ts"]) < 2.0:
             return bool(cached.get("ok", False))
         ok = False
@@ -986,7 +1010,8 @@ class LLMBackend:
             ok = bool(r.ok)
         except Exception:
             ok = False
-        self._local_health_cache = {"ok": ok, "ts": time.monotonic()}
+        with self._lock:
+            self._local_health_cache = {"ok": ok, "ts": time.monotonic()}
         if ok:
             self._note_connection_ready(f"{self.local_server} is ready.")
         return ok
@@ -1024,23 +1049,34 @@ class LLMBackend:
         """Trim conversation history while preserving maximum context.
 
         Neuro-Sama-class companions need 40-60+ turns of context for
-        personality consistency and long-term coherence. We keep as much
-        as the context window allows.
+        personality consistency and long-term coherence.  We keep as many
+        messages as the context window allows, always retaining at least
+        _MIN_HISTORY_MESSAGES (10) messages as a hard floor.
         """
         convo = list(conversation or [])
-        # Estimate tokens roughly: avg ~30 tokens per message
-        est_tokens = sum(len(str(m.get("content", "")).split()) for m in convo)
+        # P-4: reuse cached word-count estimates when available (set by commit_turn_to_history).
+        def _msg_token_est(m):
+            if "_token_est" in m:
+                return m["_token_est"]
+            content = m.get("content", "")
+            if isinstance(content, list):
+                return sum(len(p.get("text", "").split()) for p in content if isinstance(p, dict))
+            return len(str(content).split())
+
+        est_tokens = sum(_msg_token_est(m) for m in convo)
         ctx_budget = int(self.ctx_length * 0.65)  # Reserve 35% for system prompt + generation
 
         # If within budget, keep everything
         if est_tokens <= ctx_budget:
             return convo
 
-        # Trim oldest messages until within budget, keeping at least last 60 messages
-        min_keep = 80 if not self.fast_mode else 50
-        while len(convo) > min_keep and est_tokens > ctx_budget:
+        # Trim oldest messages until within budget.
+        # B-3: floor was 80/50 which prevented trimming short conversations that
+        # exceed the token budget; lowered to 10 so the while loop can actually run.
+        _MIN_HISTORY_MESSAGES = 10  # always keep at least 5 turns regardless of budget
+        while len(convo) > _MIN_HISTORY_MESSAGES and est_tokens > ctx_budget:
             removed = convo.pop(0)
-            est_tokens -= len(str(removed.get("content", "")).split())
+            est_tokens -= _msg_token_est(removed)
 
         # Hard limits as safety net
         if self.fast_mode and len(convo) > 80:
@@ -1049,10 +1085,21 @@ class LLMBackend:
             return convo[-80:]
         return convo
 
+    @staticmethod
+    def _tag_token_est(msg: dict) -> dict:
+        """P-4: attach a word-count estimate once so _trim_conversation can reuse it."""
+        if "_token_est" not in msg:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                msg["_token_est"] = sum(len(p.get("text", "").split()) for p in content if isinstance(p, dict))
+            else:
+                msg["_token_est"] = len(str(content).split())
+        return msg
+
     def commit_turn_to_history(self, user_text, assistant_text):
         with self._lock:
-            self.conversation.append({"role": "user", "content": user_text})
-            self.conversation.append({"role": "assistant", "content": assistant_text})
+            self.conversation.append(self._tag_token_est({"role": "user", "content": user_text}))
+            self.conversation.append(self._tag_token_est({"role": "assistant", "content": assistant_text}))
             self.conversation = self._trim_conversation(self.conversation)
 
     def _build_messages(self, conversation, user_text, response_mode, image_b64=None):
@@ -1333,13 +1380,14 @@ class LLMBackend:
         elapsed = time.perf_counter() - t0
         token_count = len(full_text.split())
         tps = token_count / elapsed if elapsed > 0 else 0
-        telemetry.llm["tokens_generated"] = token_count
-        telemetry.llm["tokens_per_second"] = round(tps, 1)
         def _count_words(content):
             if isinstance(content, list):
                 return sum(len(p.get("text", "").split()) for p in content if isinstance(p, dict))
             return len(content.split())
-        telemetry.llm["context_length"] = sum(_count_words(m["content"]) for m in messages) + token_count
+        with telemetry._lock:  # B-2: atomic multi-key update
+            telemetry.llm["tokens_generated"] = token_count
+            telemetry.llm["tokens_per_second"] = round(tps, 1)
+            telemetry.llm["context_length"] = sum(_count_words(m["content"]) for m in messages) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
         # If generation was interrupted, discard partial output - don't commit
         if self._is_interrupted():
@@ -1426,9 +1474,10 @@ class LLMBackend:
         elapsed = time.perf_counter() - t0
         token_count = len(full_text.split())
         tps = token_count / elapsed if elapsed > 0 else 0
-        telemetry.llm["tokens_generated"] = token_count
-        telemetry.llm["tokens_per_second"] = round(tps, 1)
-        telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages if isinstance(m["content"], str)) + token_count
+        with telemetry._lock:  # B-2: atomic multi-key update
+            telemetry.llm["tokens_generated"] = token_count
+            telemetry.llm["tokens_per_second"] = round(tps, 1)
+            telemetry.llm["context_length"] = sum(len(m["content"].split()) for m in messages if isinstance(m["content"], str)) + token_count
         self._note_connection_ready(f"{self.api_provider or 'API'} request succeeded.")
         # If generation was interrupted, discard partial output - don't commit
         if self._is_interrupted():
@@ -1558,11 +1607,12 @@ class LLMBackend:
                     lora_adapter=self._vllm.get_active_lora(base_url) or None,
                 )
                 if vr.success and vr.text:
-                    # Feed exact token counts into telemetry
-                    telemetry.llm["tokens_generated"] = vr.metrics.completion_tokens
-                    telemetry.llm["tokens_per_second"] = round(vr.metrics.tokens_per_second, 1)
-                    telemetry.llm["context_length"] = vr.metrics.total_tokens
-                    telemetry.llm["ttft_ms"] = round(vr.metrics.time_to_first_token_ms, 1)
+                    # Feed exact token counts into telemetry (B-2: atomic multi-key update)
+                    with telemetry._lock:
+                        telemetry.llm["tokens_generated"] = vr.metrics.completion_tokens
+                        telemetry.llm["tokens_per_second"] = round(vr.metrics.tokens_per_second, 1)
+                        telemetry.llm["context_length"] = vr.metrics.total_tokens
+                        telemetry.llm["ttft_ms"] = round(vr.metrics.time_to_first_token_ms, 1)
                     if model_name:
                         telemetry.system["model"] = model_name
                     self._note_connection_ready(f"vLLM ({model_name or 'default'}) OK")
@@ -1703,8 +1753,9 @@ class LLMBackend:
             elapsed = time.perf_counter() - t0
             token_count = len(full_text.split())
             tps = token_count / elapsed if elapsed > 0 else 0
-            telemetry.llm["tokens_generated"] = token_count
-            telemetry.llm["tokens_per_second"] = round(tps, 1)
+            with telemetry._lock:  # B-2: atomic multi-key update
+                telemetry.llm["tokens_generated"] = token_count
+                telemetry.llm["tokens_per_second"] = round(tps, 1)
             if model_name:
                 telemetry.system["model"] = model_name
 
@@ -2764,9 +2815,10 @@ def _compute_situational_context() -> str:
         f"- Runtime: state={state} | CPU={cpu:.0f}% | GPU={gpu:.0f}% | RAM={ram_used}/{ram_total} MB"
     )
 
-    # Memory
-    st = len(memory_store.short_term)
-    lt = len(memory_store.long_term)
+    # Memory (B-6: hold lock while reading mutable list lengths)
+    with memory_store._lock:
+        st = len(memory_store.short_term)
+        lt = len(memory_store.long_term)
     lines.append(f"-- Memory: {st} recent exchanges | {lt} long-term facts stored")
 
     lines.append(
@@ -2886,6 +2938,29 @@ class MemoryStore:
         except Exception:
             self._redis_available_cache = False
             self._redis_checked_ts = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Resource management
+    # ------------------------------------------------------------------
+
+    def close(self):
+        """Q-2: Flush and close the long-term memory file handle on shutdown.
+
+        Registered with atexit in main() so unsaved buffer bytes are not
+        silently lost when the process exits.  Safe to call multiple times.
+        """
+        with self._lock:
+            handle = self._lt_handle
+            self._lt_handle = None
+        if handle is not None and not handle.closed:
+            try:
+                handle.flush()
+                handle.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        self.close()
 
     # ------------------------------------------------------------------
     # Profile switching
@@ -3578,7 +3653,7 @@ def _extract_people_candidates(text: str):
     low = src.lower()
 
     patterns = [
-        (rf"\bmy name is (?P<name>[A-Za-z][A-Za-z' -]{{1,40}})", "self", 0.98),
+        (r"\bmy name is (?P<name>[A-Za-z][A-Za-z' -]{1,40})", "self", 0.98),
         (rf"\bmy (?P<relation>{_PEOPLE_REL_RE}) is (?P<name>[A-Za-z][A-Za-z' -]{{1,40}})", None, 0.82),
         (rf"\b(?P<name>[A-Za-z][A-Za-z' -]{{1,40}}) is my (?P<relation>{_PEOPLE_REL_RE})", None, 0.82),
         (rf"\bmy (?P<relation>{_PEOPLE_REL_RE}) (?P<name>[A-Za-z][A-Za-z' -]{{1,40}})", None, 0.78),
@@ -3964,17 +4039,28 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         f"| source={trigger.source} | reason={trigger.reason}"
     )
     _mark_user_activity()
-    # User-driven responses should force the state transition even if currently
-    # in Cooldown. The behavior controller already gates on trigger kind, so
-    # only legitimate user messages reach here. Without force=True, the FSM
-    # rejects Cooldown -> Thinking, leaving user messages silently dropped.
     _is_user_driven = trigger.kind == TriggerKind.RESPONSE.value or trigger.force
-    # Clear any stale interrupt flag from a previous (e.g. autonomous) turn.
-    # The interrupt flag is only reset inside generate(), but _pipeline_interrupted()
-    # checks it before generate() is ever called — so a leftover True flag from
-    # an aborted autonomous turn silently kills every subsequent pipeline run.
+
+    # B-1 + B-5: For user-driven requests, unconditionally clear the interrupt
+    # flag and force-exit Cooldown BEFORE any pipeline gate runs.
+    #
+    # Why this ordering matters:
+    #   - _pipeline_interrupted() checks llm_backend._is_interrupted() before
+    #     generate() is ever called, so a stale True flag from a prior
+    #     autonomous turn silently kills every subsequent user pipeline run.
+    #   - Transitioning to IDLE first guarantees the state machine accepts the
+    #     follow-up THINKING transition even when the previous turn left the
+    #     FSM in COOLDOWN (Cooldown -> Thinking is allowed, but if any
+    #     concurrent path transitions the state again between our two calls the
+    #     FSM can end up in an unexpected state; going through IDLE first is
+    #     idempotent and avoids that race).
     if _is_user_driven:
         llm_backend.clear_interrupt()
+        # Kick the FSM out of Cooldown so the THINKING transition below succeeds
+        # unconditionally.  force=True is required here because some transitions
+        # (e.g. ERROR -> IDLE) are not in the allowed-transitions table.
+        _set_runtime_state(ReviaState.IDLE, "user pre-empted cooldown", force=True)
+
     _set_turn_stage(
         turn,
         RequestLifecycleState.THINKING,
@@ -4283,9 +4369,10 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
                 s_pref = telemetry.begin_span("preference_direct_answer", device=_device)
                 telemetry.end_span(s_pref)
                 token_count = len((full_text or "").split())
-                telemetry.llm["tokens_generated"] = token_count
-                telemetry.llm["tokens_per_second"] = 0.0
-                telemetry.llm["context_length"] = token_count
+                with telemetry._lock:  # B-2: atomic multi-key update
+                    telemetry.llm["tokens_generated"] = token_count
+                    telemetry.llm["tokens_per_second"] = 0.0
+                    telemetry.llm["context_length"] = token_count
                 response = AssistantResponse(
                     text=full_text,
                     response_mode=ResponseMode.NORMAL_RESPONSE.value,
@@ -4618,7 +4705,6 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
     _captured_text = text
     _captured_emo = emo
     _captured_prev_emo = prev_emotion
-    _captured_request_id = turn.request_id
 
     def _expression_finalize():
         avs_composite = float(
@@ -4809,11 +4895,15 @@ except Exception as _int_err:
 
 
 def _memory_status_snapshot():
+    # B-6: hold lock while reading mutable list lengths
+    with memory_store._lock:
+        st_count = len(memory_store.short_term)
+        lt_count = len(memory_store.long_term)
     return {
         "backend": "redis" if memory_store.redis_available else "local_file",
         "profile": memory_store._profile_name,
-        "short_term_count": len(memory_store.short_term),
-        "long_term_count": len(memory_store.long_term),
+        "short_term_count": st_count,
+        "long_term_count": lt_count,
     }
 
 
@@ -4990,7 +5080,20 @@ def _build_architecture_status(readiness=None, llm_status=None):
     }
 
 
+# P-2: cache for _build_status_payload — rebuilt at most once per second.
+_status_payload_cache: dict = {"ts": 0.0, "payload": None}
+_status_payload_cache_lock = threading.Lock()
+
+
 def _build_status_payload():
+    # P-2: Return cached payload if it's less than 1 second old.
+    # The broadcast loop fires every 1.5 s; REST clients can call faster
+    # than that.  A 1 s TTL means at most one full rebuild per second.
+    _now = time.monotonic()
+    with _status_payload_cache_lock:
+        if _status_payload_cache["payload"] is not None and (_now - _status_payload_cache["ts"]) < 1.0:
+            return _status_payload_cache["payload"]
+
     conversation_manager.maybe_leave_cooldown()
     telemetry.state = conversation_manager.current_state
     snap = telemetry.snapshot()
@@ -4999,7 +5102,8 @@ def _build_status_payload():
     )
     architecture = _build_architecture_status(readiness=readiness, llm_status=llm_status)
     runtime_status = runtime_status_manager.get_runtime_status()
-    return {
+    _rl_stats = rl_engine.get_stats()  # P-3: single call, reused below
+    _payload = {
         "state": conversation_manager.current_state,
         "version": "1.2.0-py",
         "uptime_s": round(time.perf_counter() - telemetry._epoch, 1),
@@ -5023,12 +5127,16 @@ def _build_status_payload():
         "request_lifecycle": turn_manager.snapshot(),
         "rl": {
             "enabled": rl_engine.enabled,
-            "interaction_count": rl_engine.get_stats().get("interaction_count", 0),
-            "average_reward": rl_engine.get_stats().get("average_reward", 0.0),
+            **{k: _rl_stats.get(k, 0) for k in ("interaction_count", "average_reward")},  # P-3
         },
         "parallel_pipeline": parallel_pipeline.status() if parallel_pipeline else {"lanes": {}, "any_running": False},
         "neural_refiner": neural_refiner.status() if neural_refiner else {"available": False},
     }
+    # P-2: store in cache for subsequent calls within the TTL window
+    with _status_payload_cache_lock:
+        _status_payload_cache["payload"] = _payload
+        _status_payload_cache["ts"] = time.monotonic()
+    return _payload
 
 
 def _broadcast_runtime_status():
@@ -5238,6 +5346,277 @@ def api_chat():
         "request_id": turn.request_id,
         "turn_id": turn.turn_id,
     })
+
+
+# ---------------------------------------------------------------------------
+# Parallel Agents V1 — additive endpoint (does not replace /api/chat)
+# ---------------------------------------------------------------------------
+
+_agents_orchestrator_lock = threading.Lock()
+_agents_orchestrator: AgentOrchestrator | None = None
+_hardware_profiler: HardwareProfiler | None = None
+_hardware_fingerprint = None  # type: ignore[assignment]
+_hardware_agent: HardwareAgent | None = None
+_runtime_scheduler: RuntimeScheduler | None = None
+_provider_registry: ProviderRegistry | None = None
+
+
+def _ensure_hardware_runtime():
+    """Detect hardware once, build the live agent + scheduler, and cache them.
+
+    Safe to call multiple times — subsequent calls are a no-op.  All probes
+    are best-effort; if something fails the runtime falls back to a permissive
+    profile so the orchestrator still works.
+    """
+    global _hardware_profiler, _hardware_fingerprint, _hardware_agent, _runtime_scheduler
+    if _hardware_agent is not None and _runtime_scheduler is not None:
+        return _hardware_fingerprint, _hardware_agent, _runtime_scheduler
+
+    profiler = HardwareProfiler(log_fn=_revia_log)
+    try:
+        fingerprint = profiler.detect_and_persist(
+            provider_urls={k: v["url"] for k, v in LOCAL_SERVERS.items()},
+        )
+    except Exception as exc:
+        _revia_log(f"[HardwareProfiler] detection failed: {exc}; using safe defaults")
+        fingerprint = profiler.detect()
+
+    hw_agent = HardwareAgent(
+        fingerprint=fingerprint,
+        gpu_stats_provider=_get_gpu_stats,
+        ttl_seconds=2.0,
+    )
+    # Prime an initial snapshot so the scheduler has data on the first call.
+    try:
+        hw_agent.take_snapshot(force=True)
+    except Exception:
+        pass
+
+    scheduler = RuntimeScheduler(
+        snapshot_provider=hw_agent.latest,
+        log_fn=_revia_log,
+    )
+    scheduler.configure_from_fingerprint(fingerprint)
+
+    _hardware_profiler = profiler
+    _hardware_fingerprint = fingerprint
+    _hardware_agent = hw_agent
+    _runtime_scheduler = scheduler
+    return fingerprint, hw_agent, scheduler
+
+
+def _build_agents_orchestrator() -> AgentOrchestrator:
+    """Wire the parallel-agents orchestrator with REVIA's live singletons.
+
+    Routes are registered with :class:`ModelRequirements` so the
+    :class:`RuntimeScheduler` can throttle or fall back when the GPU
+    is under pressure.
+    """
+    fingerprint, hw_agent, scheduler = _ensure_hardware_runtime()
+
+    router = ModelRouter(scheduler=scheduler)
+
+    # Emotion classifier: cheap, in-process, no GPU needed.
+    router.register(
+        "emotion_classify",
+        backend_name="emotion_net",
+        handler=emotion_net.infer,
+        requirements=ModelRequirements(
+            vram_mb=0, cpu_bound=True, prefers_gpu=False, latency_budget_ms=400,
+        ),
+        priority_class="normal",
+        rank=10,
+        description="REVIA EmotionNet affective fusion",
+    )
+
+    # Reasoning: heavy LLM; declared VRAM cost depends on the user's chosen
+    # backend.  Estimate from the boot fingerprint's recommended_defaults so
+    # the scheduler's VRAM budget is coherent with the suggested model size.
+    reason_vram_mb = {
+        "high_24gb": 14000,
+        "mid_12gb": 6500,
+        "low_8gb": 4500,
+        "cpu_only": 0,
+    }.get(getattr(fingerprint, "suggested_profile", "cpu_only"), 4500)
+
+    router.register(
+        "reason_chat",
+        backend_name="llm_backend",
+        handler=lambda text, broadcast_fn=None, **kw: llm_backend.generate_response(
+            text, broadcast_fn or (lambda *a, **k: None), **kw,
+        ),
+        requirements=ModelRequirements(
+            vram_mb=reason_vram_mb,
+            prefers_gpu=reason_vram_mb > 0,
+            cpu_bound=reason_vram_mb == 0,
+            supports_streaming=True,
+            latency_budget_ms=20000,
+        ),
+        priority_class="high",
+        rank=10,
+        description="REVIA LLMBackend.generate_response (primary)",
+    )
+
+    # V2.3: discover available local + cloud providers and register them as
+    # ranked fallbacks (rank >= 30, so the user-chosen LLMBackend at rank 10
+    # is still tried first).  The router will fall back automatically if the
+    # primary route is denied by the scheduler.
+    global _provider_registry
+    try:
+        if _provider_registry is None:
+            _provider_registry = ProviderRegistry(log_fn=_revia_log)
+            _provider_registry.discover()
+        added = _provider_registry.register_chat_routes(
+            router=router,
+            task_type="reason_chat",
+            fingerprint=fingerprint,
+            only_available=True,
+        )
+        _revia_log(
+            f"[Agents] ProviderRegistry registered {added} fallback chat route(s)"
+        )
+    except Exception as exc:
+        _revia_log(f"[Agents] ProviderRegistry skipped: {exc}")
+
+    agents = [
+        MemoryAgent(memory_store=memory_store, model_router=router),
+        EmotionAgent(emotion_net=emotion_net, model_router=router,
+                     profile_engine=profile_engine),
+        IntentAgent(model_router=router),
+        VoiceStyleAgent(profile_engine=profile_engine, model_router=router),
+        ReasoningAgent(reply_planner=None, model_router=router),
+        # Background HardwareAgent — runs at low priority, refreshes the
+        # snapshot consumed by the scheduler on every turn.
+        hw_agent,
+    ]
+    post_agents = [
+        CriticAgent(model_router=router, profile_engine=profile_engine),
+    ]
+    final_builder = FinalResponseBuilder(hfl=None)
+    quality_gate = QualityGate(profile_engine=profile_engine)
+
+    # Regen budget: profile-driven (capped at 2 to bound latency).
+    try:
+        regen_budget = int(getattr(profile_engine, "regen_patience", 1) or 1)
+    except Exception:
+        regen_budget = 1
+    regen_budget = max(0, min(2, regen_budget))
+
+    return AgentOrchestrator(
+        agents=agents,
+        final_builder=final_builder,
+        quality_gate=quality_gate,
+        post_agents=post_agents,
+        max_regen=regen_budget,
+        agent_timeouts_ms={
+            "MemoryAgent": 1500,
+            "EmotionAgent": 500,
+            "IntentAgent": 250,
+            "VoiceStyleAgent": 250,
+            "ReasoningAgent": 8000,
+            "HardwareAgent": 600,
+            "CriticAgent": 400,
+        },
+    )
+
+
+def _get_agents_orchestrator() -> AgentOrchestrator:
+    global _agents_orchestrator
+    with _agents_orchestrator_lock:
+        if _agents_orchestrator is None:
+            _agents_orchestrator = _build_agents_orchestrator()
+        return _agents_orchestrator
+
+
+@app.route("/api/agents/chat", methods=["POST"])
+def api_agents_chat():
+    """V1 parallel-agents endpoint.
+
+    Body::
+
+        { "text": "...", "threshold": 0.70, "metadata": {...} }
+
+    Returns the structured orchestrator output (final + quality + per-agent
+    AgentResult records).  Does not modify ``conversation_manager`` state.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty message"}), 400
+
+    threshold = float(data.get("threshold", 0.70))
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    turn_id = str(data.get("turn_id") or f"agents-{int(time.time() * 1000)}")
+    profile_name = ""
+    try:
+        profile_name = str(profile_engine.profile_name or "")
+    except Exception:
+        profile_name = ""
+
+    ctx = AgentContext(
+        user_text=text,
+        turn_id=turn_id,
+        conversation_id=str(data.get("conversation_id") or "rest"),
+        user_profile=profile_name,
+        response_threshold=threshold,
+        cancel_token=CancellationToken(turn_id=turn_id),
+        metadata=metadata or {},
+    )
+
+    try:
+        output = _get_agents_orchestrator().run_turn(ctx)
+    except Exception as exc:
+        _revia_log(f"[Agents] /api/agents/chat error: {exc}")
+        return jsonify({"error": "orchestrator_error", "detail": str(exc)}), 500
+
+    return jsonify(output.to_dict())
+
+
+@app.route("/api/agents/status", methods=["GET"])
+def api_agents_status():
+    """Lightweight introspection for the agent layer."""
+    orch = _get_agents_orchestrator()
+    return jsonify({
+        "agents": orch.agent_names(),
+        "ready": True,
+    })
+
+
+@app.route("/api/agents/hardware", methods=["GET"])
+def api_agents_hardware():
+    """Return the hardware fingerprint + latest live snapshot + scheduler state.
+
+    Useful for the controller's Logs / System tab to show *exactly* what
+    REVIA detected and how the Model Router is throttling work.
+    """
+    fingerprint, hw_agent, scheduler = _ensure_hardware_runtime()
+    snapshot = hw_agent.take_snapshot(force=False) if hw_agent is not None else None
+    sched_status = scheduler.status() if scheduler is not None else None
+    return jsonify({
+        "fingerprint": fingerprint.to_dict() if fingerprint is not None else {},
+        "snapshot": snapshot.to_dict() if snapshot is not None else {},
+        "scheduler": sched_status.to_dict() if sched_status is not None else {},
+        "router": _get_agents_orchestrator() and _runtime_scheduler is not None,
+    })
+
+
+@app.route("/api/agents/providers", methods=["GET"])
+def api_agents_providers():
+    """List discovered LLM providers + their reachability + cost class.
+
+    Optional query parameter ``rediscover=1`` re-runs the HEAD-probe loop.
+    """
+    global _provider_registry
+    if _provider_registry is None:
+        _provider_registry = ProviderRegistry(log_fn=_revia_log)
+        _provider_registry.discover()
+    elif request.args.get("rediscover") in ("1", "true", "yes"):
+        try:
+            _provider_registry.discover()
+        except Exception as exc:
+            _revia_log(f"[Providers] rediscover failed: {exc}")
+    return jsonify(_provider_registry.to_dict())
+
 
 @app.route("/api/model/config", methods=["GET"])
 def api_model_config_get():
@@ -6175,10 +6554,12 @@ def main():
     conversation_manager.mark_startup_complete("Core services online")
     telemetry.state = conversation_manager.current_state
     print(f"[REVIA Core] REST server on http://{REST_HOST}:{REST_PORT}")
-    print(f"[REVIA Core] Ready. Open the controller and click 'Connect'.")
+    print("[REVIA Core] Ready. Open the controller and click 'Connect'.")
     print()
     import atexit
     atexit.register(rl_engine.save)
+    atexit.register(memory_store.close)   # Q-2: flush JSONL file handle on exit
+    atexit.register(telemetry.close)      # flush telemetry log file on exit
     if neural_refiner is not None:
         atexit.register(neural_refiner.shutdown)
     if parallel_pipeline is not None:
