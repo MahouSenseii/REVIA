@@ -240,6 +240,14 @@ from reinforcement_learner import ReinforcementLearner, RewardSignal
 from vllm_backend import VLLMEnhancer, classify_prompt_complexity
 from human_feel_layer import HumanFeelLayer
 from answer_validation import AnswerValidationSystem
+from autonomy.autonomy_loop import ReviaAutonomyLoop
+from autonomy.candidate_generator import CandidateGenerator
+from autonomy.cooldown_manager import CooldownManager
+from autonomy.memory_retriever import MemoryRetriever
+from autonomy.self_initiation_scorer import SelfInitiationScorer
+from autonomy.state_tracker import StateTracker
+from autonomy.topic_manager import TopicManager
+from reflex_responder import get_reflex_reply
 
 # ---------------------------------------------------------------------------
 # Optional Redis client for Docker-backed long-term memory
@@ -3373,6 +3381,24 @@ rl_engine.sync_from_profile(profile)
 conversation_manager.mark_initializing("Loading profile, memory, and services")
 telemetry.state = conversation_manager.current_state
 
+autonomy_topic_manager = TopicManager(memory_store=memory_store, log_fn=_revia_log)
+autonomy_loop = ReviaAutonomyLoop(
+    state_tracker=StateTracker(
+        conversation_manager=conversation_manager,
+        turn_manager=turn_manager,
+        memory_store=memory_store,
+        profile_provider=lambda: profile,
+        emotion_provider=lambda: dict(telemetry.emotion),
+        user_activity_seconds_provider=_seconds_since_user_activity,
+    ),
+    topic_manager=autonomy_topic_manager,
+    memory_retriever=MemoryRetriever(memory_store=memory_store),
+    candidate_generator=CandidateGenerator(),
+    scorer=SelfInitiationScorer(),
+    cooldown_manager=CooldownManager(),
+    log_fn=_revia_log,
+)
+
 # ---------------------------------------------------------------------------
 # WebSocket broadcast
 # ---------------------------------------------------------------------------
@@ -4025,7 +4051,74 @@ def process_pipeline(text, image_b64=None, vision_context=None, trigger=None, tu
         """Return True if an interrupt was requested since this turn started."""
         return llm_backend._is_interrupted() or not turn_manager.is_current(turn.request_id)
 
-    # === Lane 1 — Perception (emotion + router run concurrently) =============
+    # === Reflex fast path for tiny direct user turns ==========================
+    if _is_user_driven and trigger.kind == TriggerKind.RESPONSE.value:
+        reflex = get_reflex_reply(text, memory_store=memory_store, profile=profile)
+        if reflex is not None:
+            _revia_log(
+                f"Reflex response selected | request_id={turn.request_id} | reason={reflex.reason}"
+            )
+            if reflex.quiet_request:
+                try:
+                    autonomy_loop.note_quiet_request(900.0)
+                except Exception as exc:
+                    _revia_log(f"[Autonomy] Failed to note quiet request: {exc}")
+            memory_store.add_short_term(
+                "user",
+                text,
+                {"reflex": True, "reason": reflex.reason},
+            )
+            response = AssistantResponse(
+                text=reflex.text,
+                response_mode=ResponseMode.NORMAL_RESPONSE.value,
+                success=True,
+                speakable=bool(reflex.speakable),
+                commit_to_history=True,
+                commit_to_memory=bool(reflex.commit_to_memory),
+                metadata={"reflex": True, "reflex_reason": reflex.reason},
+            )
+            filtered = conversation_manager.response_filter.apply(
+                response.text,
+                trigger,
+                emotion_label=telemetry.emotion.get("label", "Neutral"),
+            )
+            response.text = filtered.text if filtered.text else response.text
+            response.speakable = bool(response.speakable and filtered.speakable and response.text)
+            if response.commit_to_history and response.text:
+                llm_backend.commit_turn_to_history(text, response.text)
+                turn_manager.remember_committed_output(text, response.text, response.response_mode)
+            if response.commit_to_memory and response.text:
+                memory_store.add_short_term("assistant", response.text, {"reflex": True})
+            _set_turn_stage(
+                turn,
+                RequestLifecycleState.SPEAKING,
+                "reflex_output",
+                runtime_state=ReviaState.SPEAKING,
+                runtime_reason=f"{trigger.source}: reflex response",
+                force_state=True,
+            )
+            _pipeline_broadcast(response.to_payload(turn.request_id, turn.turn_id))
+            conversation_manager.behavior.start_cooldown("response")
+            _set_runtime_state(
+                ReviaState.COOLDOWN,
+                f"{trigger.source}: reflex output delivered",
+                force=True,
+                broadcast=True,
+            )
+            turn_manager.finish_turn(
+                turn.request_id,
+                lifecycle_state=RequestLifecycleState.IDLE,
+                reason=f"reflex:{reflex.reason}",
+            )
+            payload = _build_status_payload()
+            broadcast_json({"type": "telemetry_update", "data": payload})
+            conversation_manager.maybe_leave_cooldown()
+            telemetry.state = conversation_manager.current_state
+            if conversation_manager.current_state == ReviaState.IDLE.value:
+                _broadcast_runtime_status()
+            return response.text
+
+    # === Lane 1: Perception (emotion + router run concurrently) ==============
     # Previously these were serial: emotion (~25ms) -> interrupt -> router
     # (~10ms) -> interrupt -> memory_update. They have no data dependency
     # between them, so we run emotion + router in parallel inside the
@@ -4919,10 +5012,12 @@ def _build_status_payload():
             "character_name": profile.get("character_name", "Revia"),
             "response_style": profile.get("response_style", "Conversational"),
             "verbosity": profile.get("verbosity", "Normal"),
+            "autonomy_mode": (profile.get("behavior", {}) or {}).get("autonomy_mode", "companion"),
         },
         "llm_connection": llm_status,
         "conversation_readiness": readiness.to_dict(),
         "behavior": conversation_manager.behavior_snapshot(),
+        "autonomy": autonomy_loop.status(),
         "architecture": architecture,
         "runtime_status": runtime_status,
         "request_lifecycle": turn_manager.snapshot(),
@@ -5480,7 +5575,7 @@ _PROACTIVE_PROMPTS = [
     "continue. Keep it short, social, and character-consistent.",
 ]
 
-def _run_proactive_pipeline(trigger):
+def _run_proactive_pipeline(trigger, autonomy_decision=None):
     """Generate a proactive Revia message without a user-side message in the UI."""
     import random as _random
 
@@ -5510,7 +5605,11 @@ def _run_proactive_pipeline(trigger):
         return
     lock_acquired = True
 
-    prompt = _random.choice(_PROACTIVE_PROMPTS)
+    prompt = (
+        autonomy_decision.prompt
+        if autonomy_decision is not None and getattr(autonomy_decision, "prompt", "")
+        else _random.choice(_PROACTIVE_PROMPTS)
+    )
     token_started = False
     response = AssistantResponse(text="", success=False, commit_to_history=False, commit_to_memory=False)
 
@@ -5612,6 +5711,12 @@ def _run_proactive_pipeline(trigger):
         _set_turn_stage(turn, RequestLifecycleState.GENERATING, "memory_commit")
         memory_store.add_short_term("assistant", response.text)
 
+    if autonomy_decision is not None and response.success and response.text:
+        try:
+            autonomy_loop.register_spoken_decision(autonomy_decision)
+        except Exception as exc:
+            _revia_log(f"[Autonomy] Failed to register spoken decision: {exc}")
+
     if response.text and not token_started:
         _set_turn_stage(
             turn,
@@ -5645,15 +5750,20 @@ def api_proactive():
     force = bool(data.get("force", False))
     source = str(data.get("source") or TriggerSource.IDLE_TIMER.value)
     reason = str(data.get("reason") or "autonomous conversation")
+    metadata = {
+        "recent_user_activity_s": _seconds_since_user_activity(),
+        "user_is_speaking": bool(data.get("user_is_speaking", False)),
+        "user_is_typing": bool(data.get("user_is_typing", False)),
+        "revia_is_speaking": bool(data.get("revia_is_speaking", False)),
+        "autonomy_mode": str(data.get("autonomy_mode") or ""),
+    }
     trigger = TriggerRequest(
         source=source,
         kind=TriggerKind.AUTONOMOUS.value,
         reason=reason,
         force=force,
         require_emotion=emotion_net.enabled,
-        metadata={
-            "recent_user_activity_s": _seconds_since_user_activity(),
-        },
+        metadata=metadata,
     )
     conversation_manager.maybe_leave_cooldown()
     readiness, _ = _build_conversation_readiness(require_emotion=emotion_net.enabled)
@@ -5661,6 +5771,8 @@ def api_proactive():
         trigger,
         readiness,
         conversation_manager.current_state,
+        user_speaking=metadata["user_is_speaking"],
+        assistant_speaking=metadata["revia_is_speaking"],
     )
     if not decision.allowed:
         return jsonify({
@@ -5669,8 +5781,32 @@ def api_proactive():
             "conversation_readiness": readiness.to_dict(),
             "state": conversation_manager.current_state,
         }), 409
-    threading.Thread(target=_run_proactive_pipeline, args=(trigger,), daemon=True).start()
-    return jsonify({"status": "proactive triggered", "force": force})
+
+    autonomy_decision = autonomy_loop.evaluate_once(
+        source=source,
+        reason=reason,
+        force=force,
+        metadata=metadata,
+    )
+    if not autonomy_decision.should_speak:
+        return jsonify({
+            "ok": True,
+            "status": "silent",
+            "force": force,
+            "autonomy": autonomy_decision.to_dict(),
+        })
+
+    threading.Thread(
+        target=_run_proactive_pipeline,
+        args=(trigger, autonomy_decision),
+        daemon=True,
+    ).start()
+    return jsonify({
+        "ok": True,
+        "status": "proactive triggered",
+        "force": force,
+        "autonomy": autonomy_decision.to_dict(),
+    })
 
 # ---------------------------------------------------------------------------
 # Web Search API

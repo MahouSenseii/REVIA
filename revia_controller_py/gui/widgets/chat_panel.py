@@ -177,6 +177,7 @@ class ChatPanel(QFrame):
 
         self.send_btn.clicked.connect(self._send)
         self.input_field.returnPressed.connect(self._send)
+        self.input_field.textChanged.connect(self._on_input_text_changed)
         self.tts_session_finished.connect(self._on_tts_session_finished)
         self.event_bus.chat_request_accepted.connect(self._on_request_accepted)
         self.event_bus.chat_token_payload.connect(self._on_token_payload)
@@ -215,6 +216,10 @@ class ChatPanel(QFrame):
 
     def set_conversation_starter(self, cs):
         self._conversation_starter = cs
+
+    def _on_input_text_changed(self, text):
+        if self._conversation_starter:
+            self._conversation_starter.set_user_typing(bool(str(text or "").strip()))
 
     def set_behavior_controller(self, controller):
         self._behavior_controller = controller

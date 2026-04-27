@@ -292,6 +292,7 @@ class VoiceTab(QScrollArea):
         self.voice_mgr.error.connect(
             lambda e: self._set_status(f"Error: {e}", role="error")
         )
+        self.voice_mgr.status.connect(self._on_voice_status)
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
         self._refresh_library()
@@ -1120,6 +1121,13 @@ class VoiceTab(QScrollArea):
         self.synth_lbl.setText(f"Synth: {metrics.synthesis_time}s")
         self.dur_lbl.setText(f"Duration: {metrics.audio_duration}s")
         self.rtf_lbl.setText(f"RTF: {metrics.realtime_factor}x")
+
+    def _on_voice_status(self, message):
+        text = str(message or "").strip()
+        if not text:
+            return
+        self._set_status(text, role="warning")
+        self._log_voice_startup(text)
 
     def _set_status(self, text, color=None, role: str = "muted"):
         """Update the status label.

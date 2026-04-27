@@ -102,6 +102,12 @@ class ConversationBehaviorController:
             require_speech_output=require_speech_output,
         )
 
+    def activity_snapshot(self) -> dict:
+        return {
+            "user_is_speaking": bool(self._is_user_speaking()),
+            "revia_is_speaking": bool(self._is_assistant_speaking()),
+        }
+
     def _evaluate(
         self,
         *,

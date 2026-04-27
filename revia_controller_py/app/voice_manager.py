@@ -38,6 +38,7 @@ class VoiceManager(QObject):
     voice_changed = Signal(str)
     metrics_updated = Signal(object)  # TTSMetrics
     error = Signal(str)
+    status = Signal(str)
     # Emitted whenever the active TTS engine changes; payload is the new engine ID
     backend_changed = Signal(str)
 
@@ -50,6 +51,7 @@ class VoiceManager(QObject):
 
         self.backend.synthesis_finished.connect(self._on_synthesis_done)
         self.backend.error_occurred.connect(lambda e: self.error.emit(e))
+        self.backend.status_updated.connect(lambda message: self.status.emit(message))
 
     @property
     def active_profile(self):

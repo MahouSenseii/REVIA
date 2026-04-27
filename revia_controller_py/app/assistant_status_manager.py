@@ -172,7 +172,6 @@ class AssistantStatusManager(QObject):
         backend.playback_finished.connect(self._on_tts_playback_finished)
         backend.playback_interrupted.connect(self._on_tts_playback_interrupted)
         backend.error_occurred.connect(self._on_tts_error)
-        self.voice_tab.voice_mgr.error.connect(self._on_tts_error)
         self.voice_tab.voice_mgr.voice_changed.connect(
             lambda *_args: self.refresh_status(emit_runtime=True)
         )

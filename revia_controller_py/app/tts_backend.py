@@ -1,6 +1,7 @@
 """TTS backend for REVIA. Supports Qwen3-TTS via gradio_client and local pyttsx3 fallback."""
 import logging
 import re
+import json
 import sys
 import time
 import shutil
@@ -101,6 +102,7 @@ class QwenTTSBackend(QObject):
     synthesis_started = Signal()
     synthesis_finished = Signal(object)  # TTSMetrics
     error_occurred = Signal(str)
+    status_updated = Signal(str)
     playback_started = Signal()
     playback_finished = Signal()
     playback_interrupted = Signal()
@@ -534,6 +536,62 @@ class QwenTTSBackend(QObject):
         except Exception as e:
             raise ConnectionError(f"Cannot connect to Qwen3-TTS at {url}: {e}")
 
+    def _get_qwen_api_names(self, client=None):
+        """Return public Gradio API names exposed by the active Qwen server."""
+        names = set()
+
+        if client is not None and hasattr(client, "view_api"):
+            try:
+                api = client.view_api(return_format="dict")
+                names.update(self._extract_api_names(api))
+            except Exception as exc:
+                _log.debug("[TTS] Could not inspect Gradio client API: %s", exc)
+
+        url = (self._qwen_url or "").rstrip("/")
+        if url.startswith(("http://", "https://")):
+            try:
+                with urllib.request.urlopen(url + "/gradio_api/info", timeout=1.5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                names.update(self._extract_api_names(payload))
+            except Exception as exc:
+                _log.debug("[TTS] Could not inspect Gradio API info: %s", exc)
+
+        return names
+
+    @staticmethod
+    def _extract_api_names(api_info):
+        names = set()
+        if not isinstance(api_info, dict):
+            return names
+        for key in ("named_endpoints", "unnamed_endpoints", "endpoints"):
+            endpoints = api_info.get(key)
+            if isinstance(endpoints, dict):
+                names.update(str(name) for name in endpoints.keys() if name)
+            elif isinstance(endpoints, list):
+                for endpoint in endpoints:
+                    if isinstance(endpoint, dict):
+                        api_name = endpoint.get("api_name") or endpoint.get("name")
+                        if api_name:
+                            names.add(str(api_name))
+                    elif endpoint:
+                        names.add(str(endpoint))
+        return names
+
+    @staticmethod
+    def _format_api_names(api_names):
+        return ", ".join(sorted(api_names)) if api_names else "none advertised"
+
+    def _report_qwen_mode_unavailable(self, mode_name, required_endpoint, api_names):
+        available = self._format_api_names(api_names)
+        msg = (
+            f"{mode_name} is not available on the current Qwen3-TTS server "
+            f"(missing {required_endpoint}; available: {available}). "
+            "Select the matching Qwen model and restart the TTS server, or use a supported voice mode."
+        )
+        _log.warning("[TTS] %s", msg)
+        self.status_updated.emit(msg)
+        return None, msg
+
     def _qwen_design(self, text, voice_description, language, output_path):
         # API: predict(text, language, voice_description, api_name="/generate_voice_design")
         #   -> (generated_audio: filepath, status: str)
@@ -548,15 +606,42 @@ class QwenTTSBackend(QObject):
             return None, str(exc)
 
         with self._synth_semaphore:
-            t0 = time.perf_counter()
-            self.synthesis_started.emit()
             try:
-                result = client.predict(
-                    text,
-                    language,
-                    voice_description,
-                    api_name="/generate_voice_design",
-                )
+                api_names = self._get_qwen_api_names(client)
+                api_name = "/generate_voice_design"
+                if api_names and "/generate_voice_design" not in api_names:
+                    if "/generate_custom_voice" not in api_names:
+                        return self._report_qwen_mode_unavailable(
+                            "Voice Design",
+                            "/generate_voice_design",
+                            api_names,
+                        )
+                    self.status_updated.emit(
+                        "Voice Design endpoint unavailable; using CustomVoice style fallback."
+                    )
+                    _log.info(
+                        "[TTS] Voice Design endpoint unavailable; using /generate_custom_voice"
+                    )
+                    api_name = "/generate_custom_voice"
+
+                t0 = time.perf_counter()
+                self.synthesis_started.emit()
+                if api_name == "/generate_custom_voice":
+                    result = client.predict(
+                        text,
+                        language,
+                        "Ryan",
+                        voice_description or "",
+                        "0.6B",
+                        api_name=api_name,
+                    )
+                else:
+                    result = client.predict(
+                        text,
+                        language,
+                        voice_description,
+                        api_name=api_name,
+                    )
                 wav_path = self._extract_wav(result, output_path)
                 m = self._build_metrics(t0, wav_path)
                 self.synthesis_finished.emit(m)
@@ -638,9 +723,16 @@ class QwenTTSBackend(QObject):
             return None, str(exc)
 
         with self._synth_semaphore:
-            t0 = time.perf_counter()
-            self.synthesis_started.emit()
             try:
+                api_names = self._get_qwen_api_names(client)
+                if api_names and "/generate_custom_voice" not in api_names:
+                    return self._report_qwen_mode_unavailable(
+                        "CustomVoice",
+                        "/generate_custom_voice",
+                        api_names,
+                    )
+                t0 = time.perf_counter()
+                self.synthesis_started.emit()
                 result = client.predict(
                     text,
                     language,
@@ -662,11 +754,20 @@ class QwenTTSBackend(QObject):
         """Extract WAV path from gradio result and optionally copy to output_path."""
         wav_path = None
         try:
+            def _candidate_path(value):
+                if isinstance(value, str) and Path(value).exists():
+                    return value
+                if isinstance(value, dict):
+                    path = value.get("path") or value.get("name")
+                    if isinstance(path, str) and Path(path).exists():
+                        return path
+                return None
+
             if isinstance(result, tuple):
                 # (audio_tuple, status_text) or (filepath, ...)
                 for item in result:
-                    if isinstance(item, str) and Path(item).exists():
-                        wav_path = item
+                    wav_path = _candidate_path(item)
+                    if wav_path:
                         break
                     if isinstance(item, tuple) and len(item) == 2:
                         # (sr, numpy_array) -> save to temp
@@ -677,8 +778,13 @@ class QwenTTSBackend(QObject):
                         sf.write(tmp.name, np.asarray(data, dtype=np.float32), int(sr))
                         wav_path = tmp.name
                         break
-            elif isinstance(result, str) and Path(result).exists():
-                wav_path = result
+            elif isinstance(result, list):
+                for item in result:
+                    wav_path = _candidate_path(item)
+                    if wav_path:
+                        break
+            else:
+                wav_path = _candidate_path(result)
 
             if wav_path and output_path:
                 shutil.copy2(wav_path, str(output_path))

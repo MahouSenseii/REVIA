@@ -30,6 +30,7 @@
     "loop_detection_window": 80,
     "loop_recovery_mode": "rephrase",
     "minimum_answer_threshold": 0.74,
+    "autonomy_mode": "companion",
     "proactive_speech_probability": 0.05,
     "question_propensity": 0.22,
     "regen_patience": 3,

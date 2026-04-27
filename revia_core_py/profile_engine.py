@@ -64,6 +64,7 @@ PRD_DEFAULT_PROFILE: dict[str, Any] = {
         "regen_patience":                3,      # max regen attempts before fallback
         "loop_detection_window":         80,     # token lookback for ALE
         "loop_recovery_mode":            "rephrase",  # rephrase | topic_shift | silence
+        "autonomy_mode":                 "companion", # quiet | companion | stream | work | emotional_support
     },
 
     # Emotional Parameters
@@ -375,6 +376,10 @@ class ProfileEngine:
     @property
     def loop_recovery_mode(self) -> str:
         return str(self.get_behavior_param("loop_recovery_mode", "rephrase"))
+
+    @property
+    def autonomy_mode(self) -> str:
+        return str(self.get_behavior_param("autonomy_mode", "companion"))
 
     @property
     def emotion_intensity(self) -> float:

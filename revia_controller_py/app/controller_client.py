@@ -700,7 +700,7 @@ class ControllerClient(QObject):
             ),
         )
 
-    def send_proactive(self, force=False, source=None, reason=None):
+    def send_proactive(self, force=False, source=None, reason=None, context=None):
         """Ask the core server to generate a proactive message from Revia."""
         def _do():
             try:
@@ -709,12 +709,32 @@ class ControllerClient(QObject):
                     payload["source"] = source
                 if reason:
                     payload["reason"] = reason
+                if isinstance(context, dict):
+                    payload.update(context)
                 r = self._session_post(
                     f"{self.BASE_URL}/api/proactive",
                     json=payload,
                     timeout=(1.0, 15.0),
                 )
-                if not r.ok:
+                if r.ok:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                    status = str(data.get("status") or "")
+                    autonomy = data.get("autonomy", {}) or {}
+                    selected = (autonomy.get("selected") or {}) if isinstance(autonomy, dict) else {}
+                    if status == "silent":
+                        self.event_bus.log_entry.emit(
+                            "[Revia] Autonomy check chose silence: "
+                            f"{autonomy.get('reason', 'no reason') if isinstance(autonomy, dict) else 'no reason'}"
+                        )
+                    elif selected:
+                        self.event_bus.log_entry.emit(
+                            "[Revia] Autonomy check allowed speech: "
+                            f"{selected.get('type', '?')} score={selected.get('score', '?')}"
+                        )
+                else:
                     try:
                         data = r.json()
                     except Exception:
