@@ -1,10 +1,12 @@
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QComboBox, QGroupBox, QSpinBox, QCheckBox,
+    QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QPushButton, QMessageBox, QTextEdit, QSizePolicy,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
+
+from gui.widgets.settings_card import SettingsCard
 
 
 class VisionTab(QScrollArea):
@@ -26,9 +28,12 @@ class VisionTab(QScrollArea):
         layout.addWidget(header)
 
         # --- Vision Module ---
-        group = QGroupBox("Vision Module")
-        group.setObjectName("settingsGroup")
-        g = QFormLayout(group)
+        vision_card = SettingsCard(
+            "Vision Module",
+            subtitle="Engine & capture mode",
+            icon="V",
+        )
+        g = QFormLayout()
 
         self.vision_engine = QComboBox()
         self.vision_engine.addItems(
@@ -44,13 +49,16 @@ class VisionTab(QScrollArea):
         self.auto_capture = QCheckBox("Auto-capture on vision queries")
         self.auto_capture.setChecked(True)
         g.addRow("", self.auto_capture)
+        vision_card.add_layout(g)
 
-        layout.addWidget(group)
+        layout.addWidget(vision_card)
 
         # --- Camera Source ---
-        cam_group = QGroupBox("Camera Source")
-        cam_group.setObjectName("settingsGroup")
-        cg = QVBoxLayout(cam_group)
+        cam_card = SettingsCard(
+            "Camera Source",
+            subtitle="USB, Luxonis, or IP stream",
+            icon="C",
+        )
 
         detect_row = QHBoxLayout()
         self.camera_combo = QComboBox()
@@ -60,7 +68,7 @@ class VisionTab(QScrollArea):
         self.detect_btn.setObjectName("secondaryBtn")
         self.detect_btn.clicked.connect(self._detect_cameras)
         detect_row.addWidget(self.detect_btn)
-        cg.addLayout(detect_row)
+        cam_card.add_layout(detect_row)
 
         wireless_row = QHBoxLayout()
         wireless_label = QLabel("Wireless / IP:")
@@ -71,7 +79,7 @@ class VisionTab(QScrollArea):
             "rtsp://user:pass@192.168.1.100:554/stream (leave blank for USB/Luxonis)"
         )
         wireless_row.addWidget(self.wireless_url, stretch=1)
-        cg.addLayout(wireless_row)
+        cam_card.add_layout(wireless_row)
 
         conn_row = QHBoxLayout()
         self.connect_btn = QPushButton("Connect Camera")
@@ -83,19 +91,21 @@ class VisionTab(QScrollArea):
         self.disconnect_btn.clicked.connect(self._disconnect_camera)
         self.disconnect_btn.setEnabled(False)
         conn_row.addWidget(self.disconnect_btn)
-        cg.addLayout(conn_row)
+        cam_card.add_layout(conn_row)
 
         self.cam_status = QLabel("Status: Disconnected")
         self.cam_status.setObjectName("metricLabel")
         self.cam_status.setFont(QFont("Consolas", 9))
-        cg.addWidget(self.cam_status)
+        cam_card.add_widget(self.cam_status)
 
-        layout.addWidget(cam_group)
+        layout.addWidget(cam_card)
 
         # --- Object Identification ---
-        obj_group = QGroupBox("Object Identification")
-        obj_group.setObjectName("settingsGroup")
-        og = QVBoxLayout(obj_group)
+        obj_card = SettingsCard(
+            "Object Identification",
+            subtitle="Detection & classification",
+            icon="O",
+        )
 
         obj_info = QLabel(
             "Detect and classify objects in camera frames using "
@@ -103,7 +113,8 @@ class VisionTab(QScrollArea):
         )
         obj_info.setFont(QFont("Segoe UI", 8))
         obj_info.setWordWrap(True)
-        og.addWidget(obj_info)
+        obj_info.setObjectName("cardSubText")
+        obj_card.add_widget(obj_info)
 
         obj_form = QFormLayout()
         self.obj_engine = QComboBox()
@@ -124,31 +135,33 @@ class VisionTab(QScrollArea):
             "person, cat, dog, cup, phone... (blank = all)"
         )
         obj_form.addRow("Filter Classes:", self.obj_classes)
-        og.addLayout(obj_form)
+        obj_card.add_layout(obj_form)
 
         self.obj_realtime = QCheckBox("Real-time detection overlay")
         self.obj_realtime.setChecked(True)
-        og.addWidget(self.obj_realtime)
+        obj_card.add_widget(self.obj_realtime)
 
         self.obj_results = QTextEdit()
         self.obj_results.setReadOnly(True)
         self.obj_results.setMaximumHeight(80)
         self.obj_results.setPlaceholderText("Detection results...")
-        og.addWidget(self.obj_results)
+        obj_card.add_widget(self.obj_results)
 
         obj_btn_row = QHBoxLayout()
         self.detect_objects_btn = QPushButton("Detect Now")
         self.detect_objects_btn.setObjectName("primaryBtn")
         self.detect_objects_btn.clicked.connect(self._detect_objects)
         obj_btn_row.addWidget(self.detect_objects_btn)
-        og.addLayout(obj_btn_row)
+        obj_card.add_layout(obj_btn_row)
 
-        layout.addWidget(obj_group)
+        layout.addWidget(obj_card)
 
         # --- Gesture Recognition ---
-        gest_group = QGroupBox("Gesture Recognition")
-        gest_group.setObjectName("settingsGroup")
-        gg = QVBoxLayout(gest_group)
+        gest_card = SettingsCard(
+            "Gesture Recognition",
+            subtitle="Hand & body poses",
+            icon="G",
+        )
 
         gest_info = QLabel(
             "Recognize hand gestures and body poses via MediaPipe "
@@ -156,7 +169,8 @@ class VisionTab(QScrollArea):
         )
         gest_info.setFont(QFont("Segoe UI", 8))
         gest_info.setWordWrap(True)
-        gg.addWidget(gest_info)
+        gest_info.setObjectName("cardSubText")
+        gest_card.add_widget(gest_info)
 
         gest_form = QFormLayout()
         self.gesture_engine = QComboBox()
@@ -171,21 +185,21 @@ class VisionTab(QScrollArea):
         self.gesture_sensitivity.setValue(70)
         self.gesture_sensitivity.setSuffix("%")
         gest_form.addRow("Sensitivity:", self.gesture_sensitivity)
-        gg.addLayout(gest_form)
+        gest_card.add_layout(gest_form)
 
         self.gesture_enabled = QCheckBox("Enable gesture recognition")
         self.gesture_enabled.setChecked(False)
-        gg.addWidget(self.gesture_enabled)
+        gest_card.add_widget(self.gesture_enabled)
 
         self.gesture_log = QTextEdit()
         self.gesture_log.setReadOnly(True)
         self.gesture_log.setMaximumHeight(80)
         self.gesture_log.setPlaceholderText("Gesture events...")
-        gg.addWidget(self.gesture_log)
+        gest_card.add_widget(self.gesture_log)
 
         gest_map_label = QLabel("Gesture Mappings:")
         gest_map_label.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        gg.addWidget(gest_map_label)
+        gest_card.add_widget(gest_map_label)
 
         mappings_form = QFormLayout()
         self.gesture_wave = QComboBox()
@@ -215,14 +229,16 @@ class VisionTab(QScrollArea):
             "Focus Object", "Take Snapshot", "No Action",
         ])
         mappings_form.addRow("Point:", self.gesture_point)
-        gg.addLayout(mappings_form)
+        gest_card.add_layout(mappings_form)
 
-        layout.addWidget(gest_group)
+        layout.addWidget(gest_card)
 
         # --- Camera Preview ---
-        preview_group = QGroupBox("Camera Preview")
-        preview_group.setObjectName("settingsGroup")
-        p = QVBoxLayout(preview_group)
+        preview_card = SettingsCard(
+            "Camera Preview",
+            subtitle="Live feed & snapshot",
+            icon="P",
+        )
 
         self.preview = QLabel("[Camera Inactive]")
         self.preview.setAlignment(Qt.AlignCenter)
@@ -231,7 +247,7 @@ class VisionTab(QScrollArea):
         self.preview.setMaximumWidth(720)
         self.preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.preview.setObjectName("webcamPlaceholder")
-        p.addWidget(self.preview, alignment=Qt.AlignCenter)
+        preview_card.add_widget(self.preview)
 
         snap_row = QHBoxLayout()
         self.snapshot_btn = QPushButton("Take Snapshot")
@@ -239,9 +255,9 @@ class VisionTab(QScrollArea):
         self.snapshot_btn.clicked.connect(self._take_snapshot)
         self.snapshot_btn.setEnabled(False)
         snap_row.addWidget(self.snapshot_btn)
-        p.addLayout(snap_row)
+        preview_card.add_layout(snap_row)
 
-        layout.addWidget(preview_group)
+        layout.addWidget(preview_card)
         layout.addStretch()
         self.setWidget(container)
 

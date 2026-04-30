@@ -44,7 +44,7 @@ import traceback
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +296,120 @@ class ConsoleBackend(ErrorBackend):
             _severity_to_logging(report.severity),
             " ".join(parts),
         )
+
+
+class WebSocketBackend(ErrorBackend):
+    """Forwards error reports to the GUI via a WebSocket broadcast callable.
+
+    The broadcaster is provided as a callable (typically
+    :func:`core_server.broadcast_json`) so this backend has no hard import
+    dependency on the server module.  The payload matches the existing
+    ``log_entry`` envelope consumed by the controller's ``logs_tab``::
+
+        {"type": "log_entry", "text": "[ERROR] [inference] ... (fn:line)"}
+
+    A small in-memory buffer captures messages emitted before the
+    broadcaster is wired (e.g. during startup); the buffer is replayed
+    automatically on the first successful broadcast.
+    """
+
+    __slots__ = ("_broadcast", "_buffer", "_buffer_lock", "_min_level")
+
+    def __init__(
+        self,
+        broadcaster_fn: Callable[[dict], None] | None = None,
+        *,
+        buffer_size: int = 200,
+    ) -> None:
+        self._broadcast = broadcaster_fn
+        self._buffer: deque[str] = deque(maxlen=max(0, int(buffer_size)))
+        self._buffer_lock = threading.Lock()
+        min_level_name = os.environ.get("REVIA_LOG_LEVEL", "DEBUG").upper()
+        try:
+            self._min_level = ErrorSeverity[min_level_name]
+        except KeyError:
+            self._min_level = ErrorSeverity.DEBUG
+
+    def set_broadcaster(self, broadcaster_fn: Callable[[dict], None] | None) -> None:
+        """Wire (or rewire) the broadcaster.  Flushes any buffered lines."""
+        self._broadcast = broadcaster_fn
+        if broadcaster_fn is None:
+            return
+        # Drain the buffer on first wiring so startup errors reach the GUI.
+        with self._buffer_lock:
+            pending = list(self._buffer)
+            self._buffer.clear()
+        for line in pending:
+            try:
+                broadcaster_fn({"type": "log_entry", "text": line})
+            except Exception:
+                # If broadcasting fails mid-replay, stop — the rest will be
+                # lost rather than recurse into the error path.
+                break
+
+    def emit(self, report: ErrorReport) -> None:
+        if report.severity < self._min_level:
+            return
+        parts = [
+            f"[{report.severity.name}]",
+            f"[{report.category}]",
+            report.message,
+            f"({report.function_name}:{report.line_number})",
+        ]
+        line = " ".join(parts)
+        broadcaster = self._broadcast
+        if not callable(broadcaster):
+            with self._buffer_lock:
+                self._buffer.append(line)
+            return
+        try:
+            broadcaster({"type": "log_entry", "text": line})
+        except Exception:
+            # WS layer not ready or transport error — buffer for retry on
+            # the next broadcaster swap.  Never raise from a logging path.
+            with self._buffer_lock:
+                self._buffer.append(line)
+
+
+class CompositeBackend(ErrorBackend):
+    """Fan-out backend: emits each report to every wrapped backend.
+
+    Failures in one backend never block another.  Used to attach
+    WebSocketBackend alongside ConsoleBackend / FileBackend without
+    changing the :class:`ReviaErrorHandler` single-backend façade.
+    """
+
+    __slots__ = ("_backends",)
+
+    def __init__(self, backends: Iterable[ErrorBackend]) -> None:
+        self._backends: list[ErrorBackend] = [b for b in backends if b is not None]
+
+    def add(self, backend: ErrorBackend) -> None:
+        if backend is None:
+            return
+        self._backends.append(backend)
+
+    def emit(self, report: ErrorReport) -> None:
+        for backend in self._backends:
+            try:
+                backend.emit(report)
+            except Exception:
+                # A misbehaving backend must never starve the others.
+                continue
+
+    def close(self) -> None:
+        for backend in self._backends:
+            try:
+                backend.close()
+            except Exception:
+                continue
+
+    def find(self, kind: type) -> ErrorBackend | None:
+        """Return the first wrapped backend of the given type, if any."""
+        for backend in self._backends:
+            if isinstance(backend, kind):
+                return backend
+        return None
 
 
 class FileBackend(ErrorBackend):
@@ -561,6 +675,45 @@ class ReviaErrorHandler:
     def swap_backend(self, backend: ErrorBackend) -> None:
         self._backend.close()
         self._backend = backend
+
+    # --- composite-backend helpers ---
+    def attach_backend(self, backend: ErrorBackend) -> None:
+        """Add an additional backend without losing the existing one(s).
+
+        If the current backend is a :class:`CompositeBackend`, ``backend`` is
+        appended to it.  Otherwise the existing backend is wrapped in a fresh
+        composite alongside the new one.
+        """
+        if isinstance(self._backend, CompositeBackend):
+            self._backend.add(backend)
+            return
+        existing = self._backend
+        self._backend = CompositeBackend([existing, backend])
+
+    def attach_websocket_broadcaster(
+        self, broadcaster_fn: Callable[[dict], None] | None
+    ) -> WebSocketBackend:
+        """Attach (or rewire) a :class:`WebSocketBackend` for GUI delivery.
+
+        Idempotent: if a WebSocketBackend is already attached, its broadcaster
+        is rewired and any buffered lines are flushed.  Returns the active
+        backend so callers can introspect it.
+        """
+        existing: WebSocketBackend | None = None
+        if isinstance(self._backend, CompositeBackend):
+            found = self._backend.find(WebSocketBackend)
+            if isinstance(found, WebSocketBackend):
+                existing = found
+        elif isinstance(self._backend, WebSocketBackend):
+            existing = self._backend
+
+        if existing is not None:
+            existing.set_broadcaster(broadcaster_fn)
+            return existing
+
+        ws = WebSocketBackend(broadcaster_fn)
+        self.attach_backend(ws)
+        return ws
 
     # --- timer ---
     def timer(self, label: str, category: str = "general") -> PerformanceTimer:

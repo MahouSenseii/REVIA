@@ -141,6 +141,8 @@ class VoiceLibrary:
 
     def _safe_name(self, name):
         safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()
+        if not safe or not any(c.isalnum() for c in safe):
+            raise ValueError("Voice name must contain at least one letter or number")
         # Ensure the resolved path is within base_dir (path traversal protection)
         resolved = (self.base_dir / safe).resolve()
         if not str(resolved).startswith(str(self.base_dir.resolve())):

@@ -1,8 +1,10 @@
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout,
-    QLabel, QTextEdit, QGroupBox, QSpinBox, QCheckBox,
+    QLabel, QTextEdit, QSpinBox, QCheckBox,
 )
 from PySide6.QtGui import QFont
+
+from gui.widgets.settings_card import SettingsCard
 
 
 class FiltersTab(QScrollArea):
@@ -20,30 +22,35 @@ class FiltersTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        group = QGroupBox("Safety Filters")
-        group.setObjectName("settingsGroup")
-        g = QVBoxLayout(group)
+        safety_card = SettingsCard(
+            "Safety Filters",
+            subtitle="Content guard rails",
+            icon="!",
+        )
 
         self.nsfw_filter = QCheckBox("NSFW Content Filter")
         self.nsfw_filter.setChecked(True)
-        g.addWidget(self.nsfw_filter)
+        safety_card.add_widget(self.nsfw_filter)
 
         self.profanity_filter = QCheckBox("Profanity Filter")
-        g.addWidget(self.profanity_filter)
+        safety_card.add_widget(self.profanity_filter)
 
         self.pii_filter = QCheckBox("PII Detection & Masking")
         self.pii_filter.setChecked(True)
-        g.addWidget(self.pii_filter)
+        safety_card.add_widget(self.pii_filter)
 
         self.injection_guard = QCheckBox("Prompt Injection Guard")
         self.injection_guard.setChecked(True)
-        g.addWidget(self.injection_guard)
+        safety_card.add_widget(self.injection_guard)
 
-        layout.addWidget(group)
+        layout.addWidget(safety_card)
 
-        bounds_group = QGroupBox("Behavior Boundaries")
-        bounds_group.setObjectName("settingsGroup")
-        b = QFormLayout(bounds_group)
+        bounds_card = SettingsCard(
+            "Behavior Boundaries",
+            subtitle="Response limits & blocked topics",
+            icon="B",
+        )
+        b = QFormLayout()
 
         self.max_response_len = QSpinBox()
         self.max_response_len.setRange(50, 8192)
@@ -56,7 +63,8 @@ class FiltersTab(QScrollArea):
             "Enter blocked topics, one per line..."
         )
         b.addRow("Blocked Topics:", self.blocked_topics)
+        bounds_card.add_layout(b)
 
-        layout.addWidget(bounds_group)
+        layout.addWidget(bounds_card)
         layout.addStretch()
         self.setWidget(container)

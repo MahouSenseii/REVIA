@@ -316,6 +316,49 @@ QGroupBox::title {
     letter-spacing: 1px;
 }
 
+/* ── Settings Cards (Profile / sub-category cards) ───────── */
+#settingsCard {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 rgba(28, 18, 56, 220),
+        stop:1 rgba(18, 12, 38, 220));
+    border: 1px solid rgba(168, 85, 247, 0.20);
+    border-radius: 14px;
+}
+
+#cardHeaderBar {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(168, 85, 247, 0.18),
+        stop:1 rgba(168, 85, 247, 0.02));
+    border-bottom: 1px solid rgba(168, 85, 247, 0.25);
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+}
+
+#cardHeader {
+    color: #d8b4fe;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    padding: 0;
+    background: transparent;
+}
+
+#cardSubText {
+    color: rgba(216, 180, 254, 0.55);
+    font-size: 9px;
+    background: transparent;
+}
+
+#cardIcon {
+    color: #d8b4fe;
+    font-size: 13px;
+    background: transparent;
+}
+
+#cardBody {
+    background: transparent;
+}
+
 /* ── Inputs ──────────────────────────────────────────────── */
 QLineEdit {
     background: rgba(22, 16, 44, 190);

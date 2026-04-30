@@ -10,17 +10,19 @@ import importlib.util
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
-    QLabel, QComboBox, QGroupBox, QCheckBox,
+    QLabel, QComboBox, QCheckBox,
     QPushButton, QProgressBar, QListWidget, QTextEdit,
     QLineEdit, QTabWidget, QFileDialog, QInputDialog, QMessageBox,
+    QToolButton, QFrame, QListWidgetItem, QStyle,
 )
-from PySide6.QtCore import Qt, QTimer, QProcess
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QTimer, QProcess, Signal, QSize
+from PySide6.QtGui import QFont, QPainter, QColor
 
 from app.voice_profile import VoiceMode
 from app.voice_manager import VoiceManager
 from app.tts_backend import QWEN_SPEAKERS, QWEN_LANGUAGES, QWEN_MODEL_SIZES
 from app.ui_status import apply_status_style, clear_status_role
+from gui.widgets.settings_card import SettingsCard
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,235 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _standard_icon(widget, name: str, fallback: str = "SP_FileIcon"):
+    standard = getattr(QStyle, name, None)
+    if standard is None and hasattr(QStyle, "StandardPixmap"):
+        standard = getattr(QStyle.StandardPixmap, name, None)
+    if standard is None:
+        standard = getattr(QStyle, fallback, None)
+    if standard is None and hasattr(QStyle, "StandardPixmap"):
+        standard = getattr(QStyle.StandardPixmap, fallback, None)
+    if standard is None:
+        return None
+    return widget.style().standardIcon(standard)
+
+
+class CollapsibleSection(QWidget):
+    def __init__(self, title, content, expanded=True, parent=None):
+        super().__init__(parent)
+        self.content = content
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle.clicked.connect(self._on_toggled)
+        layout.addWidget(self.toggle)
+
+        self.content.setVisible(expanded)
+        layout.addWidget(self.content)
+
+    def _on_toggled(self, checked):
+        self.toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content.setVisible(checked)
+
+
+class StatusCard(QFrame):
+    def __init__(self, title, value="--", role="muted", parent=None):
+        super().__init__(parent)
+        self.setObjectName("voiceStatusCard")
+        self.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+        self.title_lbl = QLabel(title)
+        self.title_lbl.setObjectName("metricLabel")
+        self.title_lbl.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        self.value_lbl = QLabel(value)
+        self.value_lbl.setObjectName("metricLabel")
+        self.value_lbl.setWordWrap(True)
+        layout.addWidget(self.title_lbl)
+        layout.addWidget(self.value_lbl)
+        self.set_value(value, role)
+
+    def set_value(self, value, role="muted"):
+        self.value_lbl.setText(str(value or "--"))
+        apply_status_style(self.value_lbl, role=role)
+
+
+class Stepper(QWidget):
+    def __init__(self, steps, parent=None):
+        super().__init__(parent)
+        self._steps = list(steps)
+        self._labels = []
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        for step in self._steps:
+            lbl = QLabel(step)
+            lbl.setObjectName("metricLabel")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumHeight(24)
+            lbl.setFrameShape(QFrame.StyledPanel)
+            apply_status_style(lbl, role="muted")
+            layout.addWidget(lbl)
+            self._labels.append(lbl)
+
+    def set_state(self, active=None, complete=None, failed=None):
+        complete = set(complete or [])
+        failed = set(failed or [])
+        for step, lbl in zip(self._steps, self._labels):
+            if step in failed:
+                role = "error"
+            elif step == active:
+                role = "warning"
+            elif step in complete:
+                role = "success"
+            else:
+                role = "muted"
+            apply_status_style(lbl, role=role)
+
+
+class WaveformPreview(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._samples = []
+        self._label = "No audio generated yet"
+        self.setMinimumHeight(58)
+
+    def clear(self, label="No audio generated yet"):
+        self._samples = []
+        self._label = label
+        self.update()
+
+    def set_audio(self, wav_path):
+        self._label = str(wav_path or "")
+        self._samples = self._read_samples(wav_path)
+        self.update()
+
+    def _read_samples(self, wav_path):
+        try:
+            import wave
+            path = Path(wav_path)
+            if not path.exists():
+                return []
+            with wave.open(str(path), "rb") as wf:
+                channels = max(1, wf.getnchannels())
+                width = wf.getsampwidth()
+                frames = wf.readframes(min(wf.getnframes(), 44100 * 8))
+            if not frames or width not in (1, 2, 4):
+                return []
+            step = max(width * channels, int(len(frames) / 96) or width * channels)
+            values = []
+            max_amp = 1
+            for offset in range(0, len(frames) - width, step):
+                chunk = frames[offset:offset + width]
+                if width == 1:
+                    amp = abs(chunk[0] - 128)
+                    max_amp = 128
+                elif width == 2:
+                    amp = abs(int.from_bytes(chunk, "little", signed=True))
+                    max_amp = 32768
+                else:
+                    amp = abs(int.from_bytes(chunk, "little", signed=True))
+                    max_amp = 2147483648
+                values.append(min(1.0, amp / max_amp))
+            return values[:96]
+        except Exception as exc:
+            logger.debug("Could not build waveform preview: %s", exc)
+            return []
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(rect, QColor(20, 18, 32))
+        painter.setPen(QColor(78, 66, 110))
+        painter.drawRoundedRect(rect, 6, 6)
+        if not self._samples:
+            painter.setPen(QColor(150, 140, 180))
+            painter.drawText(rect, Qt.AlignCenter, self._label)
+            return
+        mid = rect.center().y()
+        bar_w = max(2, rect.width() // max(1, len(self._samples)))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(176, 78, 255))
+        x = rect.left() + 6
+        usable_h = max(12, rect.height() - 14)
+        for sample in self._samples:
+            h = max(4, int(sample * usable_h))
+            painter.drawRoundedRect(x, mid - h // 2, max(2, bar_w - 2), h, 2, 2)
+            x += bar_w
+
+
+class VoiceCardWidget(QFrame):
+    def __init__(self, profile, is_active, is_default, callbacks, parent=None):
+        super().__init__(parent)
+        self.profile = profile
+        self.setObjectName("voiceCard")
+        self.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        top = QHBoxLayout()
+        title = QLabel(profile.name)
+        title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        top.addWidget(title, stretch=1)
+        badges = []
+        if is_active:
+            badges.append("Active")
+        if is_default:
+            badges.append("Default")
+        badges.append(profile.mode.value.title())
+        badge = QLabel(" | ".join(badges))
+        badge.setObjectName("metricLabel")
+        apply_status_style(badge, role="success" if is_active else "accent")
+        top.addWidget(badge)
+        layout.addLayout(top)
+
+        wav_state = "WAV ready" if profile.has_wav() else "No WAV"
+        meta = QLabel(f"{profile.language} | {wav_state}")
+        meta.setObjectName("metricLabel")
+        apply_status_style(meta, role="success" if profile.has_wav() else "warning")
+        layout.addWidget(meta)
+
+        buttons = QHBoxLayout()
+        for label, callback in (
+            ("Play", callbacks["play"]),
+            ("Set Active", callbacks["active"]),
+            ("Delete", callbacks["delete"]),
+        ):
+            btn = QPushButton(label)
+            btn.setObjectName("secondaryBtn")
+            icon_name = {
+                "Play": "SP_MediaPlay",
+                "Set Active": "SP_DialogApplyButton",
+                "Delete": "SP_TrashIcon",
+            }.get(label)
+            icon = _standard_icon(btn, icon_name, fallback="SP_DialogDiscardButton")
+            if icon is not None:
+                btn.setIcon(icon)
+                btn.setIconSize(QSize(15, 15))
+            btn.setToolTip(label)
+            btn.clicked.connect(lambda _checked=False, cb=callback, name=profile.name: cb(name))
+            if label == "Play":
+                btn.setEnabled(profile.has_wav())
+            buttons.addWidget(btn)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+
 class VoiceTab(QScrollArea):
+    design_done = Signal(object, object)
+    clone_done = Signal(object, object)
+    custom_done = Signal(object, object)
+
     def __init__(self, event_bus, client, audio_service=None, parent=None):
         super().__init__(parent)
         self.event_bus = event_bus
@@ -58,18 +288,26 @@ class VoiceTab(QScrollArea):
 
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
         header = QLabel("Voice Management")
         header.setObjectName("tabHeader")
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
+        self.toast_label = QLabel("")
+        self.toast_label.setObjectName("toastLabel")
+        self.toast_label.setWordWrap(True)
+        self.toast_label.setVisible(False)
+        layout.addWidget(self.toast_label)
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(lambda: self.toast_label.setVisible(False))
+
         # Qwen3-TTS Server
-        srv_group = QGroupBox("Qwen3-TTS Server")
-        srv_group.setObjectName("settingsGroup")
-        sv = QFormLayout(srv_group)
+        srv_card = SettingsCard("Qwen3-TTS Server", subtitle="Server config & backend", icon="S")
+        sv = QFormLayout()
         sv.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.qwen_url = QLineEdit("http://localhost:8000")
@@ -139,54 +377,92 @@ class VoiceTab(QScrollArea):
         self._tts_last_device_label = ""
         self._tts_cuda_failure_seen = False
         self._tts_cuda_retry_attempted = False
-        layout.addWidget(srv_group)
+        # Capability snapshot from the running Qwen3-TTS server.  Updated
+        # by the backend's ``capabilities_changed`` signal.  When the
+        # active server only supports a subset of modes (Base/Clone vs
+        # CustomVoice vs VoiceDesign), the unsupported tab labels show
+        # ``(N/A)`` and the active one shows ``(active)``.
+        self._caps_variant = "unknown"
+        self._caps_label = "Probing..."
+        self._caps_modes: list[str] = []
+        self._caps_api_names: list[str] = []
+        builder_content = QWidget()
+        builder_layout = QVBoxLayout(builder_content)
+        builder_layout.setContentsMargins(0, 0, 0, 0)
+        builder_layout.setSpacing(6)
+        srv_card.add_layout(sv)
+        builder_layout.addWidget(srv_card)
 
-        # TTS Output Device (Revia's voice)
-        # Placed directly under the TTS server controls so it's visible
-        # without scrolling - it's a frequent-touch setting when you have
-        # multiple outputs (speakers / headset / VB-Cable / OBS Monitor).
-        out_group = QGroupBox("TTS Output (where Revia speaks)")
-        out_group.setObjectName("settingsGroup")
-        ov = QFormLayout(out_group)
-        ov.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        self.output_device = QComboBox()
-        # The first entry (userData=None) means "use the OS default device".
-        self.output_device.addItem("System Default", userData=None)
-        self._populate_output_devices()
-        self.output_device.currentIndexChanged.connect(self._on_output_device_changed)
-        ov.addRow("Output Device:", self.output_device)
-        out_btn_row = QHBoxLayout()
-        self.output_test_btn = QPushButton("Test Output")
-        self.output_test_btn.setObjectName("secondaryBtn")
-        self.output_test_btn.clicked.connect(self._test_output_device)
-        out_btn_row.addWidget(self.output_test_btn)
-        self.output_refresh_btn = QPushButton("Refresh")
-        self.output_refresh_btn.setObjectName("secondaryBtn")
-        self.output_refresh_btn.clicked.connect(self._refresh_output_devices)
-        out_btn_row.addWidget(self.output_refresh_btn)
-        out_btn_row.addStretch()
-        ov.addRow("", out_btn_row)
-        layout.addWidget(out_group)
+        card_row = QHBoxLayout()
+        self.voice_card = StatusCard("Voice", "Fallback", "warning")
+        self.mode_card = StatusCard("Mode", "Select a mode", "muted")
+        self.save_card = StatusCard("Save", "Auto-save waiting", "muted")
+        self.output_card = StatusCard("Output", "System Default", "muted")
+        for card in (self.voice_card, self.mode_card, self.save_card, self.output_card):
+            card_row.addWidget(card)
+        builder_layout.addLayout(card_row)
+
+        # Active Voice / Server Capabilities panel.  Always visible,
+        # tells the user *which voice* speaks, *which mode* is active,
+        # and *what the server can do* without scrolling.
+        active_card = SettingsCard("Active Voice & Server Capabilities", subtitle="Current voice & server info", icon="A")
+        ag = QFormLayout()
+        ag.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.active_voice_lbl = QLabel("Active Voice: (none) - using fallback")
+        self.active_voice_lbl.setObjectName("metricLabel")
+        self.active_voice_lbl.setFont(QFont("Consolas", 8))
+        self.active_voice_lbl.setWordWrap(True)
+        ag.addRow("Voice:", self.active_voice_lbl)
+
+        self.caps_lbl = QLabel("Server: probing...")
+        self.caps_lbl.setObjectName("metricLabel")
+        self.caps_lbl.setFont(QFont("Consolas", 8))
+        self.caps_lbl.setWordWrap(True)
+        ag.addRow("Capabilities:", self.caps_lbl)
+
+        # Live "what's happening now" indicator (synthesis + playback).
+        self.activity_lbl = QLabel("Idle")
+        self.activity_lbl.setObjectName("metricLabel")
+        self.activity_lbl.setFont(QFont("Consolas", 8))
+        self.activity_lbl.setWordWrap(True)
+        ag.addRow("Activity:", self.activity_lbl)
+        active_card.add_layout(ag)
+        builder_layout.addWidget(active_card)
+
+        self.workflow_stepper = Stepper([
+            "Name", "Configure", "Generate", "Auto-save", "Test", "Active",
+        ])
+        self.workflow_stepper.set_state(active="Name")
+        builder_layout.addWidget(self.workflow_stepper)
+
+        self.activity_timeline = Stepper([
+            "Server", "Generating", "Saved", "Playing",
+        ])
+        self.activity_timeline.set_state(active="Server")
+        builder_layout.addWidget(self.activity_timeline)
 
         # 3 Mode Tabs (matching Qwen3-TTS demo)
         self.mode_tabs = QTabWidget()
         self.mode_tabs.addTab(self._build_design_tab(), "Voice Design")
         self.mode_tabs.addTab(self._build_clone_tab(), "Voice Clone (Base)")
         self.mode_tabs.addTab(self._build_custom_tab(), "TTS (CustomVoice)")
-        layout.addWidget(self.mode_tabs)
+        self.mode_tabs.setMinimumHeight(360)
+        builder_layout.addWidget(self.mode_tabs)
+        layout.addWidget(CollapsibleSection("Voice Builder", builder_content, expanded=True))
 
         # Voice Library
-        lib_group = QGroupBox("Voice Library")
-        lib_group.setObjectName("settingsGroup")
-        lib_layout = QVBoxLayout(lib_group)
+        lib_card = SettingsCard("Voice Library", subtitle="Manage saved voices", icon="V")
+        lib_layout = QVBoxLayout()
         lib_layout.setSpacing(4)
 
         self.voice_list = QListWidget()
-        self.voice_list.setMaximumHeight(110)
-        self.voice_list.currentTextChanged.connect(self._on_voice_selected)
+        self.voice_list.setMaximumHeight(260)
+        self.voice_list.currentItemChanged.connect(self._on_voice_item_selected)
         lib_layout.addWidget(self.voice_list)
 
         lib_btns = QHBoxLayout()
+        self.library_action_buttons = {}
         for text, slot in [
             ("Set Active", self._set_active), ("Rename", self._rename_voice),
             ("Delete", self._delete_voice), ("Set Default", self._set_default),
@@ -196,6 +472,7 @@ class VoiceTab(QScrollArea):
             b.setMinimumHeight(26)
             b.setMaximumHeight(34)
             b.clicked.connect(slot)
+            self.library_action_buttons[text] = b
             lib_btns.addWidget(b)
         lib_layout.addLayout(lib_btns)
 
@@ -209,20 +486,26 @@ class VoiceTab(QScrollArea):
             b.setMinimumHeight(26)
             b.setMaximumHeight(34)
             b.clicked.connect(slot)
+            self.library_action_buttons[text] = b
             lib_btns2.addWidget(b)
         lib_layout.addLayout(lib_btns2)
 
-        self.lib_meta = QLabel("Select a voice to see details")
+        voices_path = str(self.voice_mgr.library.base_dir)
+        self.lib_meta = QLabel(f"Saved in: {voices_path}\nSelect a voice to see details")
         self.lib_meta.setFont(QFont("Consolas", 8))
         self.lib_meta.setObjectName("metricLabel")
         self.lib_meta.setWordWrap(True)
         lib_layout.addWidget(self.lib_meta)
-        layout.addWidget(lib_group)
+        lib_card.add_layout(lib_layout)
+        layout.addWidget(CollapsibleSection("Voice Library", lib_card, expanded=False))
 
         # STT Input
-        stt_group = QGroupBox("Speech-to-Text (Input)")
-        stt_group.setObjectName("settingsGroup")
-        stf = QFormLayout(stt_group)
+        input_content = QWidget()
+        input_layout = QVBoxLayout(input_content)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(6)
+        stt_card = SettingsCard("Speech-to-Text (Input)", subtitle="STT input settings", icon="I")
+        stf = QFormLayout()
         self.input_device = QComboBox()
         self.input_device.addItem("Default Microphone")
         self._populate_input_devices()
@@ -234,12 +517,12 @@ class VoiceTab(QScrollArea):
             "Always Listening (VAD)",
         ])
         stf.addRow("Activation:", self.ptt_mode)
-        layout.addWidget(stt_group)
+        stt_card.add_layout(stf)
+        input_layout.addWidget(stt_card)
 
         # Mic Test
-        mic_group = QGroupBox("Microphone Test")
-        mic_group.setObjectName("settingsGroup")
-        ml = QVBoxLayout(mic_group)
+        mic_card = SettingsCard("Microphone Test", subtitle="Test mic levels", icon="M")
+        ml = QVBoxLayout()
         self.vol_bar = QProgressBar()
         self.vol_bar.setRange(0, 100)
         self.vol_bar.setValue(0)
@@ -258,12 +541,17 @@ class VoiceTab(QScrollArea):
         self.mic_level_label.setFont(QFont("Consolas", 9))
         mic_row.addWidget(self.mic_level_label, stretch=1)
         ml.addLayout(mic_row)
-        layout.addWidget(mic_group)
+        mic_card.add_layout(ml)
+        input_layout.addWidget(mic_card)
+        layout.addWidget(CollapsibleSection("Speech Input", input_content, expanded=False))
 
         # Latency Metrics
-        lat_group = QGroupBox("TTS Latency")
-        lat_group.setObjectName("settingsGroup")
-        ll = QHBoxLayout(lat_group)
+        diagnostics_content = QWidget()
+        diagnostics_layout = QVBoxLayout(diagnostics_content)
+        diagnostics_layout.setContentsMargins(0, 0, 0, 0)
+        diagnostics_layout.setSpacing(6)
+        lat_card = SettingsCard("TTS Latency", subtitle="Synthesis timing metrics", icon="L")
+        ll = QHBoxLayout()
         self.synth_lbl = QLabel("Synth: --")
         self.synth_lbl.setFont(QFont("Consolas", 9))
         self.synth_lbl.setObjectName("metricLabel")
@@ -276,13 +564,43 @@ class VoiceTab(QScrollArea):
         self.rtf_lbl.setFont(QFont("Consolas", 9))
         self.rtf_lbl.setObjectName("metricLabel")
         ll.addWidget(self.rtf_lbl)
-        layout.addWidget(lat_group)
+        lat_card.add_layout(ll)
+        diagnostics_layout.addWidget(lat_card)
+        layout.addWidget(CollapsibleSection("Diagnostics", diagnostics_content, expanded=False))
 
         # Status
         self.status_label = QLabel("Status: Ready")
         self.status_label.setFont(QFont("Consolas", 8))
         self.status_label.setObjectName("metricLabel")
         layout.addWidget(self.status_label)
+
+        # TTS Output Device (Revia's voice), intentionally kept at the
+        # bottom so the voice-building flow stays focused.
+        out_card = SettingsCard("TTS Output", subtitle="Output device selection", icon="O")
+        ov = QFormLayout()
+        ov.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.output_device = QComboBox()
+        self.output_device.addItem("System Default", userData=None)
+        self._populate_output_devices()
+        self.output_device.currentIndexChanged.connect(self._on_output_device_changed)
+        ov.addRow("Output Device:", self.output_device)
+        self.output_route_lbl = QLabel("Revia Voice -> System Default")
+        self.output_route_lbl.setObjectName("metricLabel")
+        self.output_route_lbl.setWordWrap(True)
+        ov.addRow("Route:", self.output_route_lbl)
+        out_btn_row = QHBoxLayout()
+        self.output_test_btn = QPushButton("Test Output")
+        self.output_test_btn.setObjectName("secondaryBtn")
+        self.output_test_btn.clicked.connect(self._test_output_device)
+        out_btn_row.addWidget(self.output_test_btn)
+        self.output_refresh_btn = QPushButton("Refresh")
+        self.output_refresh_btn.setObjectName("secondaryBtn")
+        self.output_refresh_btn.clicked.connect(self._refresh_output_devices)
+        out_btn_row.addWidget(self.output_refresh_btn)
+        out_btn_row.addStretch()
+        ov.addRow("", out_btn_row)
+        out_card.add_layout(ov)
+        layout.addWidget(CollapsibleSection("TTS Output Check", out_card, expanded=False))
 
         layout.addStretch()
         self.setWidget(container)
@@ -293,9 +611,31 @@ class VoiceTab(QScrollArea):
             lambda e: self._set_status(f"Error: {e}", role="error")
         )
         self.voice_mgr.status.connect(self._on_voice_status)
+        self.design_done.connect(self._on_design_done)
+        self.clone_done.connect(self._on_clone_done)
+        self.custom_done.connect(self._on_custom_done)
+        # React to TTS server capability changes + synthesis lifecycle so
+        # the "Active Voice & Server Capabilities" panel stays accurate.
+        backend = self.voice_mgr.backend
+        backend.capabilities_changed.connect(self._on_capabilities_changed)
+        backend.synthesis_started.connect(self._on_synthesis_started)
+        backend.synthesis_finished.connect(self._on_synthesis_finished_ui)
+        backend.error_occurred.connect(self._on_synthesis_error)
+        # Mode-mismatch warnings come through status_updated; surface
+        # them in the activity line so the user sees why nothing played.
+        backend.status_updated.connect(self._on_backend_status_for_activity)
+        backend.playback_started.connect(self._on_playback_started)
+        backend.playback_finished.connect(self._on_playback_finished)
+        backend.playback_interrupted.connect(self._on_playback_interrupted)
+        self.voice_mgr.voice_changed.connect(self._on_voice_changed)
+        self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
+        self._refresh_active_voice_label()
+        self._refresh_capabilities_ui()
         self.event_bus.connection_changed.connect(self._on_core_connection)
         self.event_bus.ui_theme_changed.connect(self._on_theme_changed)
         self._refresh_library()
+        self._apply_button_icons()
+        self._refresh_visual_status()
 
         # Defer the "fetch persisted TTS output device" hit to let the core
         # come up first. If the core is already up this returns instantly;
@@ -307,57 +647,69 @@ class VoiceTab(QScrollArea):
     def _build_design_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
-        vl.setContentsMargins(8, 8, 8, 8)
-        vl.setSpacing(6)
-
-        title = QLabel("Create Custom Voice with Natural Language")
-        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        vl.addWidget(title)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(4)
 
         fl = QFormLayout()
+        fl.setSpacing(4)
+
+        self.design_name = QLineEdit()
+        self.design_name.setPlaceholderText("Name for this saved voice")
+        fl.addRow("Voice Name:", self.design_name)
 
         self.design_text = QTextEdit()
-        self.design_text.setMaximumHeight(70)
+        self.design_text.setMaximumHeight(90)
         self.design_text.setPlaceholderText(
             "Hello! Welcome to Text-to-Speech system. "
             "This is a demo of our TTS capabilities."
         )
-        fl.addRow("Text to Synthesize:", self.design_text)
+        fl.addRow("Text:", self.design_text)
 
         self.design_lang = QComboBox()
         self.design_lang.addItems(QWEN_LANGUAGES)
         fl.addRow("Language:", self.design_lang)
 
         self.design_desc = QTextEdit()
-        self.design_desc.setMaximumHeight(60)
+        self.design_desc.setMaximumHeight(80)
         self.design_desc.setPlaceholderText(
             "e.g. Speak in an incredulous tone, but with a hint of "
             "panic beginning to creep into your voice."
         )
-        fl.addRow("Voice Description:", self.design_desc)
+        fl.addRow("Voice Desc:", self.design_desc)
 
         vl.addLayout(fl)
 
         btn_row = QHBoxLayout()
-        gen_btn = QPushButton("Generate with Custom Voice")
-        gen_btn.setObjectName("primaryBtn")
-        gen_btn.clicked.connect(self._run_design)
-        btn_row.addWidget(gen_btn)
-        play_btn = QPushButton("Play")
-        play_btn.setObjectName("secondaryBtn")
-        play_btn.clicked.connect(lambda: self._play_last("design"))
-        btn_row.addWidget(play_btn)
-        save_btn = QPushButton("Save to Library")
-        save_btn.setObjectName("secondaryBtn")
-        save_btn.clicked.connect(self._save_design)
-        btn_row.addWidget(save_btn)
+        self.design_generate_btn = QPushButton("Generate with Custom Voice")
+        self.design_generate_btn.setObjectName("primaryBtn")
+        self.design_generate_btn.clicked.connect(self._run_design)
+        btn_row.addWidget(self.design_generate_btn)
+        self.design_play_btn = QPushButton("Play")
+        self.design_play_btn.setObjectName("secondaryBtn")
+        self.design_play_btn.setEnabled(False)
+        self.design_play_btn.clicked.connect(lambda: self._play_last("design"))
+        btn_row.addWidget(self.design_play_btn)
+        self.design_delete_btn = QPushButton("Delete Voice")
+        self.design_delete_btn.setObjectName("secondaryBtn")
+        self.design_delete_btn.setEnabled(False)
+        self.design_delete_btn.clicked.connect(lambda: self._delete_current_voice("design"))
+        btn_row.addWidget(self.design_delete_btn)
         vl.addLayout(btn_row)
+
+        self.design_progress = QProgressBar()
+        self.design_progress.setRange(0, 0)
+        self.design_progress.setTextVisible(False)
+        self.design_progress.setVisible(False)
+        vl.addWidget(self.design_progress)
 
         self.design_status = QLabel("")
         self.design_status.setFont(QFont("Consolas", 8))
         self.design_status.setObjectName("metricLabel")
         self.design_status.setWordWrap(True)
         vl.addWidget(self.design_status)
+
+        self.design_waveform = WaveformPreview()
+        vl.addWidget(self.design_waveform)
 
         vl.addStretch()
         self._last_design_wav = None
@@ -367,12 +719,8 @@ class VoiceTab(QScrollArea):
     def _build_clone_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
-        vl.setContentsMargins(8, 8, 8, 8)
-        vl.setSpacing(6)
-
-        title = QLabel("Clone Voice from Reference Audio")
-        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        vl.addWidget(title)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(4)
 
         # Reference audio
         ref_row = QHBoxLayout()
@@ -390,16 +738,21 @@ class VoiceTab(QScrollArea):
         vl.addLayout(ref_row)
 
         fl = QFormLayout()
+        fl.setSpacing(4)
+
+        self.clone_name = QLineEdit()
+        self.clone_name.setPlaceholderText("Name for this saved voice")
+        fl.addRow("Voice Name:", self.clone_name)
 
         self.clone_ref_text = QTextEdit()
-        self.clone_ref_text.setMaximumHeight(50)
+        self.clone_ref_text.setMaximumHeight(60)
         self.clone_ref_text.setPlaceholderText(
             "Enter the exact text spoken in the reference audio..."
         )
-        fl.addRow("Reference Text:", self.clone_ref_text)
+        fl.addRow("Ref Text:", self.clone_ref_text)
 
         self.clone_target_text = QTextEdit()
-        self.clone_target_text.setMaximumHeight(60)
+        self.clone_target_text.setMaximumHeight(76)
         self.clone_target_text.setPlaceholderText(
             "Enter the text you want the cloned voice to speak..."
         )
@@ -425,25 +778,36 @@ class VoiceTab(QScrollArea):
         vl.addLayout(fl)
 
         btn_row = QHBoxLayout()
-        gen_btn = QPushButton("Clone & Generate")
-        gen_btn.setObjectName("primaryBtn")
-        gen_btn.clicked.connect(self._run_clone)
-        btn_row.addWidget(gen_btn)
-        play_btn = QPushButton("Play")
-        play_btn.setObjectName("secondaryBtn")
-        play_btn.clicked.connect(lambda: self._play_last("clone"))
-        btn_row.addWidget(play_btn)
-        save_btn = QPushButton("Save to Library")
-        save_btn.setObjectName("secondaryBtn")
-        save_btn.clicked.connect(self._save_clone)
-        btn_row.addWidget(save_btn)
+        self.clone_generate_btn = QPushButton("Clone & Generate")
+        self.clone_generate_btn.setObjectName("primaryBtn")
+        self.clone_generate_btn.clicked.connect(self._run_clone)
+        btn_row.addWidget(self.clone_generate_btn)
+        self.clone_play_btn = QPushButton("Play")
+        self.clone_play_btn.setObjectName("secondaryBtn")
+        self.clone_play_btn.setEnabled(False)
+        self.clone_play_btn.clicked.connect(lambda: self._play_last("clone"))
+        btn_row.addWidget(self.clone_play_btn)
+        self.clone_delete_btn = QPushButton("Delete Voice")
+        self.clone_delete_btn.setObjectName("secondaryBtn")
+        self.clone_delete_btn.setEnabled(False)
+        self.clone_delete_btn.clicked.connect(lambda: self._delete_current_voice("clone"))
+        btn_row.addWidget(self.clone_delete_btn)
         vl.addLayout(btn_row)
+
+        self.clone_progress = QProgressBar()
+        self.clone_progress.setRange(0, 0)
+        self.clone_progress.setTextVisible(False)
+        self.clone_progress.setVisible(False)
+        vl.addWidget(self.clone_progress)
 
         self.clone_status = QLabel("")
         self.clone_status.setFont(QFont("Consolas", 8))
         self.clone_status.setObjectName("metricLabel")
         self.clone_status.setWordWrap(True)
         vl.addWidget(self.clone_status)
+
+        self.clone_waveform = WaveformPreview()
+        vl.addWidget(self.clone_waveform)
 
         vl.addStretch()
         self._last_clone_wav = None
@@ -453,22 +817,23 @@ class VoiceTab(QScrollArea):
     def _build_custom_tab(self):
         w = QWidget()
         vl = QVBoxLayout(w)
-        vl.setContentsMargins(8, 8, 8, 8)
-        vl.setSpacing(6)
-
-        title = QLabel("Text-to-Speech with Predefined Speakers")
-        title.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        vl.addWidget(title)
+        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setSpacing(4)
 
         fl = QFormLayout()
+        fl.setSpacing(4)
+
+        self.custom_name = QLineEdit()
+        self.custom_name.setPlaceholderText("Name for this saved voice")
+        fl.addRow("Voice Name:", self.custom_name)
 
         self.custom_text = QTextEdit()
-        self.custom_text.setMaximumHeight(70)
+        self.custom_text.setMaximumHeight(90)
         self.custom_text.setPlaceholderText(
             "Hello! Welcome to Text-to-Speech system. "
             "This is a demo of our TTS capabilities."
         )
-        fl.addRow("Text to Synthesize:", self.custom_text)
+        fl.addRow("Text:", self.custom_text)
 
         row1 = QHBoxLayout()
         self.custom_lang = QComboBox()
@@ -483,11 +848,11 @@ class VoiceTab(QScrollArea):
         fl.addRow(row1)
 
         self.custom_style = QTextEdit()
-        self.custom_style.setMaximumHeight(50)
+        self.custom_style.setMaximumHeight(68)
         self.custom_style.setPlaceholderText(
             "e.g. Speak in a cheerful and energetic tone..."
         )
-        fl.addRow("Style Instruction\n(Optional):", self.custom_style)
+        fl.addRow("Style:", self.custom_style)
 
         self.custom_model_size = QComboBox()
         self.custom_model_size.addItems(QWEN_MODEL_SIZES)
@@ -497,19 +862,27 @@ class VoiceTab(QScrollArea):
         vl.addLayout(fl)
 
         btn_row = QHBoxLayout()
-        gen_btn = QPushButton("Generate Speech")
-        gen_btn.setObjectName("primaryBtn")
-        gen_btn.clicked.connect(self._run_custom)
-        btn_row.addWidget(gen_btn)
-        play_btn = QPushButton("Play")
-        play_btn.setObjectName("secondaryBtn")
-        play_btn.clicked.connect(lambda: self._play_last("custom"))
-        btn_row.addWidget(play_btn)
-        save_btn = QPushButton("Save to Library")
-        save_btn.setObjectName("secondaryBtn")
-        save_btn.clicked.connect(self._save_custom)
-        btn_row.addWidget(save_btn)
+        self.custom_generate_btn = QPushButton("Generate Speech")
+        self.custom_generate_btn.setObjectName("primaryBtn")
+        self.custom_generate_btn.clicked.connect(self._run_custom)
+        btn_row.addWidget(self.custom_generate_btn)
+        self.custom_play_btn = QPushButton("Play")
+        self.custom_play_btn.setObjectName("secondaryBtn")
+        self.custom_play_btn.setEnabled(False)
+        self.custom_play_btn.clicked.connect(lambda: self._play_last("custom"))
+        btn_row.addWidget(self.custom_play_btn)
+        self.custom_delete_btn = QPushButton("Delete Voice")
+        self.custom_delete_btn.setObjectName("secondaryBtn")
+        self.custom_delete_btn.setEnabled(False)
+        self.custom_delete_btn.clicked.connect(lambda: self._delete_current_voice("custom"))
+        btn_row.addWidget(self.custom_delete_btn)
         vl.addLayout(btn_row)
+
+        self.custom_progress = QProgressBar()
+        self.custom_progress.setRange(0, 0)
+        self.custom_progress.setTextVisible(False)
+        self.custom_progress.setVisible(False)
+        vl.addWidget(self.custom_progress)
 
         self.custom_status = QLabel("")
         self.custom_status.setFont(QFont("Consolas", 8))
@@ -517,39 +890,102 @@ class VoiceTab(QScrollArea):
         self.custom_status.setWordWrap(True)
         vl.addWidget(self.custom_status)
 
+        self.custom_waveform = WaveformPreview()
+        vl.addWidget(self.custom_waveform)
+
         vl.addStretch()
         self._last_custom_wav = None
         return w
 
     # Generation actions (threaded)
 
+    def _set_generation_busy(self, mode, message):
+        setattr(self, f"_last_{mode}_wav", None)
+        getattr(self, f"{mode}_progress").setVisible(True)
+        getattr(self, f"{mode}_generate_btn").setEnabled(False)
+        getattr(self, f"{mode}_play_btn").setEnabled(False)
+        getattr(self, f"{mode}_delete_btn").setEnabled(False)
+        getattr(self, f"{mode}_waveform").clear("Generating audio...")
+        status = getattr(self, f"{mode}_status")
+        status.setText(message)
+        apply_status_style(status, role="warning")
+        self._set_activity(message, role="warning")
+        self.workflow_stepper.set_state(
+            active="Generate",
+            complete={"Name", "Configure"},
+        )
+        self.activity_timeline.set_state(active="Generating", complete={"Server"})
+        self.save_card.set_value("Generating", "warning")
+        self._show_toast(message, role="warning")
+
+    def _set_generation_ready(self, mode, name, wav):
+        getattr(self, f"{mode}_progress").setVisible(False)
+        getattr(self, f"{mode}_generate_btn").setEnabled(True)
+        getattr(self, f"{mode}_play_btn").setEnabled(True)
+        getattr(self, f"{mode}_delete_btn").setEnabled(True)
+        getattr(self, f"{mode}_waveform").set_audio(wav)
+        status = getattr(self, f"{mode}_status")
+        status.setText(f"Done. Auto-saved to Library as '{name}'.\nSaved WAV: {wav}")
+        apply_status_style(status, role="success")
+        self._set_activity(f"Generation complete. '{name}' was auto-saved.", role="success")
+        self.workflow_stepper.set_state(
+            active="Test",
+            complete={"Name", "Configure", "Generate", "Auto-save", "Active"},
+        )
+        self.activity_timeline.set_state(active="Playing", complete={"Server", "Generating", "Saved"})
+        self.save_card.set_value(f"Saved: {name}", "success")
+        self._show_toast(f"Voice auto-saved: {name}", role="success")
+        self._refresh_visual_status()
+
+    def _set_generation_failed(self, mode, error):
+        getattr(self, f"{mode}_progress").setVisible(False)
+        getattr(self, f"{mode}_generate_btn").setEnabled(True)
+        getattr(self, f"{mode}_play_btn").setEnabled(False)
+        getattr(self, f"{mode}_delete_btn").setEnabled(False)
+        getattr(self, f"{mode}_waveform").clear("No audio saved")
+        status = getattr(self, f"{mode}_status")
+        status.setText(f"Failed: {error}")
+        apply_status_style(status, role="error")
+        self._set_activity(f"Generation failed: {error}", role="error")
+        self.workflow_stepper.set_state(failed={"Generate"})
+        self.activity_timeline.set_state(failed={"Generating"})
+        self.save_card.set_value("Save failed", "error")
+        self._show_toast(f"Generation failed: {error}", role="error")
+
     def _run_design(self):
         text = self.design_text.toPlainText().strip()
         desc = self.design_desc.toPlainText().strip()
         lang = self.design_lang.currentText()
+        if not self._voice_name_from_field(self.design_name, self.design_status, "generating"):
+            return
         if not text:
             self.design_status.setText("Enter text to synthesize")
+            apply_status_style(self.design_status, role="warning")
             return
         if not desc:
             self.design_status.setText("Enter a voice description")
+            apply_status_style(self.design_status, role="warning")
             return
-        self.design_status.setText("Generating...")
-        apply_status_style(self.design_status, role="warning")
+        self._set_generation_busy("design", "Generating Voice Design audio...")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_design(text, desc, lang)
-            QTimer.singleShot(0, lambda: self._on_design_done(wav, metrics))
+            self.design_done.emit(wav, metrics)
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_design_done(self, wav, metrics):
         if wav:
-            self._last_design_wav = wav
-            self.design_status.setText(f"Generated: {wav}")
-            apply_status_style(self.design_status, role="success")
-            self.voice_mgr.play_wav(wav)
+            try:
+                name, saved_wav = self._save_generated_voice("design", wav)
+            except Exception as exc:
+                self._last_design_wav = wav
+                self._set_generation_failed("design", f"Generated, but auto-save failed: {exc}")
+                return
+            self._last_design_wav = str(saved_wav)
+            self._set_generation_ready("design", name, saved_wav)
+            self.voice_mgr.play_wav(saved_wav)
         else:
-            self.design_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.design_status, role="error")
+            self._set_generation_failed("design", metrics)
 
     def _run_clone(self):
         ref = self.clone_ref_path.text().strip()
@@ -558,36 +994,44 @@ class VoiceTab(QScrollArea):
         lang = self.clone_lang.currentText()
         model_size = self.clone_model_size.currentText()
         xvec = self.clone_xvec.isChecked()
+        if not self._voice_name_from_field(self.clone_name, self.clone_status, "generating"):
+            return
         if not ref:
             self.clone_status.setText("Select reference audio first")
+            apply_status_style(self.clone_status, role="warning")
             return
         if not target:
             self.clone_status.setText("Enter target text")
+            apply_status_style(self.clone_status, role="warning")
             return
         if not xvec and not ref_text:
             self.clone_status.setText(
                 "Enter reference text or enable x-vector only"
             )
+            apply_status_style(self.clone_status, role="warning")
             return
-        self.clone_status.setText("Cloning...")
-        apply_status_style(self.clone_status, role="warning")
+        self._set_generation_busy("clone", "Cloning voice and generating audio...")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_clone(
                 target, ref, ref_text, lang, xvec, model_size=model_size
             )
-            QTimer.singleShot(0, lambda: self._on_clone_done(wav, metrics))
+            self.clone_done.emit(wav, metrics)
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_clone_done(self, wav, metrics):
         if wav:
-            self._last_clone_wav = wav
-            self.clone_status.setText(f"Generated: {wav}")
-            apply_status_style(self.clone_status, role="success")
-            self.voice_mgr.play_wav(wav)
+            try:
+                name, saved_wav = self._save_generated_voice("clone", wav)
+            except Exception as exc:
+                self._last_clone_wav = wav
+                self._set_generation_failed("clone", f"Generated, but auto-save failed: {exc}")
+                return
+            self._last_clone_wav = str(saved_wav)
+            self._set_generation_ready("clone", name, saved_wav)
+            self.voice_mgr.play_wav(saved_wav)
         else:
-            self.clone_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.clone_status, role="error")
+            self._set_generation_failed("clone", metrics)
 
     def _run_custom(self):
         text = self.custom_text.toPlainText().strip()
@@ -595,177 +1039,307 @@ class VoiceTab(QScrollArea):
         speaker = self.custom_speaker.currentText()
         style = self.custom_style.toPlainText().strip()
         model_size = self.custom_model_size.currentText()
+        if not self._voice_name_from_field(self.custom_name, self.custom_status, "generating"):
+            return
         if not text:
             self.custom_status.setText("Enter text to synthesize")
+            apply_status_style(self.custom_status, role="warning")
             return
-        self.custom_status.setText("Generating...")
-        apply_status_style(self.custom_status, role="warning")
+        self._set_generation_busy("custom", "Generating CustomVoice audio...")
 
         def _do():
             wav, metrics = self.voice_mgr.generate_custom(
                 text, lang, speaker, style, model_size
             )
-            QTimer.singleShot(0, lambda: self._on_custom_done(wav, metrics))
+            self.custom_done.emit(wav, metrics)
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_custom_done(self, wav, metrics):
         if wav:
-            self._last_custom_wav = wav
-            self.custom_status.setText(f"Generated: {wav}")
-            apply_status_style(self.custom_status, role="success")
-            self.voice_mgr.play_wav(wav)
+            try:
+                name, saved_wav = self._save_generated_voice("custom", wav)
+            except Exception as exc:
+                self._last_custom_wav = wav
+                self._set_generation_failed("custom", f"Generated, but auto-save failed: {exc}")
+                return
+            self._last_custom_wav = str(saved_wav)
+            self._set_generation_ready("custom", name, saved_wav)
+            self.voice_mgr.play_wav(saved_wav)
         else:
-            self.custom_status.setText(f"Failed: {metrics}")
-            apply_status_style(self.custom_status, role="error")
+            self._set_generation_failed("custom", metrics)
 
     def _play_last(self, mode):
         wav = getattr(self, f"_last_{mode}_wav", None)
         if wav and Path(wav).exists():
             self.voice_mgr.play_wav(wav)
 
-    # Save to Library
+    # Auto-save / delete
 
-    def _save_design(self):
-        wav = self._last_design_wav
-        if not wav or not Path(wav).exists():
-            self.design_status.setText("Generate a voice first")
-            return
-        name, ok = QInputDialog.getText(self, "Save Voice", "Voice name:")
-        if not ok or not name.strip():
-            return
-        p = self.voice_mgr.create_design_profile(
-            name.strip(),
-            self.design_desc.toPlainText().strip(),
-            self.design_lang.currentText(),
-        )
+    def _voice_name_from_field(self, field, status_label, action="saving"):
+        name = field.text().strip()
+        if name:
+            if not any(ch.isalnum() for ch in name):
+                status_label.setText("Voice name must contain at least one letter or number")
+                apply_status_style(status_label, role="warning")
+                field.setFocus()
+                return ""
+            return name
+        status_label.setText(f"Enter a voice name before {action}")
+        apply_status_style(status_label, role="warning")
+        field.setFocus()
+        return ""
+
+    def _save_generated_voice(self, mode, wav):
+        wav_path = Path(wav)
+        if not wav_path.exists():
+            raise FileNotFoundError(str(wav))
+        if mode == "design":
+            name = self.design_name.text().strip()
+            p = self.voice_mgr.create_design_profile(
+                name,
+                self.design_desc.toPlainText().strip(),
+                self.design_lang.currentText(),
+            )
+        elif mode == "clone":
+            name = self.clone_name.text().strip()
+            ref = self.clone_ref_path.text().strip()
+            p = self.voice_mgr.create_clone_profile(
+                name, ref,
+                self.clone_ref_text.toPlainText().strip(),
+                self.clone_lang.currentText(),
+                self.clone_xvec.isChecked(),
+                self.clone_model_size.currentText(),
+            )
+        else:
+            name = self.custom_name.text().strip()
+            p = self.voice_mgr.create_custom_profile(
+                name,
+                self.custom_speaker.currentText(),
+                self.custom_style.toPlainText().strip(),
+                self.custom_lang.currentText(),
+                self.custom_model_size.currentText(),
+            )
         voice_dir = self.voice_mgr.save_voice(p)
         dest = voice_dir / "generated.wav"
-        shutil.copy2(wav, str(dest))
+        shutil.copy2(str(wav_path), str(dest))
         p.generated_wav = str(dest)
+        if mode == "clone":
+            ref = self.clone_ref_path.text().strip()
+            if ref and Path(ref).exists():
+                ref_dest = voice_dir / "ref.wav"
+                shutil.copy2(ref, str(ref_dest))
+                p.reference_audio = str(ref_dest)
         p.save(voice_dir)
+        self.voice_mgr.set_active_voice(name)
         self._refresh_library()
-        self.design_status.setText(f"Saved: {name.strip()}")
+        return name, dest
 
-    def _save_clone(self):
-        wav = self._last_clone_wav
-        if not wav or not Path(wav).exists():
-            self.clone_status.setText("Generate a clone first")
+    def _delete_current_voice(self, mode):
+        field = getattr(self, f"{mode}_name")
+        status = getattr(self, f"{mode}_status")
+        name = self._voice_name_from_field(field, status, "deleting")
+        if not name:
             return
-        name, ok = QInputDialog.getText(self, "Save Voice", "Voice name:")
-        if not ok or not name.strip():
+        if not self.voice_mgr.library.get(name):
+            status.setText(f"No saved voice named '{name}'")
+            apply_status_style(status, role="warning")
+            getattr(self, f"{mode}_delete_btn").setEnabled(False)
             return
-        ref = self.clone_ref_path.text().strip()
-        p = self.voice_mgr.create_clone_profile(
-            name.strip(), ref,
-            self.clone_ref_text.toPlainText().strip(),
-            self.clone_lang.currentText(),
-            self.clone_xvec.isChecked(),
-            self.clone_model_size.currentText(),
+        reply = QMessageBox.question(
+            self,
+            "Delete Voice",
+            f"Delete '{name}' from the Voice Library?",
+            QMessageBox.Yes | QMessageBox.No,
         )
-        voice_dir = self.voice_mgr.save_voice(p)
-        dest = voice_dir / "generated.wav"
-        shutil.copy2(wav, str(dest))
-        p.generated_wav = str(dest)
-        # Also copy reference audio
-        if ref and Path(ref).exists():
-            ref_dest = voice_dir / "ref.wav"
-            shutil.copy2(ref, str(ref_dest))
-            p.reference_audio = str(ref_dest)
-        p.save(voice_dir)
-        self._refresh_library()
-        self.clone_status.setText(f"Saved: {name.strip()}")
-
-    def _save_custom(self):
-        wav = self._last_custom_wav
-        if not wav or not Path(wav).exists():
-            self.custom_status.setText("Generate speech first")
+        if reply != QMessageBox.Yes:
             return
-        name, ok = QInputDialog.getText(self, "Save Voice", "Voice name:")
-        if not ok or not name.strip():
-            return
-        p = self.voice_mgr.create_custom_profile(
-            name.strip(),
-            self.custom_speaker.currentText(),
-            self.custom_style.toPlainText().strip(),
-            self.custom_lang.currentText(),
-            self.custom_model_size.currentText(),
-        )
-        voice_dir = self.voice_mgr.save_voice(p)
-        dest = voice_dir / "generated.wav"
-        shutil.copy2(wav, str(dest))
-        p.generated_wav = str(dest)
-        p.save(voice_dir)
+        self.voice_mgr.delete_voice(name)
+        setattr(self, f"_last_{mode}_wav", None)
+        getattr(self, f"{mode}_play_btn").setEnabled(False)
+        getattr(self, f"{mode}_delete_btn").setEnabled(False)
+        getattr(self, f"{mode}_waveform").clear("Deleted from library")
         self._refresh_library()
-        self.custom_status.setText(f"Saved: {name.strip()}")
+        status.setText(f"Deleted: {name}")
+        apply_status_style(status, role="success")
+        self._set_activity(f"Deleted voice '{name}' from the library.", role="success")
+        self.save_card.set_value("Deleted", "warning")
+        self._show_toast(f"Deleted voice: {name}", role="warning")
+        self._refresh_visual_status()
 
     # Voice Library actions
 
     def _refresh_library(self):
         self.voice_mgr.library.load_all()
+        selected_name = self._selected_voice_name()
+        active_name = getattr(self.voice_mgr.active_profile, "name", "")
         self.voice_list.clear()
-        for name in self.voice_mgr.library.list_names():
+        names = self.voice_mgr.library.list_names()
+        if not names:
+            item = QListWidgetItem("No voices yet - generate a named voice above.")
+            item.setData(Qt.UserRole, "")
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+            self.voice_list.addItem(item)
+            self.lib_meta.setText(
+                f"Saved in: {self.voice_mgr.library.base_dir}\n"
+                "No voices saved yet. New generations auto-save here."
+            )
+            self._refresh_library_buttons()
+            self._refresh_visual_status()
+            return
+
+        callbacks = {
+            "play": self._play_voice_name,
+            "active": self._set_active_voice_name,
+            "delete": self._confirm_delete_voice_name,
+        }
+        current_item = None
+        for name in names:
             p = self.voice_mgr.library.get(name)
-            suffix = " *" if p and p.is_default else ""
-            wav_tag = " [WAV]" if p and p.has_wav() else ""
-            self.voice_list.addItem(f"{name}{suffix}{wav_tag}")
-        if self.voice_list.count() == 0:
-            self.lib_meta.setText("No voices saved yet. Generate and save one above.")
+            if not p:
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, name)
+            card = VoiceCardWidget(
+                p,
+                is_active=(active_name == name),
+                is_default=bool(p.is_default),
+                callbacks=callbacks,
+            )
+            self.voice_list.addItem(item)
+            item.setSizeHint(card.sizeHint())
+            self.voice_list.setItemWidget(item, card)
+            if selected_name == name:
+                current_item = item
+        if current_item is None and self.voice_list.count() > 0:
+            current_item = self.voice_list.item(0)
+        if current_item is not None:
+            self.voice_list.setCurrentItem(current_item)
+            self._show_voice_meta(str(current_item.data(Qt.UserRole) or ""))
+        self._refresh_library_buttons()
+        self._refresh_visual_status()
+
+    def _selected_voice_name(self):
+        cur = self.voice_list.currentItem()
+        if not cur:
+            return ""
+        name = cur.data(Qt.UserRole)
+        if name:
+            return str(name)
+        text = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
+        return text if self.voice_mgr.library.get(text) else ""
+
+    def _refresh_library_buttons(self):
+        buttons = getattr(self, "library_action_buttons", {})
+        selected = self._selected_voice_name()
+        profile = self.voice_mgr.library.get(selected) if selected else None
+        for label, btn in buttons.items():
+            if label in {"Import", "Open Folder"}:
+                btn.setEnabled(True)
+            elif label == "Play Voice":
+                btn.setEnabled(bool(profile and profile.has_wav()))
+            else:
+                btn.setEnabled(bool(profile))
+
+    def _show_voice_meta(self, name):
+        p = self.voice_mgr.library.get(name)
+        if not p:
+            self.lib_meta.setText(
+                f"Saved in: {self.voice_mgr.library.base_dir}\n"
+                "Select a saved voice to see details."
+            )
+            return
+
+        meta = (
+            f"Mode: {p.mode.value} | Lang: {p.language} | "
+            f"Created: {p.created[:10]}"
+        )
+        if p.mode == VoiceMode.CUSTOM:
+            meta += f" | Speaker: {p.speaker_id}"
+        meta += f"\nFolder: {self.voice_mgr.library.get_voice_dir(name)}"
+        if p.has_wav():
+            meta += f"\nWAV: {p.generated_wav}"
+        else:
+            meta += "\n(No generated WAV)"
+        self.lib_meta.setText(meta)
+
+    def _on_voice_item_selected(self, current, _previous=None):
+        name = str(current.data(Qt.UserRole) or "") if current else ""
+        self._show_voice_meta(name)
+        self._refresh_library_buttons()
 
     def _on_voice_selected(self, text):
         name = text.replace(" *", "").replace(" [WAV]", "").strip()
-        p = self.voice_mgr.library.get(name)
-        if p:
-            meta = (
-                f"Mode: {p.mode.value} | Lang: {p.language} | "
-                f"Created: {p.created[:10]}"
-            )
-            if p.mode == VoiceMode.CUSTOM:
-                meta += f" | Speaker: {p.speaker_id}"
-            if p.has_wav():
-                meta += f"\nWAV: {p.generated_wav}"
-            else:
-                meta += "\n(No generated WAV)"
-            self.lib_meta.setText(meta)
+        self._show_voice_meta(name)
 
     def _set_active(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        name = self._selected_voice_name()
+        if not name:
             return
-        name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
+        self._set_active_voice_name(name)
+
+    def _set_active_voice_name(self, name):
         self.voice_mgr.set_active_voice(name)
+        self.workflow_stepper.set_state(
+            active=None,
+            complete={"Name", "Configure", "Generate", "Auto-save", "Test", "Active"},
+        )
+        self._refresh_library()
         self._set_status(f"Active voice: {name}", role="success")
+        self._show_toast(f"Active voice: {name}", role="success")
+        self._refresh_visual_status()
 
     def _rename_voice(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        old = self._selected_voice_name()
+        if not old:
             return
-        old = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
         new, ok = QInputDialog.getText(self, "Rename", "New name:", text=old)
         if ok and new.strip():
-            self.voice_mgr.library.rename(old, new.strip())
+            try:
+                self.voice_mgr.library.rename(old, new.strip())
+            except ValueError as exc:
+                self._set_status(str(exc), role="error")
+                return
             self._refresh_library()
+            self._show_toast(f"Renamed voice: {new.strip()}", role="success")
 
     def _delete_voice(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        name = self._selected_voice_name()
+        if not name:
             return
-        name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
+        self._confirm_delete_voice_name(name)
+
+    def _confirm_delete_voice_name(self, name):
         reply = QMessageBox.question(
             self, "Delete Voice", f"Delete '{name}'?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self.voice_mgr.library.delete(name)
+            self._delete_voice_name(name)
+
+    def _delete_voice_name(self, name):
+        if self.voice_mgr.delete_voice(name):
+            for mode in ("design", "clone", "custom"):
+                field = getattr(self, f"{mode}_name", None)
+                if field is not None and field.text().strip() == name:
+                    setattr(self, f"_last_{mode}_wav", None)
+                    getattr(self, f"{mode}_play_btn").setEnabled(False)
+                    getattr(self, f"{mode}_delete_btn").setEnabled(False)
+                    getattr(self, f"{mode}_waveform").clear("Deleted from library")
             self._refresh_library()
+            self._set_status(f"Deleted voice: {name}", role="success")
+            self.save_card.set_value("Deleted", "warning")
+            self._set_activity(f"Deleted voice '{name}' from the library.", role="success")
+            self._show_toast(f"Deleted voice: {name}", role="warning")
+            self._refresh_visual_status()
 
     def _set_default(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        name = self._selected_voice_name()
+        if not name:
             return
-        name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
         self.voice_mgr.library.set_default(name)
         self._refresh_library()
         self._set_status(f"Default voice: {name}", role="success")
+        self._show_toast(f"Default voice: {name}", role="success")
 
     def _import_voice(self):
         d = QFileDialog.getExistingDirectory(self, "Import Voice Directory")
@@ -774,31 +1348,36 @@ class VoiceTab(QScrollArea):
             if p:
                 self._refresh_library()
                 self._set_status(f"Imported: {p.name}", role="success")
+                self._show_toast(f"Imported voice: {p.name}", role="success")
 
     def _export_voice(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        name = self._selected_voice_name()
+        if not name:
             return
-        name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
         d = QFileDialog.getExistingDirectory(self, "Export To")
         if d:
             dest = Path(d) / name
             self.voice_mgr.library.export_profile(name, dest)
             self._set_status(f"Exported to: {dest}", role="success")
+            self._show_toast(f"Exported voice: {name}", role="success")
 
     def _open_folder(self):
         self.voice_mgr.library.open_folder()
 
     def _play_selected(self):
-        cur = self.voice_list.currentItem()
-        if not cur:
+        name = self._selected_voice_name()
+        if not name:
             return
-        name = cur.text().replace(" *", "").replace(" [WAV]", "").strip()
+        self._play_voice_name(name)
+
+    def _play_voice_name(self, name):
         p = self.voice_mgr.library.get(name)
         if p and p.has_wav():
             self.voice_mgr.play_wav(p.generated_wav)
+            self._set_activity(f"Playing saved voice: '{name}'", role="success")
         else:
             self._set_status("No WAV file for this voice", role="error")
+            self._show_toast("No WAV file for this voice", role="error")
 
     # Clone tab helpers
 
@@ -924,6 +1503,13 @@ class VoiceTab(QScrollArea):
     def _on_backend_changed(self, engine_id: str) -> None:
         """Sync UI when VoiceManager emits backend_changed."""
         self._update_active_backend_label()
+        if hasattr(self, "activity_timeline"):
+            if engine_id == "qwen3-tts":
+                self.activity_timeline.set_state(active=None, complete={"Server"})
+            else:
+                self.activity_timeline.set_state(active="Server")
+        if hasattr(self, "mode_card"):
+            self._refresh_visual_status()
         # Keep engine_combo in sync if changed programmatically
         label = self.voice_mgr.active_backend_label
         if self.engine_combo.currentText() != label:
@@ -945,6 +1531,8 @@ class VoiceTab(QScrollArea):
                     f"Fallback: {fallback}  |  Starting"
                 )
                 apply_status_style(self.active_backend_lbl, role="warning")
+                if hasattr(self, "mode_card"):
+                    self._refresh_visual_status()
                 return
             ready = self.voice_mgr.is_backend_ready()
             health = "Ready" if ready else "Unavailable"
@@ -953,6 +1541,8 @@ class VoiceTab(QScrollArea):
                 f"Active: {label}  |  Fallback: {fallback}  |  {health}"
             )
             apply_status_style(self.active_backend_lbl, role=role)
+            if hasattr(self, "mode_card"):
+                self._refresh_visual_status()
 
     def _populate_input_devices(self):
         try:
@@ -991,6 +1581,8 @@ class VoiceTab(QScrollArea):
                     break
         finally:
             self.output_device.blockSignals(False)
+        self._refresh_output_route()
+        self._show_toast("Output devices refreshed", role="success")
 
     def _on_output_device_changed(self, _index=None):
         """User picked a different output device - apply + persist."""
@@ -1011,19 +1603,24 @@ class VoiceTab(QScrollArea):
                 client.set_tts_output(payload)
             except Exception as e:
                 logger.debug(f"Error persisting output device: {e}")
+        self._refresh_output_route()
+        self._show_toast(f"Output route: {label}", role="success")
 
     def _load_saved_output_device(self):
         """Fetch the persisted TTS output device from the core and select it."""
         client = getattr(self, "client", None)
         if client is None or not hasattr(client, "get_tts_output"):
+            self._refresh_output_route()
             return
         try:
             saved = client.get_tts_output() or {}
         except Exception as e:
             logger.debug(f"Could not fetch saved TTS output device: {e}")
+            self._refresh_output_route()
             return
         device = saved.get("device")
         if device in (None, "", -1):
+            self._refresh_output_route()
             return  # already on "System Default"
 
         # Find the matching combobox entry by userData. If no match (user
@@ -1063,6 +1660,7 @@ class VoiceTab(QScrollArea):
             logger.info(
                 f"Saved TTS output device {device!r} not present on this system"
             )
+        self._refresh_output_route()
 
     def _test_output_device(self):
         """Speak a short phrase through the currently selected output device."""
@@ -1089,9 +1687,11 @@ class VoiceTab(QScrollArea):
                 f"Testing output: {self.output_device.currentText()}",
                 role="success",
             )
+            self._show_toast(f"Testing output: {self.output_device.currentText()}", role="success")
         except Exception as e:
             logger.warning(f"Output test failed: {e}")
             self._set_status(f"Output test failed: {e}", role="error")
+            self._show_toast(f"Output test failed: {e}", role="error")
 
     def _toggle_mic_test(self, active):
         if not self.audio_service:
@@ -1122,12 +1722,318 @@ class VoiceTab(QScrollArea):
         self.dur_lbl.setText(f"Duration: {metrics.audio_duration}s")
         self.rtf_lbl.setText(f"RTF: {metrics.realtime_factor}x")
 
+    def _show_toast(self, text, role="muted", timeout_ms=4200):
+        if not hasattr(self, "toast_label"):
+            return
+        clean = str(text or "").strip()
+        if not clean:
+            self.toast_label.setVisible(False)
+            return
+        if len(clean) > 180:
+            clean = clean[:177] + "..."
+        self.toast_label.setText(clean)
+        apply_status_style(self.toast_label, role=role)
+        self.toast_label.setVisible(True)
+        timer = getattr(self, "_toast_timer", None)
+        if timer is not None:
+            timer.start(timeout_ms)
+
+    def _set_button_icon(self, button, icon_name, fallback="SP_FileIcon", tooltip=None):
+        icon = _standard_icon(button, icon_name, fallback=fallback)
+        if icon is not None:
+            button.setIcon(icon)
+            button.setIconSize(QSize(16, 16))
+        if tooltip:
+            button.setToolTip(tooltip)
+
+    def _apply_button_icons(self):
+        icon_specs = [
+            (self.start_tts_btn, "SP_MediaPlay", "Start Qwen3-TTS"),
+            (self.stop_tts_btn, "SP_MediaStop", "Stop Qwen3-TTS"),
+            (self.design_generate_btn, "SP_DialogApplyButton", "Generate and auto-save"),
+            (self.clone_generate_btn, "SP_DialogApplyButton", "Clone, generate, and auto-save"),
+            (self.custom_generate_btn, "SP_DialogApplyButton", "Generate and auto-save"),
+            (self.design_play_btn, "SP_MediaPlay", "Play generated voice"),
+            (self.clone_play_btn, "SP_MediaPlay", "Play generated voice"),
+            (self.custom_play_btn, "SP_MediaPlay", "Play generated voice"),
+            (self.design_delete_btn, "SP_TrashIcon", "Delete saved voice"),
+            (self.clone_delete_btn, "SP_TrashIcon", "Delete saved voice"),
+            (self.custom_delete_btn, "SP_TrashIcon", "Delete saved voice"),
+            (self.output_test_btn, "SP_MediaPlay", "Test selected output device"),
+            (self.output_refresh_btn, "SP_BrowserReload", "Refresh output devices"),
+            (self.mic_test_btn, "SP_MediaPlay", "Test microphone input"),
+        ]
+        for button, icon_name, tooltip in icon_specs:
+            self._set_button_icon(
+                button,
+                icon_name,
+                fallback="SP_DialogDiscardButton" if "Trash" in icon_name else "SP_FileIcon",
+                tooltip=tooltip,
+            )
+        for label, btn in getattr(self, "library_action_buttons", {}).items():
+            icon_name = {
+                "Set Active": "SP_DialogApplyButton",
+                "Rename": "SP_FileDialogDetailedView",
+                "Delete": "SP_TrashIcon",
+                "Set Default": "SP_DialogApplyButton",
+                "Import": "SP_DirOpenIcon",
+                "Export": "SP_DialogSaveButton",
+                "Open Folder": "SP_DirOpenIcon",
+                "Play Voice": "SP_MediaPlay",
+            }.get(label, "SP_FileIcon")
+            self._set_button_icon(
+                btn,
+                icon_name,
+                fallback="SP_DialogDiscardButton" if label == "Delete" else "SP_FileIcon",
+                tooltip=label,
+            )
+
+    def _refresh_output_route(self):
+        if not hasattr(self, "output_device"):
+            return
+        label = self.output_device.currentText() or "System Default"
+        route = f"Revia Voice -> {label}"
+        if hasattr(self, "output_route_lbl"):
+            self.output_route_lbl.setText(route)
+            apply_status_style(self.output_route_lbl, role="success")
+        if hasattr(self, "output_card"):
+            self.output_card.set_value(label, "success")
+
+    def _refresh_visual_status(self):
+        prof = self.voice_mgr.active_profile
+        if hasattr(self, "voice_card"):
+            if prof is None:
+                self.voice_card.set_value("Fallback", "warning")
+            else:
+                wav = "WAV ready" if prof.has_wav() else "WAV missing"
+                role = "success" if prof.has_wav() else "warning"
+                self.voice_card.set_value(f"{prof.name} | {wav}", role)
+
+        if hasattr(self, "mode_card"):
+            mode = self._current_mode_id() if hasattr(self, "mode_tabs") else None
+            idx = self._MODE_TAB_INDEX.get(mode, -1)
+            mode_label = self._MODE_TAB_BASE_LABEL.get(idx, "Mode")
+            engine = self.voice_mgr.active_backend_name
+            supported = set(getattr(self, "_caps_modes", []) or [])
+            if engine == "pyttsx3":
+                self.mode_card.set_value("Fallback engine", "warning")
+            elif not supported:
+                self.mode_card.set_value("Detecting modes", "warning")
+            elif mode in supported:
+                self.mode_card.set_value(f"{mode_label} ready", "success")
+            else:
+                self.mode_card.set_value(f"{mode_label} unavailable", "error")
+        self._refresh_output_route()
+
+    # ------------------------------------------------------------------
+    # V4 visibility: Active voice / Server capabilities / Activity
+    # ------------------------------------------------------------------
+
+    _MODE_TAB_INDEX = {"design": 0, "clone": 1, "custom": 2}
+    _MODE_TAB_BASE_LABEL = {
+        0: "Voice Design",
+        1: "Voice Clone (Base)",
+        2: "TTS (CustomVoice)",
+    }
+    _TAB_TO_MODE = {0: "design", 1: "clone", 2: "custom"}
+
+    def _refresh_active_voice_label(self):
+        """Repaint the \"Active Voice\" line from the current voice profile."""
+        prof = self.voice_mgr.active_profile
+        if prof is None:
+            self.active_voice_lbl.setText(
+                "Active Voice: (none) - synthesis will use the system fallback"
+            )
+            apply_status_style(self.active_voice_lbl, role="warning")
+            self._refresh_visual_status()
+            return
+        mode_str = getattr(prof.mode, "value", str(prof.mode))
+        bits = [f"Active Voice: {prof.name}", f"Mode: {mode_str}"]
+        if prof.language:
+            bits.append(f"Lang: {prof.language}")
+        if mode_str == "custom" and getattr(prof, "speaker_id", ""):
+            bits.append(f"Speaker: {prof.speaker_id}")
+        if prof.has_wav():
+            bits.append("WAV: ready")
+        else:
+            bits.append("WAV: missing")
+        self.active_voice_lbl.setText("  |  ".join(bits))
+        role = "success" if prof.has_wav() else "warning"
+        apply_status_style(self.active_voice_lbl, role=role)
+        self._refresh_visual_status()
+
+    def _on_voice_changed(self, _name):
+        self._refresh_active_voice_label()
+        self._refresh_capabilities_ui()
+        self._refresh_library()
+
+    def _on_capabilities_changed(self, payload):
+        """Stash the latest server capabilities and repaint the UI."""
+        if isinstance(payload, dict):
+            self._caps_variant = str(payload.get("variant") or "unknown")
+            self._caps_label = str(payload.get("label") or "")
+            self._caps_modes = [str(m) for m in (payload.get("modes") or [])]
+            self._caps_api_names = [str(n) for n in (payload.get("api_names") or [])]
+        self._refresh_capabilities_ui()
+        self._refresh_visual_status()
+
+    def _refresh_capabilities_ui(self):
+        """Repaint the capabilities label + per-tab supported badges."""
+        engine = self.voice_mgr.active_backend_name
+        if engine == "pyttsx3":
+            self.caps_lbl.setText(
+                "Server: pyttsx3 fallback engine (offline). "
+                "Modes Design / Clone / CustomVoice need a Qwen3-TTS server."
+            )
+            apply_status_style(self.caps_lbl, role="warning")
+            self._update_mode_tab_badges(supported=set(),
+                                         active_mode=None)
+            self._refresh_visual_status()
+            return
+
+        if not self._caps_modes and self._caps_variant in ("", "unknown"):
+            self.caps_lbl.setText(
+                f"Server: {self._caps_label or 'probing...'} - capabilities not yet detected"
+            )
+            apply_status_style(self.caps_lbl, role="warning")
+            self._update_mode_tab_badges(supported=set(),
+                                         active_mode=None)
+            self._refresh_visual_status()
+            return
+
+        modes_pretty = ", ".join(m.title() for m in self._caps_modes) or "none"
+        api_pretty = ", ".join(self._caps_api_names) or "none advertised"
+        self.caps_lbl.setText(
+            f"Server: {self._caps_label}.  Supports: {modes_pretty}.  "
+            f"Endpoints: {api_pretty}"
+        )
+        apply_status_style(self.caps_lbl, role="success")
+        self._update_mode_tab_badges(
+            supported=set(self._caps_modes),
+            active_mode=self._current_mode_id(),
+        )
+        self._refresh_visual_status()
+
+    def _current_mode_id(self):
+        idx = self.mode_tabs.currentIndex()
+        return self._TAB_TO_MODE.get(idx)
+
+    def _update_mode_tab_badges(self, supported, active_mode=None):
+        """Decorate each mode tab with its support state.
+
+        ``(active)`` for the selected & supported tab,
+        ``(supported)`` for other supported modes,
+        ``(N/A)`` for unsupported modes.
+        """
+        for idx, base in self._MODE_TAB_BASE_LABEL.items():
+            mode = self._TAB_TO_MODE.get(idx)
+            if not supported:
+                badge = ""
+                tip = "Qwen3-TTS capabilities have not been detected yet."
+            elif mode in supported and mode == active_mode:
+                badge = "  (active)"
+                tip = f"{base} is supported by the current Qwen3-TTS server."
+            elif mode in supported:
+                badge = "  (supported)"
+                tip = f"{base} is available on the current Qwen3-TTS server."
+            else:
+                badge = "  (N/A)"
+                tip = f"{base} is not advertised by the current Qwen3-TTS server."
+            self.mode_tabs.setTabText(idx, base + badge)
+            self.mode_tabs.setTabToolTip(idx, tip)
+
+    def _on_mode_tab_changed(self, _index):
+        self._refresh_capabilities_ui()
+        self._refresh_visual_status()
+
+    # ---- Live activity indicator -----------------------------------
+
+    def _set_activity(self, text, role="muted"):
+        if hasattr(self, "activity_lbl"):
+            self.activity_lbl.setText(text)
+            apply_status_style(self.activity_lbl, role=role)
+
+    def _on_synthesis_started(self):
+        prof = self.voice_mgr.active_profile
+        voice_name = prof.name if prof else "(default)"
+        mode = self._current_mode_id() or "synthesis"
+        self._set_activity(
+            f"Synthesizing ({mode}) using '{voice_name}'...",
+            role="warning",
+        )
+        self.activity_timeline.set_state(active="Generating", complete={"Server"})
+
+    def _on_synthesis_finished_ui(self, metrics):
+        try:
+            secs = float(getattr(metrics, "synthesis_time", 0.0))
+        except (TypeError, ValueError):
+            secs = 0.0
+        self._set_activity(
+            f"Synthesis done in {secs:.2f}s - playing back...",
+            role="success",
+        )
+        self.activity_timeline.set_state(
+            active="Playing",
+            complete={"Server", "Generating", "Saved"},
+        )
+
+    def _on_playback_started(self):
+        prof = self.voice_mgr.active_profile
+        voice_name = prof.name if prof else "(default)"
+        self._set_activity(f"Playing voice: '{voice_name}'", role="success")
+        self.activity_timeline.set_state(
+            active="Playing",
+            complete={"Server", "Generating", "Saved"},
+        )
+
+    def _on_playback_finished(self):
+        self._set_activity("Idle", role="muted")
+        self.activity_timeline.set_state(
+            active=None,
+            complete={"Server", "Generating", "Saved", "Playing"},
+        )
+        self.workflow_stepper.set_state(
+            active=None,
+            complete={"Name", "Configure", "Generate", "Auto-save", "Test", "Active"},
+        )
+
+    def _on_playback_interrupted(self):
+        self._set_activity("Playback interrupted", role="warning")
+        self.activity_timeline.set_state(
+            active="Playing",
+            complete={"Server", "Generating", "Saved"},
+            failed={"Playing"},
+        )
+        self.workflow_stepper.set_state(
+            active="Test",
+            complete={"Name", "Configure", "Generate", "Auto-save", "Active"},
+            failed={"Test"},
+        )
+
+    def _on_synthesis_error(self, message):
+        text = str(message or "TTS error")
+        # Trim very long messages so the activity line stays readable.
+        if len(text) > 220:
+            text = text[:217] + "..."
+        self._set_activity(f"Synthesis failed: {text}", role="error")
+        self.activity_timeline.set_state(failed={"Generating"})
+        self._show_toast(f"Synthesis failed: {text}", role="error")
+
+    def _on_backend_status_for_activity(self, message):
+        text = str(message or "")
+        low = text.lower()
+        if "unavailable" in low or "is not available" in low:
+            short = text if len(text) <= 220 else text[:217] + "..."
+            self._set_activity(short, role="error")
+            self.activity_timeline.set_state(failed={"Server"})
+
     def _on_voice_status(self, message):
         text = str(message or "").strip()
         if not text:
             return
         self._set_status(text, role="warning")
         self._log_voice_startup(text)
+        self._refresh_visual_status()
 
     def _set_status(self, text, color=None, role: str = "muted"):
         """Update the status label.
@@ -1247,6 +2153,7 @@ class VoiceTab(QScrollArea):
     def _activate_qwen_backend(self, port=8000):
         self._qwen_activation_pending = False
         url = f"http://localhost:{port}"
+        self.voice_mgr.backend.reset_qwen_connection()
         if self.qwen_url.text().strip().rstrip("/") != url:
             self.qwen_url.setText(url)
         else:
@@ -1255,6 +2162,9 @@ class VoiceTab(QScrollArea):
             self.voice_mgr.set_backend("qwen3-tts")
         else:
             self._update_active_backend_label()
+        if hasattr(self, "activity_timeline"):
+            self.activity_timeline.set_state(active=None, complete={"Server"})
+        self._refresh_visual_status()
 
     def _select_pyttsx3_backend(self):
         self._qwen_activation_pending = False
@@ -1266,6 +2176,9 @@ class VoiceTab(QScrollArea):
             self.engine_combo.blockSignals(True)
             self.engine_combo.setCurrentText("pyttsx3")
             self.engine_combo.blockSignals(False)
+        if hasattr(self, "activity_timeline"):
+            self.activity_timeline.set_state(active="Server")
+        self._refresh_visual_status()
 
     def _qwen_server_ready(self, port=8000):
         try:
@@ -1300,6 +2213,7 @@ class VoiceTab(QScrollArea):
             return
         if force_device is None:
             self._tts_cuda_retry_attempted = False
+        self.voice_mgr.backend.reset_qwen_connection()
 
         model_key = self.qwen_model_combo.currentText()
         model_id = QWEN_MODELS.get(model_key, "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
@@ -1374,6 +2288,9 @@ class VoiceTab(QScrollArea):
         self._update_active_backend_label()
         self.tts_server_status.setText(f"Loading {model_key} ({device_label})...")
         apply_status_style(self.tts_server_status, role="warning")
+        if hasattr(self, "activity_timeline"):
+            self.activity_timeline.set_state(active="Server")
+        self._show_toast(f"Starting Qwen3-TTS ({device_label})", role="warning")
         self.start_tts_btn.setEnabled(False)
         self.stop_tts_btn.setEnabled(True)
 
@@ -1626,6 +2543,7 @@ class VoiceTab(QScrollArea):
                 apply_status_style(self.tts_server_status, role="success")
                 self._tts_ready_timer.stop()
                 self._set_status("Qwen3-TTS ready", role="success")
+                self._show_toast("Qwen3-TTS ready", role="success")
                 return
         except Exception as e:
             logger.debug(f"TTS server not ready: {e}")
@@ -1642,12 +2560,14 @@ class VoiceTab(QScrollArea):
             self._tts_process.kill()
             self._tts_process.waitForFinished(3000)
         self._kill_port(8000)
+        self.voice_mgr.backend.reset_qwen_connection()
         self._cleanup_tts_launcher()
         self.tts_server_status.setText("Stopped")
         clear_status_role(self.tts_server_status)
         self.start_tts_btn.setEnabled(True)
         self.stop_tts_btn.setEnabled(False)
         self._select_pyttsx3_backend()
+        self._show_toast("Qwen3-TTS stopped; using fallback", role="warning")
 
     def _on_tts_output(self):
         if not self._tts_process:
@@ -1667,6 +2587,7 @@ class VoiceTab(QScrollArea):
                 self._activate_qwen_backend(8000)
                 self.tts_server_status.setText("Running on :8000")
                 apply_status_style(self.tts_server_status, role="success")
+                self._show_toast("Qwen3-TTS ready", role="success")
                 if self._tts_ready_timer:
                     self._tts_ready_timer.stop()
 
@@ -1695,6 +2616,7 @@ class VoiceTab(QScrollArea):
             self._select_pyttsx3_backend()
             self.tts_server_status.setText("Stopped")
             clear_status_role(self.tts_server_status)
+            self._show_toast("Qwen3-TTS stopped; using fallback", role="warning")
         else:
             if self._should_retry_qwen_on_cpu():
                 self._tts_cuda_retry_attempted = True
@@ -1704,6 +2626,7 @@ class VoiceTab(QScrollArea):
                 self.tts_server_status.setText(msg)
                 apply_status_style(self.tts_server_status, role="warning")
                 self._set_status(msg, role="warning")
+                self._show_toast(msg, role="warning")
                 self._log_voice_startup(
                     "Qwen3-TTS CUDA failed with a PyTorch device-side assert; "
                     "retrying once on CPU"
@@ -1730,6 +2653,7 @@ class VoiceTab(QScrollArea):
                 self.tts_server_status.setText(
                     f"Exited ({exit_code}) - check console for details"
                 )
+            self._show_toast("Qwen3-TTS exited; using fallback", role="error")
 
     def _clean_tts_log_line(self, line: str) -> str:
         """Normalize process output for UI display by removing ANSI escapes."""

@@ -4,12 +4,13 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QSpinBox, QComboBox, QGroupBox, QCheckBox,
+    QLabel, QLineEdit, QSpinBox, QComboBox, QCheckBox,
     QPushButton, QTableWidget, QTableWidgetItem, QListWidget,
 )
 from PySide6.QtCore import QTimer, QProcess
 from PySide6.QtGui import QFont
 
+from gui.widgets.settings_card import SettingsCard
 from app.backend_sync_client import BackendSyncClient
 from app.ui_async import UiThreadBridge
 from app.ui_status import apply_status_style, clear_status_role
@@ -42,9 +43,8 @@ class SystemTab(QScrollArea):
         layout.addWidget(header)
 
         # --- Core Server (launch / stop) ---
-        server_group = QGroupBox("Core Server")
-        server_group.setObjectName("settingsGroup")
-        svl = QVBoxLayout(server_group)
+        server_card = SettingsCard("Core Server", subtitle="Launch and control the core runtime", icon="⏻")
+        svl = QVBoxLayout()
 
         sv_info = QLabel(
             "Start the Python core server directly from the UI. "
@@ -73,12 +73,12 @@ class SystemTab(QScrollArea):
         sv_btn_row.addWidget(self.stop_server_btn)
         svl.addLayout(sv_btn_row)
 
-        layout.addWidget(server_group)
+        server_card.add_layout(svl)
+        layout.addWidget(server_card)
 
         # Core Connection
-        core_group = QGroupBox("Core Connection")
-        core_group.setObjectName("settingsGroup")
-        cg = QVBoxLayout(core_group)
+        core_card = SettingsCard("Core Connection", subtitle="Host, ports, and connection controls", icon="🔗")
+        cg = QVBoxLayout()
 
         addr_form = QFormLayout()
         addr_form.setContentsMargins(0, 0, 0, 0)
@@ -126,12 +126,12 @@ class SystemTab(QScrollArea):
         core_btn_row.addWidget(self.core_ping_btn)
         cg.addLayout(core_btn_row)
 
-        layout.addWidget(core_group)
+        core_card.add_layout(cg)
+        layout.addWidget(core_card)
 
         # Architecture monitor
-        arch_group = QGroupBox("Architecture Monitor")
-        arch_group.setObjectName("settingsGroup")
-        ag = QVBoxLayout(arch_group)
+        arch_card = SettingsCard("Architecture Monitor", subtitle="Module health and readiness status", icon="🏗")
+        ag = QVBoxLayout()
 
         self.arch_overall = QLabel("Overall: Unknown")
         self.arch_overall.setFont(QFont("Consolas", 9, QFont.Bold))
@@ -161,22 +161,22 @@ class SystemTab(QScrollArea):
             self.arch_labels[key] = status_lbl
             ag.addLayout(row)
 
-        layout.addWidget(arch_group)
+        arch_card.add_layout(ag)
+        layout.addWidget(arch_card)
 
         # Theme
-        theme_group = QGroupBox("Appearance")
-        theme_group.setObjectName("settingsGroup")
-        tg = QFormLayout(theme_group)
+        theme_card = SettingsCard("Appearance", subtitle="UI theme selection", icon="🎨")
+        tg = QFormLayout()
         self.theme_combo = QComboBox()
         self._load_theme_combo()
         self.theme_combo.currentIndexChanged.connect(self._change_theme)
         tg.addRow("Theme:", self.theme_combo)
-        layout.addWidget(theme_group)
+        theme_card.add_layout(tg)
+        layout.addWidget(theme_card)
 
         # Neural Modules
-        neural_group = QGroupBox("Neural Modules")
-        neural_group.setObjectName("settingsGroup")
-        ng = QVBoxLayout(neural_group)
+        neural_card = SettingsCard("Neural Modules", subtitle="Toggle and monitor neural sub-systems", icon="🧠")
+        ng = QVBoxLayout()
 
         en_row = QHBoxLayout()
         self.emotion_toggle = QCheckBox("EmotionNet")
@@ -233,12 +233,12 @@ class SystemTab(QScrollArea):
         pp_row.addWidget(self.pipeline_label, stretch=1)
         ng.addLayout(pp_row)
 
-        layout.addWidget(neural_group)
+        neural_card.add_layout(ng)
+        layout.addWidget(neural_card)
 
         # Plugins
-        plugin_group = QGroupBox("Plugins")
-        plugin_group.setObjectName("settingsGroup")
-        pg = QVBoxLayout(plugin_group)
+        plugin_card = SettingsCard("Plugins", subtitle="Installed plugin registry", icon="🔌")
+        pg = QVBoxLayout()
 
         self.plugin_table = QTableWidget()
         self.plugin_table.setColumnCount(5)
@@ -254,22 +254,22 @@ class SystemTab(QScrollArea):
         refresh_btn.clicked.connect(self._refresh_plugins)
         pg.addWidget(refresh_btn)
 
-        layout.addWidget(plugin_group)
+        plugin_card.add_layout(pg)
+        layout.addWidget(plugin_card)
 
         # Batched Listening
-        batch_group = QGroupBox("Batched Listening")
-        batch_group.setObjectName("settingsGroup")
-        bl = QFormLayout(batch_group)
+        batch_card = SettingsCard("Batched Listening", subtitle="Voice batching metrics", icon="📊")
+        bl = QFormLayout()
         self.batch_size_label = QLabel("200 ms")
         bl.addRow("Batch Window:", self.batch_size_label)
         self.partial_len_label = QLabel("0 chars")
         bl.addRow("Partial Transcript:", self.partial_len_label)
-        layout.addWidget(batch_group)
+        batch_card.add_layout(bl)
+        layout.addWidget(batch_card)
 
         # Training Data
-        training_group = QGroupBox("Training Data (Safe Learning)")
-        training_group.setObjectName("settingsGroup")
-        td = QVBoxLayout(training_group)
+        training_card = SettingsCard("Training Data", subtitle="Safe learning feedback collection", icon="📦")
+        td = QVBoxLayout()
 
         info = QLabel(
             "Collected feedback for offline fine-tuning.\n"
@@ -295,12 +295,12 @@ class SystemTab(QScrollArea):
         export_row.addWidget(export_emotion)
         td.addLayout(export_row)
 
-        layout.addWidget(training_group)
+        training_card.add_layout(td)
+        layout.addWidget(training_card)
 
         # Skills Library
-        skills_group = QGroupBox("Skill Library")
-        skills_group.setObjectName("settingsGroup")
-        sk = QVBoxLayout(skills_group)
+        skills_card = SettingsCard("Skill Library", subtitle="User-defined skill templates", icon="⚡")
+        sk = QVBoxLayout()
         sk_info = QLabel(
             "User-defined skills (templates/macros) "
             "executed deterministically."
@@ -317,7 +317,8 @@ class SystemTab(QScrollArea):
         add_skill_btn.setObjectName("secondaryBtn")
         sk.addWidget(add_skill_btn)
 
-        layout.addWidget(skills_group)
+        skills_card.add_layout(sk)
+        layout.addWidget(skills_card)
         layout.addStretch()
         self.setWidget(container)
 

@@ -1,4 +1,4 @@
-"""MemoryAgent — produces relevant facts for the current turn.
+"""MemoryAgent -- produces relevant facts for the current turn.
 
 V1 uses keyword retrieval over the existing :class:`MemoryStore` (plus a
 small lookback over short-term turns).  V2 can swap in vector retrieval
@@ -8,9 +8,10 @@ Output payload::
 
     {
         "_confidence": 0.0 - 1.0,
-        "relevant_facts": ["short-term: ...", "long-term: ..."],
+        "relevant_facts": ["short-term: ...", "long-term: ...", "episodic-lesson: ..."],
         "short_term_count": int,
         "long_term_hits":   int,
+        "episodic_lesson_count": int,
     }
 """
 from __future__ import annotations
@@ -33,11 +34,19 @@ class MemoryAgent(Agent):
         model_router=None,
         max_facts: int = 5,
         short_term_window: int = 6,
+        episodic_store=None,
+        max_episodic_lessons: int = 3,
     ):
         self._memory = memory_store
         self._router = model_router
         self._max_facts = max(1, int(max_facts))
         self._short_term_window = max(0, int(short_term_window))
+        # Issue #4 (REVIA_DEEP_DIVE) -- pull lessons from the EpisodicMemoryStore
+        # so cross-session learnings reach the LLM context, not just the
+        # autonomy loop.  Search is keyword + time-decayed (CPU-local), so
+        # the latency cost is negligible.
+        self._episodic = episodic_store
+        self._max_episodic_lessons = max(0, int(max_episodic_lessons))
 
     # ------------------------------------------------------------------
     # Override execute via the standard run() contract
@@ -50,6 +59,7 @@ class MemoryAgent(Agent):
                 "relevant_facts": [],
                 "short_term_count": 0,
                 "long_term_hits": 0,
+                "episodic_lesson_count": 0,
                 "note": "memory_store unavailable",
             }
 
@@ -109,6 +119,30 @@ class MemoryAgent(Agent):
             if len(relevant) >= self._max_facts * 2:
                 break
 
+        # Issue #4 -- Episodic lessons.  Search the EpisodicMemoryStore for
+        # past turns whose attached lesson is relevant to the current user
+        # text.  Lessons survive across sessions, so this is the path by
+        # which cross-session learning reaches the LLM context.
+        episodic_lessons: list[str] = []
+        if self._episodic is not None and self._max_episodic_lessons > 0:
+            try:
+                context.cancel_token.raise_if_cancelled()
+                results = self._episodic.search(
+                    context.user_text,
+                    limit=self._max_episodic_lessons,
+                )
+                for result in results or []:
+                    ep = getattr(result, "episode", None)
+                    lesson = (getattr(ep, "lesson", "") or "").strip() if ep else ""
+                    if not lesson:
+                        continue
+                    episodic_lessons.append(lesson)
+                    relevant.append(f"episodic-lesson: {lesson}")
+            except Exception:
+                # Episodic search is a *boost*, never a hard dependency for
+                # the turn -- never let its failures starve memory retrieval.
+                episodic_lessons = []
+
         # Confidence heuristic: how many distinct sources fired.
         confidence = 0.0
         if long_term_hits:
@@ -117,6 +151,8 @@ class MemoryAgent(Agent):
             confidence += 0.3
         if keywords:
             confidence += 0.2
+        if episodic_lessons:
+            confidence = min(1.0, confidence + 0.1)
         confidence = min(1.0, confidence)
 
         return {
@@ -124,6 +160,7 @@ class MemoryAgent(Agent):
             "relevant_facts": relevant,
             "short_term_count": len(short_term),
             "long_term_hits": len(long_term_hits),
+            "episodic_lesson_count": len(episodic_lessons),
             "keywords": keywords,
         }
 

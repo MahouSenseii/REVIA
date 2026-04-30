@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,6 +21,7 @@ from PySide6.QtWidgets import (
 from app.backend_sync_client import BackendSyncClient
 from app.theme_manager import THEME_TOKENS, ThemeDefinition
 from app.ui_status import apply_status_style, clear_status_role
+from gui.widgets.settings_card import SettingsCard
 
 
 class ThemeTab(QScrollArea):
@@ -51,9 +51,12 @@ class ThemeTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        selector_group = QGroupBox("Theme Selection")
-        selector_group.setObjectName("settingsGroup")
-        selector_layout = QHBoxLayout(selector_group)
+        selector_card = SettingsCard(
+            "Theme Selection",
+            subtitle="Choose & apply themes",
+            icon="T",
+        )
+        selector_layout = QHBoxLayout()
         selector_layout.setContentsMargins(10, 10, 10, 10)
         selector_layout.setSpacing(8)
 
@@ -72,11 +75,15 @@ class ThemeTab(QScrollArea):
         self.reset_btn.clicked.connect(self._reset_theme)
         selector_layout.addWidget(self.reset_btn)
 
-        layout.addWidget(selector_group)
+        selector_card.add_layout(selector_layout)
+        layout.addWidget(selector_card)
 
-        editor_group = QGroupBox("Theme Tokens")
-        editor_group.setObjectName("settingsGroup")
-        editor_layout = QVBoxLayout(editor_group)
+        editor_card = SettingsCard(
+            "Theme Tokens",
+            subtitle="Customize colors & style",
+            icon="#",
+        )
+        editor_layout = QVBoxLayout()
 
         identity_form = QFormLayout()
         identity_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -141,7 +148,8 @@ class ThemeTab(QScrollArea):
         self.validation_label.setWordWrap(True)
         editor_layout.addWidget(self.validation_label)
 
-        layout.addWidget(editor_group)
+        editor_card.add_layout(editor_layout)
+        layout.addWidget(editor_card)
         layout.addStretch()
         self.setWidget(container)
 

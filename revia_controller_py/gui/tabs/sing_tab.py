@@ -19,13 +19,14 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QFileDialog, QGroupBox,
+    QListWidget, QListWidgetItem, QFileDialog,
     QComboBox, QLineEdit, QCheckBox, QProgressBar, QSplitter,
     QTextEdit, QInputDialog, QMessageBox,
 )
 from PySide6.QtGui import QFont, QColor
 
 from app.ui_status import apply_status_style, clear_status_role
+from gui.widgets.settings_card import SettingsCard
 
 _log = logging.getLogger(__name__)
 
@@ -66,8 +67,12 @@ class SingTab(QWidget):
         layout.setSpacing(6)
 
         # Now Playing
-        np_group = QGroupBox("Now Playing")
-        np_layout = QVBoxLayout(np_group)
+        np_card = SettingsCard(
+            "Now Playing",
+            subtitle="Current song & controls",
+            icon="~",
+        )
+        np_layout = QVBoxLayout()
         self._now_playing_label = QLabel("Nothing playing")
         self._now_playing_label.setFont(QFont("", 11, QFont.Bold))
         self._now_playing_label.setWordWrap(True)
@@ -102,14 +107,19 @@ class SingTab(QWidget):
         ctrl_layout.addWidget(self._auto_pick_cb)
         np_layout.addLayout(ctrl_layout)
 
-        layout.addWidget(np_group)
+        np_card.add_layout(np_layout)
+        layout.addWidget(np_card)
 
         # Splitter: Queue | Library
         splitter = QSplitter(Qt.Horizontal)
 
         # Queue panel
-        queue_group = QGroupBox("Queue")
-        q_layout = QVBoxLayout(queue_group)
+        queue_card = SettingsCard(
+            "Queue",
+            subtitle="Upcoming songs",
+            icon="Q",
+        )
+        q_layout = QVBoxLayout()
         self._queue_list = QListWidget()
         self._queue_list.setMaximumHeight(200)
         q_layout.addWidget(self._queue_list)
@@ -119,11 +129,16 @@ class SingTab(QWidget):
         q_btn_layout.addWidget(self._btn_clear_queue)
         q_btn_layout.addStretch()
         q_layout.addLayout(q_btn_layout)
-        splitter.addWidget(queue_group)
+        queue_card.add_layout(q_layout)
+        splitter.addWidget(queue_card)
 
         # Library panel
-        lib_group = QGroupBox("Song Library")
-        lib_layout = QVBoxLayout(lib_group)
+        lib_card = SettingsCard(
+            "Song Library",
+            subtitle="Browse & manage songs",
+            icon="L",
+        )
+        lib_layout = QVBoxLayout()
 
         # Search
         search_layout = QHBoxLayout()
@@ -159,7 +174,8 @@ class SingTab(QWidget):
         apply_status_style(self._stats_label, role="muted")
         lib_layout.addWidget(self._stats_label)
 
-        splitter.addWidget(lib_group)
+        lib_card.add_layout(lib_layout)
+        splitter.addWidget(lib_card)
         layout.addWidget(splitter, stretch=1)
 
         # Processing status

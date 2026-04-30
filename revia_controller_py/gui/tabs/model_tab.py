@@ -7,11 +7,13 @@ import threading
 from pathlib import Path
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QComboBox, QGroupBox, QSpinBox, QDoubleSpinBox,
+    QLabel, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
     QPushButton, QFileDialog, QStackedWidget, QCheckBox,
 )
 from PySide6.QtGui import QFont
 from PySide6.QtCore import QProcess, QTimer, Signal
+
+from gui.widgets.settings_card import SettingsCard
 
 from app.ui_status import apply_status_style, clear_status_role
 
@@ -46,9 +48,12 @@ class ModelTab(QScrollArea):
         layout.addWidget(header)
 
         # --- Source type selector ---
-        source_group = QGroupBox("Model Source")
-        source_group.setObjectName("settingsGroup")
-        sg = QFormLayout(source_group)
+        source_card = SettingsCard(
+            "Model Source",
+            subtitle="Local model or online API",
+            icon="M",
+        )
+        sg = QFormLayout()
 
         self.source_type = QComboBox()
         self.source_type.addItems(["Local Model File", "Online API"])
@@ -118,9 +123,12 @@ class ModelTab(QScrollArea):
         lp.addLayout(local_form)
 
         # -- Server Controls (start/stop local LLM server) --
-        srv_group = QGroupBox("Server Controls")
-        srv_group.setObjectName("settingsGroup")
-        scl = QVBoxLayout(srv_group)
+        srv_card = SettingsCard(
+            "Server Controls",
+            subtitle="Start/stop local LLM server",
+            icon="S",
+        )
+        scl = QVBoxLayout()
         scl.setSpacing(6)
 
         exe_row = QHBoxLayout()
@@ -175,7 +183,8 @@ class ModelTab(QScrollArea):
         self.llm_server_status.setFont(QFont("Segoe UI", 8))
         scl.addWidget(self.llm_server_status)
 
-        lp.addWidget(srv_group)
+        srv_card.add_layout(scl)
+        lp.addWidget(srv_card)
         self.source_stack.addWidget(local_page)
 
         # -- Online API page --
@@ -233,12 +242,16 @@ class ModelTab(QScrollArea):
         self.source_stack.addWidget(online_page)
 
         sg.addRow(self.source_stack)
-        layout.addWidget(source_group)
+        source_card.add_layout(sg)
+        layout.addWidget(source_card)
 
         # --- Generation parameters ---
-        gen_group = QGroupBox("Generation Parameters")
-        gen_group.setObjectName("settingsGroup")
-        gf = QFormLayout(gen_group)
+        gen_card = SettingsCard(
+            "Generation Parameters",
+            subtitle="Sampling and response settings",
+            icon="G",
+        )
+        gf = QFormLayout()
 
         self.ctx_length = QSpinBox()
         self.ctx_length.setRange(512, 131072)
@@ -273,12 +286,16 @@ class ModelTab(QScrollArea):
         self.fast_mode.setChecked(True)
         gf.addRow("", self.fast_mode)
 
-        layout.addWidget(gen_group)
+        gen_card.add_layout(gf)
+        layout.addWidget(gen_card)
 
         # --- GPU settings (local only) ---
-        self.gpu_group = QGroupBox("GPU / Quantization  (Local)")
-        self.gpu_group.setObjectName("settingsGroup")
-        gg = QFormLayout(self.gpu_group)
+        self.gpu_card = SettingsCard(
+            "GPU / Quantization (Local)",
+            subtitle="Hardware acceleration and compression",
+            icon="Q",
+        )
+        gg = QFormLayout()
 
         self.gpu_layers = QSpinBox()
         self.gpu_layers.setRange(0, 200)
@@ -302,12 +319,16 @@ class ModelTab(QScrollArea):
         ])
         gg.addRow("Quantization:", self.quant)
 
-        layout.addWidget(self.gpu_group)
+        self.gpu_card.add_layout(gg)
+        layout.addWidget(self.gpu_card)
 
         # --- Connection ---
-        conn_group = QGroupBox("Connection")
-        conn_group.setObjectName("settingsGroup")
-        cg = QVBoxLayout(conn_group)
+        conn_card = SettingsCard(
+            "Connection",
+            subtitle="Test and manage model connection",
+            icon="C",
+        )
+        cg = QVBoxLayout()
 
         self.conn_status = QLabel("Status: Not connected")
         self.conn_status.setFont(QFont("Consolas", 9))
@@ -327,7 +348,8 @@ class ModelTab(QScrollArea):
         btn_row.addWidget(self.disconnect_btn)
         cg.addLayout(btn_row)
 
-        layout.addWidget(conn_group)
+        conn_card.add_layout(cg)
+        layout.addWidget(conn_card)
         layout.addStretch()
         self.setWidget(container)
 
@@ -386,7 +408,7 @@ class ModelTab(QScrollArea):
 
     def _on_source_changed(self, index):
         self.source_stack.setCurrentIndex(index)
-        self.gpu_group.setVisible(index == 0)
+        self.gpu_card.setVisible(index == 0)
         self._save_settings()
 
     def _on_local_server_changed(self, server):

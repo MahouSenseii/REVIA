@@ -2,13 +2,14 @@ from collections import deque
 import logging
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QGroupBox, QProgressBar, QPushButton,
+    QLabel, QProgressBar, QPushButton,
     QTextEdit, QCheckBox, QSpinBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPainter, QColor, QPen
 
 from app.ui_status import apply_status_style
+from gui.widgets.settings_card import SettingsCard
 
 logger = logging.getLogger(__name__)
 try:
@@ -73,9 +74,12 @@ class EmotionsTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        probs_group = QGroupBox("Neural Inference (Top Probabilities)")
-        probs_group.setObjectName("settingsGroup")
-        pg = QVBoxLayout(probs_group)
+        probs_card = SettingsCard(
+            "Neural Inference",
+            subtitle="Top probabilities",
+            icon="N",
+        )
+        pg = QVBoxLayout()
 
         for _ in range(5):
             row = QHBoxLayout()
@@ -105,11 +109,15 @@ class EmotionsTab(QScrollArea):
         self.temporal_view.setPlaceholderText("Temporal/behavioral context will appear here.")
         pg.addWidget(self.temporal_view)
 
-        layout.addWidget(probs_group)
+        probs_card.add_layout(pg)
+        layout.addWidget(probs_card)
 
-        chart_group = QGroupBox("Emotion Timeline")
-        chart_group.setObjectName("settingsGroup")
-        cgl = QVBoxLayout(chart_group)
+        chart_card = SettingsCard(
+            "Emotion Timeline",
+            subtitle="History over time",
+            icon="T",
+        )
+        cgl = QVBoxLayout()
 
         if _CHARTS_AVAILABLE:
             self._chart_view, self._emotion_series, self._x_axis = self._build_chart()
@@ -167,11 +175,15 @@ class EmotionsTab(QScrollArea):
                 legend_grid.addLayout(pair, row_i, col_i)
             cgl.addLayout(legend_grid)
 
-        layout.addWidget(chart_group)
+        chart_card.add_layout(cgl)
+        layout.addWidget(chart_card)
 
-        inject_group = QGroupBox("Emotion Injection to AI")
-        inject_group.setObjectName("settingsGroup")
-        ig = QVBoxLayout(inject_group)
+        inject_card = SettingsCard(
+            "Emotion Injection to AI",
+            subtitle="Context fed to the model",
+            icon="I",
+        )
+        ig = QVBoxLayout()
 
         info = QLabel(
             "This context is appended to the AI system prompt so responses adapt to "
@@ -193,7 +205,8 @@ class EmotionsTab(QScrollArea):
         self.inject_preview.setPlaceholderText("No emotion context injected yet.")
         ig.addWidget(self.inject_preview)
 
-        layout.addWidget(inject_group)
+        inject_card.add_layout(ig)
+        layout.addWidget(inject_card)
         layout.addStretch()
         self.setWidget(container)
 

@@ -61,6 +61,19 @@ class CharacterProfileManager:
             interaction.get("verbosity") or prof.get("verbosity", "Normal"),
             50,
         )
+        greeting_variants_raw = (
+            interaction.get("greeting_variants")
+            or prof.get("greeting_variants")
+            or []
+        )
+        if isinstance(greeting_variants_raw, str):
+            greeting_variants_raw = [greeting_variants_raw]
+        greeting_variants = []
+        for variant in greeting_variants_raw or []:
+            cleaned = self._sanitize_profile_field(variant, 200)
+            if cleaned:
+                greeting_variants.append(cleaned)
+
         greeting = self._sanitize_profile_field(
             interaction.get("greeting") or prof.get("greeting", ""),
             200,
@@ -125,10 +138,25 @@ class CharacterProfileManager:
             "Never default to a greeting or introduction unless the response mode "
             "explicitly allows it."
         )
-        if include_greeting_instruction and greeting:
-            parts.append(
-                f"If this turn is explicitly a greeting/startup turn, greet naturally in a way like: \"{greeting}\""
-        )
+        if include_greeting_instruction:
+            if greeting_variants:
+                samples = " | ".join(f'"{v}"' for v in greeting_variants[:6])
+                parts.append(
+                    "If this turn is explicitly a greeting/startup turn, greet naturally and "
+                    f"vary the wording each session. Draw from this flavor pool: {samples}. "
+                    "Do not reuse the exact same greeting twice in a row."
+                )
+            elif greeting:
+                parts.append(
+                    f"If this turn is explicitly a greeting/startup turn, greet naturally in a way like: \"{greeting}\". "
+                    "Vary the wording each session — do not repeat the same line every time."
+                )
+            else:
+                parts.append(
+                    "If this turn is explicitly a greeting/startup turn, greet naturally and "
+                    "vary the wording each session. Stay in character; do not use a generic "
+                    "assistant greeting."
+                )
         parts.append(
             "If you are uncertain, say so clearly and suggest a next step instead of "
             "pretending the request succeeded."

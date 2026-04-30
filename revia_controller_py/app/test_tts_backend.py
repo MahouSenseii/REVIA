@@ -34,6 +34,22 @@ class FakeQwenClient:
         return {"path": self.wav_path}
 
 
+class EndpointAwareFakeQwenClient(FakeQwenClient):
+    def __init__(self, wav_path=None, endpoints=None, advertised=None):
+        super().__init__(wav_path)
+        self.endpoints = set(endpoints or ())
+        self.advertised = set(self.endpoints if advertised is None else advertised)
+
+    def predict(self, *args, api_name=None):
+        self.calls.append((args, api_name))
+        if api_name not in self.endpoints:
+            raise ValueError(f"Cannot find a function with `api_name`: {api_name}.")
+        return {"path": self.wav_path}
+
+    def view_api(self, return_format="dict"):
+        return {"named_endpoints": {name: {} for name in self.advertised}}
+
+
 class TestQwenEndpointHandling(unittest.TestCase):
     def test_voice_design_missing_endpoint_is_nonfatal(self):
         backend = QwenTTSBackend()
@@ -116,6 +132,71 @@ class TestQwenEndpointHandling(unittest.TestCase):
             "Ryan",
             "warm clear voice",
         ))
+        self.assertEqual(errors, [])
+        self.assertTrue(any("CustomVoice style fallback" in s for s in statuses))
+
+    def test_voice_design_retries_when_discovery_misses_hf_endpoint(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+        backend.set_qwen_server("local-test-server")
+        client = EndpointAwareFakeQwenClient(
+            tmp_path,
+            endpoints={"/generate_voice_design"},
+            advertised=set(),
+        )
+        errors = []
+        backend.error_occurred.connect(errors.append)
+        backend._get_client = lambda _space_key="design": client
+
+        wav, _metrics = backend._qwen_design(
+            "hello",
+            "warm clear voice",
+            "Auto",
+            None,
+        )
+
+        self.assertEqual(wav, tmp_path)
+        self.assertEqual(
+            [call[1] for call in client.calls],
+            ["/run_voice_design", "/generate_voice_design"],
+        )
+        self.assertEqual(errors, [])
+
+    def test_voice_design_refreshes_stale_endpoint_cache(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+        backend.set_qwen_server("local-test-server")
+        with backend._qwen_api_cache_lock:
+            backend._qwen_api_cache["local-test-server"] = {"/run_voice_design"}
+        client = EndpointAwareFakeQwenClient(
+            tmp_path,
+            endpoints={"/generate_custom_voice"},
+            advertised={"/generate_custom_voice"},
+        )
+        statuses = []
+        errors = []
+        backend.status_updated.connect(statuses.append)
+        backend.error_occurred.connect(errors.append)
+        backend._get_client = lambda _space_key="design": client
+
+        wav, _metrics = backend._qwen_design(
+            "hello",
+            "warm clear voice",
+            "Auto",
+            None,
+        )
+
+        self.assertEqual(wav, tmp_path)
+        self.assertEqual(
+            [call[1] for call in client.calls],
+            ["/run_voice_design", "/generate_custom_voice"],
+        )
         self.assertEqual(errors, [])
         self.assertTrue(any("CustomVoice style fallback" in s for s in statuses))
 

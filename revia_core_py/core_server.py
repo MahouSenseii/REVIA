@@ -240,6 +240,11 @@ from reinforcement_learner import ReinforcementLearner, RewardSignal
 from vllm_backend import VLLMEnhancer, classify_prompt_complexity
 from human_feel_layer import HumanFeelLayer
 from answer_validation import AnswerValidationSystem
+from error_handler import (
+    ErrorSeverity,
+    ReviaErrorHandler,
+    WebSocketBackend,
+)
 from autonomy.autonomy_loop import ReviaAutonomyLoop
 from autonomy.candidate_generator import CandidateGenerator
 from autonomy.cooldown_manager import CooldownManager
@@ -253,6 +258,7 @@ from agents import (
     AgentOrchestrator,
     CancellationToken,
     CriticAgent,
+    DebateOrchestrator,
     EmotionAgent,
     FinalResponseBuilder,
     IntentAgent,
@@ -261,13 +267,39 @@ from agents import (
     ModelRouter,
     QualityGate,
     ReasoningAgent,
+    ToolUseAgent,
+    VisionAgent,
     VoiceStyleAgent,
+)
+from autonomy_v3 import (
+    AutonomyScheduler,
+    EpisodicMemoryStore,
+    GoalTracker,
+    ReflectionAgent,
+    register_default_tasks,
+)
+from skills import (
+    CalculatorSkill,
+    ClockSkill,
+    EchoSkill,
+    MemoryRecallSkill,
+    SkillRegistry,
+    SkillRequest,
 )
 from runtime import (
     HardwareAgent,
     HardwareProfiler,
     ProviderRegistry,
     RuntimeScheduler,
+)
+from interfaces import (
+    InterfaceContext,
+    InterfaceRouter,
+    LogInterface,
+    NotificationInterface,
+    TextChatInterface,
+    VisionInterface,
+    VoiceInterface,
 )
 
 # ---------------------------------------------------------------------------
@@ -584,6 +616,18 @@ class TelemetryEngine:
 
 
 telemetry = TelemetryEngine()
+
+
+# ---------------------------------------------------------------------------
+# Centralised error handler — instantiated early so that errors raised during
+# startup are captured into the WebSocket backend's buffer and replayed to
+# the GUI as soon as the WS server is up.  Issue #16 (REVIA_DEEP_DIVE).
+# ---------------------------------------------------------------------------
+error_handler = ReviaErrorHandler.get_instance()
+# Attach a WebSocketBackend with no broadcaster yet; it will buffer up to
+# 200 lines of startup output and replay them to the GUI as soon as
+# main() wires `broadcast_json` (after the WS server reports ready).
+error_handler.attach_websocket_broadcaster(None)
 
 
 def _revia_log(message):
@@ -5359,6 +5403,15 @@ _hardware_fingerprint = None  # type: ignore[assignment]
 _hardware_agent: HardwareAgent | None = None
 _runtime_scheduler: RuntimeScheduler | None = None
 _provider_registry: ProviderRegistry | None = None
+_interface_router: InterfaceRouter | None = None
+_interface_router_lock = threading.Lock()
+
+# V3 + V4 singletons (lazy-init).
+_episodic_memory: EpisodicMemoryStore | None = None
+_goal_tracker: GoalTracker | None = None
+_autonomy_scheduler: AutonomyScheduler | None = None
+_skill_registry: SkillRegistry | None = None
+_v3_v4_lock = threading.Lock()
 
 
 def _ensure_hardware_runtime():
@@ -5405,6 +5458,62 @@ def _ensure_hardware_runtime():
     return fingerprint, hw_agent, scheduler
 
 
+def _ensure_v3_v4() -> tuple[EpisodicMemoryStore, GoalTracker, SkillRegistry]:
+    """Lazy-build V3 EpisodicMemory + GoalTracker and V4 SkillRegistry.
+
+    Idempotent.  Loaded on first call, then cached.
+    """
+    global _episodic_memory, _goal_tracker, _skill_registry
+    with _v3_v4_lock:
+        if _episodic_memory is None:
+            _episodic_memory = EpisodicMemoryStore()
+            try:
+                _episodic_memory.load()
+            except Exception as exc:
+                _revia_log(f"[V3] EpisodicMemory load failed: {exc}")
+        if _goal_tracker is None:
+            _goal_tracker = GoalTracker()
+            try:
+                _goal_tracker.load()
+            except Exception as exc:
+                _revia_log(f"[V3] GoalTracker load failed: {exc}")
+        if _skill_registry is None:
+            _skill_registry = SkillRegistry(
+                skills=[
+                    CalculatorSkill(),
+                    ClockSkill(),
+                    EchoSkill(),
+                    MemoryRecallSkill(episode_store=_episodic_memory),
+                ],
+                log_fn=_revia_log,
+            )
+        return _episodic_memory, _goal_tracker, _skill_registry
+
+
+def _ensure_autonomy_scheduler() -> AutonomyScheduler:
+    """Build + start the V3.4 AutonomyScheduler if not running yet."""
+    global _autonomy_scheduler
+    with _v3_v4_lock:
+        if _autonomy_scheduler is not None:
+            return _autonomy_scheduler
+
+        episode_store, goal_tracker, _skills = _ensure_v3_v4()
+        _, hw_agent, _scheduler_obj = _ensure_hardware_runtime()
+        scheduler = AutonomyScheduler(
+            snapshot_provider=hw_agent.latest if hw_agent else None,
+            tick_s=10.0,
+            log_fn=_revia_log,
+        )
+        register_default_tasks(
+            scheduler,
+            episode_store=episode_store,
+            goal_tracker=goal_tracker,
+        )
+        scheduler.start()
+        _autonomy_scheduler = scheduler
+        return _autonomy_scheduler
+
+
 def _build_agents_orchestrator() -> AgentOrchestrator:
     """Wire the parallel-agents orchestrator with REVIA's live singletons.
 
@@ -5427,6 +5536,27 @@ def _build_agents_orchestrator() -> AgentOrchestrator:
         priority_class="normal",
         rank=10,
         description="REVIA EmotionNet affective fusion",
+    )
+
+    # Issue #10: intent classifier.  Without a registered route, IntentAgent's
+    # router.has("intent_classify") branch was permanently dead and we lost
+    # the natural extension point for a small ML classifier.  The heuristic
+    # engine is registered at rank=100 as a guaranteed fallback; an ML model
+    # (e.g. distilbert / ONNX) can later be registered at rank<=50 and will
+    # win automatically while the heuristic stays as the safety net.
+    def _intent_classify_heuristic(text, **_kw):
+        return IntentAgent._classify_heuristic(str(text or ""))
+
+    router.register(
+        "intent_classify",
+        backend_name="intent_heuristic",
+        handler=_intent_classify_heuristic,
+        requirements=ModelRequirements(
+            vram_mb=0, cpu_bound=True, prefers_gpu=False, latency_budget_ms=50,
+        ),
+        priority_class="normal",
+        rank=100,
+        description="REVIA heuristic intent classifier (rule-based fallback)",
     )
 
     # Reasoning: heavy LLM; declared VRAM cost depends on the user's chosen
@@ -5478,12 +5608,32 @@ def _build_agents_orchestrator() -> AgentOrchestrator:
     except Exception as exc:
         _revia_log(f"[Agents] ProviderRegistry skipped: {exc}")
 
+    # V3 + V4 wiring: build episodic memory, goal tracker, skill registry,
+    # and the V3.4 autonomy background loop.  All best-effort.
+    try:
+        episode_store, _goal_tracker_obj, skill_registry = _ensure_v3_v4()
+        _ensure_autonomy_scheduler()
+    except Exception as exc:
+        _revia_log(f"[V3/V4] init failed (non-fatal): {exc}")
+        episode_store = None
+        skill_registry = None
+
     agents = [
-        MemoryAgent(memory_store=memory_store, model_router=router),
+        # Issue #4 (REVIA_DEEP_DIVE): wire the EpisodicMemoryStore so MemoryAgent
+        # surfaces cross-session lessons into the LLM context (not just the
+        # autonomy loop).  Falls back gracefully if the V3/V4 init failed.
+        MemoryAgent(
+            memory_store=memory_store,
+            model_router=router,
+            episodic_store=episode_store,
+        ),
         EmotionAgent(emotion_net=emotion_net, model_router=router,
                      profile_engine=profile_engine),
         IntentAgent(model_router=router),
         VoiceStyleAgent(profile_engine=profile_engine, model_router=router),
+        # V4.2 + V4.3: tool-use + vision agents run in parallel with reasoning.
+        ToolUseAgent(registry=skill_registry),
+        VisionAgent(model_router=router),
         ReasoningAgent(reply_planner=None, model_router=router),
         # Background HardwareAgent — runs at low priority, refreshes the
         # snapshot consumed by the scheduler on every turn.
@@ -5491,6 +5641,9 @@ def _build_agents_orchestrator() -> AgentOrchestrator:
     ]
     post_agents = [
         CriticAgent(model_router=router, profile_engine=profile_engine),
+        # V3.2: reflection agent reads quality + critic + intent and tags
+        # a lesson on the corresponding episode for the AutonomyScheduler.
+        ReflectionAgent(model_router=router, episode_store=episode_store),
     ]
     final_builder = FinalResponseBuilder(hfl=None)
     quality_gate = QualityGate(profile_engine=profile_engine)
@@ -5513,9 +5666,12 @@ def _build_agents_orchestrator() -> AgentOrchestrator:
             "EmotionAgent": 500,
             "IntentAgent": 250,
             "VoiceStyleAgent": 250,
+            "ToolUseAgent": 600,
+            "VisionAgent": 1200,
             "ReasoningAgent": 8000,
             "HardwareAgent": 600,
             "CriticAgent": 400,
+            "ReflectionAgent": 250,
         },
     )
 
@@ -5526,6 +5682,71 @@ def _get_agents_orchestrator() -> AgentOrchestrator:
         if _agents_orchestrator is None:
             _agents_orchestrator = _build_agents_orchestrator()
         return _agents_orchestrator
+
+
+def _build_interface_router() -> InterfaceRouter:
+    """Construct the V2.4 InterfaceRouter with safe defaults.
+
+    Only the audit-log channel is enabled at boot.  Text-chat is enabled
+    but has a no-op callback unless the GUI / client hooks one up later
+    via :func:`set_interface_callback`.  Voice / Vision / Notification
+    stay disabled until the user toggles them.
+    """
+    log_iface = LogInterface(log_fn=_revia_log, enabled=True)
+
+    # Text chat: registered active by default but with a passive
+    # broadcast (the answer already returns through /api/agents/chat;
+    # this channel is for any future websocket consumer).
+    text_iface = TextChatInterface(
+        broadcast_fn=lambda *_a, **_k: None,
+        enabled=True,
+    )
+
+    voice_iface = VoiceInterface(speak_fn=None, enabled=False)
+    vision_iface = VisionInterface(avatar_fn=None, enabled=False)
+    notify_iface = NotificationInterface(notify_fn=None, enabled=False)
+
+    return InterfaceRouter(
+        interfaces=[log_iface, text_iface, voice_iface, vision_iface, notify_iface],
+        max_workers=4,
+        parallel=True,
+        per_interface_timeout_s=2.0,
+        log_fn=_revia_log,
+    )
+
+
+def _get_interface_router() -> InterfaceRouter:
+    global _interface_router
+    with _interface_router_lock:
+        if _interface_router is None:
+            _interface_router = _build_interface_router()
+        return _interface_router
+
+
+def set_interface_callback(name: str, callback) -> bool:
+    """Hook a runtime callback into a registered interface.
+
+    Used by the host (GUI / WS server) to bind real broadcast / TTS /
+    avatar / notification handlers after server startup.  Returns True
+    when the interface exists.
+    """
+    router = _get_interface_router()
+    iface = router.get(name)
+    if iface is None:
+        return False
+    if name == "text_chat" and hasattr(iface, "_broadcast"):
+        iface._broadcast = callback or (lambda *a, **k: None)  # type: ignore[attr-defined]
+    elif name == "voice" and hasattr(iface, "_speak"):
+        iface._speak = callback  # type: ignore[attr-defined]
+    elif name == "vision" and hasattr(iface, "_avatar"):
+        iface._avatar = callback  # type: ignore[attr-defined]
+    elif name == "notification" and hasattr(iface, "_notify"):
+        iface._notify = callback  # type: ignore[attr-defined]
+    elif name == "audit_log" and hasattr(iface, "_log"):
+        iface._log = callback or (lambda *a, **k: None)  # type: ignore[attr-defined]
+    else:
+        return False
+    return True
 
 
 @app.route("/api/agents/chat", methods=["POST"])
@@ -5569,7 +5790,67 @@ def api_agents_chat():
         _revia_log(f"[Agents] /api/agents/chat error: {exc}")
         return jsonify({"error": "orchestrator_error", "detail": str(exc)}), 500
 
-    return jsonify(output.to_dict())
+    # V2.4: fan the canonical answer out to every active output channel.
+    interfaces_payload: dict = {}
+    try:
+        # Pull the IntentAgent payload from agent_results (already audited).
+        intent_payload: dict = {}
+        for r in output.agent_results:
+            if r.agent == "IntentAgent" and r.success:
+                intent_payload = r.result
+                break
+        iface_ctx = InterfaceContext(
+            final=output.final,
+            user_text=text,
+            intent=intent_payload,
+            metadata={"turn_id": turn_id, "conversation_id": ctx.conversation_id},
+            cancel_token=ctx.cancel_token,
+        )
+        dispatch = _get_interface_router().dispatch(iface_ctx)
+        interfaces_payload = dispatch.to_dict()
+    except Exception as exc:
+        _revia_log(f"[Agents] interface dispatch failed: {exc}")
+        interfaces_payload = {"error": str(exc)}
+
+    # V3.1 + V3.3: persist the turn as an Episode and run goal detection.
+    episode_dict: dict = {}
+    detected_goals: list = []
+    try:
+        ep_store, goal_tracker, _skills = _ensure_v3_v4()
+        # Pull the post-orchestrator details from agent_results.
+        critic_payload: dict = output.critic or {}
+        ep = ep_store.add(
+            user_text=text,
+            reply_text=str(output.final.text or ""),
+            intent_label=str(intent_payload.get("label") or "chat"),
+            emotion_label=str(output.final.emotion_label or "neutral"),
+            polarity=str(intent_payload.get("polarity") or "neutral"),
+            confidence=float(output.final.confidence or 0.0),
+            quality_score=float(output.quality.score or 0.0),
+            regen_attempts=int(output.regen_attempts or 0),
+            critic_recommendation=str(critic_payload.get("recommendation") or "accept"),
+            session_id=str(ctx.conversation_id or ""),
+            turn_id=turn_id,
+        )
+        episode_dict = ep.to_dict()
+        detected_goals = [
+            g.to_dict() for g in goal_tracker.detect_from_turn(
+                user_text=text,
+                reply_text=str(output.final.text or ""),
+                intent=intent_payload,
+                critic=critic_payload,
+                episode_id=ep.id,
+                session_id=str(ctx.conversation_id or ""),
+            )
+        ]
+    except Exception as exc:
+        _revia_log(f"[V3] episode/goals persist failed: {exc}")
+
+    body = output.to_dict()
+    body["interfaces"] = interfaces_payload
+    body["episode"] = episode_dict
+    body["new_goals"] = detected_goals
+    return jsonify(body)
 
 
 @app.route("/api/agents/status", methods=["GET"])
@@ -5616,6 +5897,188 @@ def api_agents_providers():
         except Exception as exc:
             _revia_log(f"[Providers] rediscover failed: {exc}")
     return jsonify(_provider_registry.to_dict())
+
+
+@app.route("/api/agents/interfaces", methods=["GET"])
+def api_agents_interfaces_status():
+    """Return the current status (enabled/kind) of every output interface."""
+    return jsonify(_get_interface_router().status())
+
+
+@app.route("/api/agents/interfaces", methods=["POST"])
+def api_agents_interfaces_toggle():
+    """Toggle a single interface on or off.
+
+    Body::
+
+        { "name": "voice", "enabled": true }
+    """
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    enabled = bool(data.get("enabled", True))
+    if not name:
+        return jsonify({"error": "missing 'name'"}), 400
+    ok = _get_interface_router().set_enabled(name, enabled)
+    if not ok:
+        return jsonify({"error": f"unknown interface {name!r}"}), 404
+    return jsonify({"ok": True, "name": name, "enabled": enabled,
+                    "status": _get_interface_router().status()})
+
+
+# ===========================================================================
+# V3 — Autonomy & Persistence endpoints
+# ===========================================================================
+
+@app.route("/api/agents/memory", methods=["GET"])
+def api_agents_memory():
+    """Return EpisodicMemory stats + recent episodes.
+
+    Query parameters::
+
+        limit=10        max recent episodes to return
+        q=...           keyword search (returns SearchResult list instead)
+    """
+    ep_store, _goals, _skills = _ensure_v3_v4()
+    q = request.args.get("q", "").strip()
+    limit = max(1, min(50, int(request.args.get("limit", "10"))))
+    if q:
+        results = ep_store.search(q, limit=limit)
+        return jsonify({
+            "query": q,
+            "count": len(results),
+            "results": [r.to_dict() for r in results],
+            "stats": ep_store.stats(),
+        })
+    return jsonify({
+        "stats": ep_store.stats(),
+        "recent": [e.to_dict() for e in ep_store.recent(limit=limit)],
+    })
+
+
+@app.route("/api/agents/memory/save", methods=["POST"])
+def api_agents_memory_save():
+    """Force-flush episodic memory to disk."""
+    ep_store, _g, _s = _ensure_v3_v4()
+    n = ep_store.save()
+    return jsonify({"ok": True, "bytes": n})
+
+
+@app.route("/api/agents/goals", methods=["GET"])
+def api_agents_goals():
+    """List open goals (default) or all goals via ?all=1."""
+    _ep, goals, _s = _ensure_v3_v4()
+    show_all = request.args.get("all") in ("1", "true", "yes")
+    items = goals.all() if show_all else goals.open_goals()
+    return jsonify({
+        "stats": goals.stats(),
+        "goals": [g.to_dict() for g in items],
+    })
+
+
+@app.route("/api/agents/goals", methods=["POST"])
+def api_agents_goals_update():
+    """Add, update, or remove a goal.
+
+    Body shapes::
+
+        {"action": "add", "kind": "...", "title": "...", "detail": "...",
+         "tags": [...], "deadline_at": float}
+        {"action": "set_status", "id": "...", "status": "resolved|abandoned|..."}
+        {"action": "remove", "id": "..."}
+    """
+    _ep, goals, _s = _ensure_v3_v4()
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").lower()
+    if action == "add":
+        g = goals.add(
+            kind=str(data.get("kind") or "user_defined"),
+            title=str(data.get("title") or ""),
+            detail=str(data.get("detail") or ""),
+            tags=list(data.get("tags") or []),
+            deadline_at=float(data.get("deadline_at") or 0.0),
+        )
+        return jsonify({"ok": True, "goal": g.to_dict()})
+    if action == "set_status":
+        gid = str(data.get("id") or "")
+        status = str(data.get("status") or "")
+        ok = goals.update_status(gid, status)
+        return jsonify({"ok": bool(ok)})
+    if action == "remove":
+        gid = str(data.get("id") or "")
+        return jsonify({"ok": goals.remove(gid)})
+    return jsonify({"error": f"unknown action {action!r}"}), 400
+
+
+@app.route("/api/agents/autonomy", methods=["GET"])
+def api_agents_autonomy():
+    """Return AutonomyScheduler status + registered tasks."""
+    sched = _ensure_autonomy_scheduler()
+    return jsonify(sched.status())
+
+
+@app.route("/api/agents/autonomy", methods=["POST"])
+def api_agents_autonomy_control():
+    """Start / stop / run-once / toggle a task."""
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").lower()
+    sched = _ensure_autonomy_scheduler()
+    if action == "start":
+        sched.start()
+        return jsonify({"ok": True, "running": sched.is_running()})
+    if action == "stop":
+        sched.stop()
+        return jsonify({"ok": True, "running": sched.is_running()})
+    if action == "run_once":
+        return jsonify({"ok": True, "results": sched.run_once()})
+    if action == "run_all":
+        return jsonify({"ok": True, "results": sched.run_all()})
+    if action == "toggle":
+        name = str(data.get("name") or "")
+        on = bool(data.get("enabled", True))
+        ok = sched.set_enabled(name, on)
+        return jsonify({"ok": bool(ok), "name": name, "enabled": on})
+    return jsonify({"error": f"unknown action {action!r}"}), 400
+
+
+# ===========================================================================
+# V4 — Skills endpoints
+# ===========================================================================
+
+@app.route("/api/agents/skills", methods=["GET"])
+def api_agents_skills():
+    """Return the current SkillRegistry status (per-skill enabled + cost class)."""
+    _ep, _g, skills = _ensure_v3_v4()
+    return jsonify(skills.status())
+
+
+@app.route("/api/agents/skills", methods=["POST"])
+def api_agents_skills_control():
+    """Enable / disable a skill or dispatch a request manually.
+
+    Body shapes::
+
+        {"action": "set_enabled", "name": "calculator", "enabled": true}
+        {"action": "dispatch", "user_text": "what is 2+2?", "skill": "calculator"}
+    """
+    _ep, _g, skills = _ensure_v3_v4()
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").lower()
+    if action == "set_enabled":
+        name = str(data.get("name") or "")
+        on = bool(data.get("enabled", True))
+        ok = skills.set_enabled(name, on)
+        return jsonify({"ok": bool(ok), "name": name, "enabled": on})
+    if action == "dispatch":
+        req = SkillRequest(
+            user_text=str(data.get("user_text") or ""),
+            intent=dict(data.get("intent") or {}),
+            metadata=dict(data.get("metadata") or {}),
+            arguments=dict(data.get("arguments") or {}),
+        )
+        explicit = data.get("skill")
+        result = skills.dispatch(req, explicit_skill=explicit if explicit else None)
+        return jsonify(result.to_dict())
+    return jsonify({"error": f"unknown action {action!r}"}), 400
 
 
 @app.route("/api/model/config", methods=["GET"])
@@ -6541,13 +7004,19 @@ def main():
     if _ws_start_error:
         raise RuntimeError(_ws_start_error)
 
+    # Issue #16: rewire the WebSocketBackend with the live broadcaster.
+    # Any error reports buffered during import/startup are replayed now.
+    try:
+        error_handler.attach_websocket_broadcaster(broadcast_json)
+    except Exception as _exc:
+        _revia_log(
+            f"[ErrorHandler] Failed to attach WebSocket backend: "
+            f"{type(_exc).__name__}: {_exc}"
+        )
+
     # Watchdog: force-stops any turn stuck in THINKING/GENERATING > timeout.
-    # Without this, a hung LLM call pins conversation_manager.current_state
-    # in THINKING, which causes the controller to reject every subsequent
-    # autonomous trigger with "Blocked: Startup (state=Thinking)".
     turn_watchdog.start()
 
-    # Start any enabled platform integrations (Discord / Twitch)
     if integration_manager is not None:
         integration_manager.start_enabled()
 
@@ -6558,13 +7027,15 @@ def main():
     print()
     import atexit
     atexit.register(rl_engine.save)
-    atexit.register(memory_store.close)   # Q-2: flush JSONL file handle on exit
-    atexit.register(telemetry.close)      # flush telemetry log file on exit
+    atexit.register(memory_store.close)
+    atexit.register(telemetry.close)
+    atexit.register(error_handler.close)
     if neural_refiner is not None:
         atexit.register(neural_refiner.shutdown)
     if parallel_pipeline is not None:
         atexit.register(parallel_pipeline.shutdown)
     app.run(host=REST_HOST, port=REST_PORT, debug=False, use_reloader=False, threaded=True)
+
 
 if __name__ == "__main__":
     main()

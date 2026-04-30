@@ -37,6 +37,13 @@ from .intent_agent import IntentAgent
 from .reasoning_agent import ReasoningAgent
 from .voice_style_agent import VoiceStyleAgent
 from .critic_agent import CriticAgent
+from .tool_use_agent import ToolUseAgent
+from .vision_agent import VisionAgent
+from .debate_orchestrator import (
+    DebateOrchestrator,
+    DebateOutput,
+    DebateVariantResult,
+)
 from .quality_gate import QualityGate, QualityVerdict
 from .final_response import FinalResponse, FinalResponseBuilder
 from .orchestrator import AgentOrchestrator, OrchestratorOutput
@@ -50,6 +57,9 @@ __all__ = [
     "CancellationToken",
     "CancelledError",
     "CriticAgent",
+    "DebateOrchestrator",
+    "DebateOutput",
+    "DebateVariantResult",
     "EmotionAgent",
     "FinalResponse",
     "FinalResponseBuilder",
@@ -63,5 +73,7 @@ __all__ = [
     "QualityGate",
     "QualityVerdict",
     "ReasoningAgent",
+    "ToolUseAgent",
+    "VisionAgent",
     "VoiceStyleAgent",
 ]

@@ -78,8 +78,8 @@ class MainWindow(QMainWindow):
         center.setMinimumWidth(320)
         center.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(10, 10, 10, 10)
-        center_layout.setSpacing(8)
+        center_layout.setContentsMargins(8, 8, 8, 8)
+        center_layout.setSpacing(6)
 
         self.topbar = TopBar(self.event_bus)
         center_layout.addWidget(self.topbar)
@@ -95,15 +95,14 @@ class MainWindow(QMainWindow):
 
         self.shell_splitter.addWidget(center)
 
-        # Right panel - container gives the tab widget a fixed inset margin so
-        # content never bleeds to the splitter edge. Width is hard-locked
-        # below (after we know the screen width) so the right rail can never
-        # silently grow when an inner sub-tab demands more horizontal space.
+        # Right panel - resizable via the splitter handle.  Minimum and
+        # maximum widths keep it usable without letting it collapse or
+        # swallow the whole window.  Drag the splitter edge to resize.
         right_container = QWidget()
         right_container.setObjectName("rightPanel")
-        right_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        right_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         right_container_layout = QVBoxLayout(right_container)
-        right_container_layout.setContentsMargins(6, 6, 6, 6)
+        right_container_layout.setContentsMargins(4, 4, 4, 4)
         right_container_layout.setSpacing(0)
 
         self.tabs = QTabWidget()
@@ -254,18 +253,16 @@ class MainWindow(QMainWindow):
         self.shell_splitter.addWidget(right_container)
         self.shell_splitter.setStretchFactor(0, 0)  # sidebar: fixed
         self.shell_splitter.setStretchFactor(1, 3)  # chat: most free space
-        self.shell_splitter.setStretchFactor(2, 0)  # right panel: hard-locked
+        self.shell_splitter.setStretchFactor(2, 0)  # right panel: preferred, not stretchy
         # Set initial panel widths as a percentage of the available screen
         # width so the layout scales correctly at any resolution. The right
-        # panel width is then HARD-LOCKED via setFixedWidth so neither the
-        # splitter nor any inner sub-tab can expand or shrink it.
+        # panel width is bounded by min/max so the user can drag-resize it
+        # but it cannot collapse or take over the window.
         screen = QApplication.primaryScreen()
         screen_w = screen.availableGeometry().width() if screen else 1280
-        sidebar_w = 180
-        # Wider right rail so persona / system / advanced sub-tabs have room
-        # to breathe.  Range bumped from 300-420 to 420-640 with a 30%
-        # screen-width target (was 22%).  Override with REVIA_RIGHT_PANEL_W
-        # to pin a specific pixel width.
+        sidebar_w = 160
+        # Right rail: 26% of screen width, clamped to 320–720px.
+        # Override with REVIA_RIGHT_PANEL_W env var to pin a specific width.
         try:
             override_w = int(os.environ.get("REVIA_RIGHT_PANEL_W", "0") or "0")
         except (TypeError, ValueError):
@@ -273,9 +270,10 @@ class MainWindow(QMainWindow):
         if override_w >= 280:
             right_w = override_w
         else:
-            right_w = max(420, min(640, int(screen_w * 0.30)))
-        center_w  = max(320, screen_w - sidebar_w - right_w)
-        right_container.setFixedWidth(right_w)
+            right_w = max(380, min(560, int(screen_w * 0.26)))
+        right_container.setMinimumWidth(320)
+        right_container.setMaximumWidth(720)
+        center_w = max(320, screen_w - sidebar_w - right_w)
         self.shell_splitter.setSizes([sidebar_w, center_w, right_w])
 
     def _current_mood_label(self):

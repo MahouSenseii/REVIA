@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any
 
-from persona_manager import normalize_profile, resolve_persona_preset_name
+from persona_manager import PERSONA_PRESETS, normalize_profile, resolve_persona_preset_name
 
 _log = logging.getLogger(__name__)
 
@@ -200,6 +200,61 @@ PROFILE_PRESETS: dict[str, dict] = {
             "breath_insert_probability": 0.22,
         },
     },
+    "diana_inspired": {
+        "name": "Revia-Diana-Inspired",
+        "persona_preset": "diana_inspired",
+        "behavior": {
+            "minimum_answer_threshold": 0.74,
+            "interrupt_sensitivity": 0.60,
+            "self_correction_rate": 0.12,
+            "verbosity": 0.46,
+            "question_propensity": 0.30,
+            "proactive_speech_probability": 0.08,
+            "regen_patience": 3,
+            "loop_recovery_mode": "rephrase",
+            "autonomy_mode": "companion",
+        },
+        "emotion": {
+            "emotion_intensity": 0.58,
+            "baseline_valence": 0.68,
+            "emotional_inertia": 0.42,
+            "empathy_weight": 0.78,
+            "humor_tendency": 0.34,
+            "sarcasm_ceiling": 0.12,
+            "affect_display_mode": "natural",
+        },
+        "timing": {
+            "response_onset_delay_ms": 260,
+            "inter_sentence_pause_ms": 190,
+            "thinking_pause_probability": 0.22,
+            "speech_rate_modifier": 1.02,
+            "breath_insert_probability": 0.12,
+        },
+        "trait_weights": {
+            "curious": 0.82,
+            "bright": 0.76,
+            "observant": 0.84,
+            "precise": 0.78,
+            "cooperative": 0.82,
+            "protective": 0.70,
+            "quietly warm": 0.74,
+            "brave": 0.56,
+            "lightly playful": 0.42,
+            "synthetic": 0.62,
+        },
+        "speech_quirks": ["wait", "I see it", "there", "that part matters", "stay with me"],
+        "quirk_frequency": 0.12,
+        "mood_baseline": "brightly focused",
+        "emotional_volatility": 0.42,
+        "reply_type_weights": {
+            "explain": 0.34,
+            "react": 0.22,
+            "question": 0.18,
+            "joke": 0.06,
+            "tease": 0.03,
+            "story": 0.04,
+        },
+    },
 }
 
 
@@ -244,9 +299,28 @@ class ProfileEngine:
         """
         t0 = time.monotonic()
         preset_name = resolve_persona_preset_name(raw)
+        raw_profile = raw or {}
         base = copy.deepcopy(PRD_DEFAULT_PROFILE)
         if preset_name in PROFILE_PRESETS:
             base = self._deep_merge(base, PROFILE_PRESETS[preset_name])
+        if preset_name not in {"custom", "default"}:
+            persona_preset = copy.deepcopy(PERSONA_PRESETS.get(preset_name, {}))
+            interaction = persona_preset.get("interaction_style", {}) or {}
+            if "persona" not in raw_profile and persona_preset.get("summary"):
+                base["persona"] = persona_preset["summary"]
+            if "character_prompt" not in raw_profile and persona_preset.get("identity_prompt"):
+                base["character_prompt"] = persona_preset["identity_prompt"]
+            if "traits" not in raw_profile and persona_preset.get("traits"):
+                base["traits"] = ", ".join(persona_preset["traits"])
+            if "response_style" not in raw_profile and interaction.get("response_style"):
+                base["response_style"] = interaction["response_style"]
+            if "verbosity" not in raw_profile and interaction.get("verbosity"):
+                base["verbosity"] = interaction["verbosity"]
+                base["verbosity_label"] = interaction["verbosity"]
+            if "greeting" not in raw_profile and interaction.get("greeting"):
+                base["greeting"] = interaction["greeting"]
+            if "persona_definition" not in raw_profile and persona_preset:
+                base["persona_definition"] = persona_preset
         merged = self._deep_merge(base, raw or {})
         merged = normalize_profile(merged)
         issues = self._validate(merged)

@@ -186,6 +186,10 @@ class ConversationStateMachine:
         self._lock = threading.Lock()
         self._state = ReviaState.BOOTING
         self._updated_at = time.monotonic()
+        # Monotonic stamp of when the *current* state was entered.  Used by
+        # the FSM watchdog (Issue #1) to detect a stuck THINKING state when
+        # the pipeline crashes between THINKING -> SPEAKING.
+        self._state_entered_at: float = self._updated_at
 
         # PRD section 8 - IHS extended state fields
         self.interruption_type: str   = ""     # last InterruptionType value
@@ -254,10 +258,69 @@ class ConversationStateMachine:
                 return False
             self._state = new_state
             self._updated_at = time.monotonic()
+            self._state_entered_at = self._updated_at
         self._log(
             f"State change: {current.value} -> {new_state.value}"
             + (f" ({reason})" if reason else "")
         )
+        return True
+
+    # ------------------------------------------------------------------
+    # Issue #1 — FSM-level watchdog
+    # ------------------------------------------------------------------
+
+    def time_in_state(self) -> float:
+        """Seconds elapsed since the FSM last transitioned."""
+        with self._lock:
+            return max(0.0, time.monotonic() - self._state_entered_at)
+
+    def force_recover_if_stuck(
+        self,
+        *,
+        thinking_timeout_s: float = 60.0,
+        speaking_timeout_s: float = 90.0,
+    ) -> bool:
+        """Force-recover the FSM if it has been stuck in a transient state.
+
+        Guards against the failure mode described in REVIA_DEEP_DIVE Issue
+        #1: if the pipeline raises between ``THINKING`` and ``SPEAKING``
+        (e.g. LLM backend crashes mid-generation), the FSM remains pinned
+        in THINKING and ``BehaviorController.evaluate()`` rejects every
+        new RESPONSE-kind trigger as ``state=Thinking`` until the server
+        is restarted.
+
+        Returns ``True`` when a forced transition occurred, ``False``
+        when the FSM is in a healthy state.
+
+        The transition path is THINKING/SPEAKING -> ERROR -> IDLE (forced
+        through validation), mirroring the behaviour of
+        :class:`TurnWatchdog` so observers see the same recovery story.
+        """
+        with self._lock:
+            current = self._state
+            elapsed = time.monotonic() - self._state_entered_at
+            if current == ReviaState.THINKING:
+                threshold = float(thinking_timeout_s)
+                if elapsed < threshold:
+                    return False
+                stuck_state = current
+            elif current == ReviaState.SPEAKING:
+                threshold = float(speaking_timeout_s)
+                if elapsed < threshold:
+                    return False
+                stuck_state = current
+            else:
+                return False
+
+        self._log(
+            f"FSM watchdog: forcing recovery from stuck {stuck_state.value} "
+            f"after {elapsed:.1f}s (threshold={threshold:.0f}s)"
+        )
+        # ERROR is an explicit allowed target from THINKING/SPEAKING; IDLE
+        # is reachable from ERROR.  Both are forced so the recovery cannot
+        # itself be rejected by the validation rules.
+        self.transition(ReviaState.ERROR, reason="fsm_watchdog_recovery", force=True)
+        self.transition(ReviaState.IDLE, reason="fsm_watchdog_recovery", force=True)
         return True
 
 
@@ -270,6 +333,8 @@ class BehaviorController:
         response_cooldown_s: float = 0.75,
         autonomous_cooldown_s: float = 120.0,
         interruption_cooldown_s: float = 5.0,
+        thinking_timeout_s: float = 60.0,
+        speaking_timeout_s: float = 90.0,
     ):
         self._log = log_fn
         self._lock = threading.Lock()
@@ -283,6 +348,17 @@ class BehaviorController:
             "interruption": float(interruption_cooldown_s),
         }
         self._cooldowns: dict[str, float] = {}
+        # Issue #1 — watchdog timeouts for stuck FSM recovery.  Wired by
+        # ConversationManager via :meth:`bind_state_machine` so evaluate()
+        # can force-recover a permanently-pinned THINKING/SPEAKING state
+        # before rejecting an inbound user trigger.
+        self._thinking_timeout_s = float(thinking_timeout_s)
+        self._speaking_timeout_s = float(speaking_timeout_s)
+        self._state_machine: ConversationStateMachine | None = None
+
+    def bind_state_machine(self, state_machine: "ConversationStateMachine") -> None:
+        """Wire the FSM so :meth:`evaluate` can run the stuck-state watchdog."""
+        self._state_machine = state_machine
 
     def mark_startup_phase(self, phase: str):
         with self._lock:
@@ -367,6 +443,26 @@ class BehaviorController:
         current_state = str(current_state or ReviaState.BOOTING.value)
         if not reason:
             return self._blocked(trigger, "invalid trigger reason")
+
+        # Issue #1 — FSM watchdog: if the state machine has been pinned in
+        # THINKING (or, defensively, SPEAKING) past the configured timeout,
+        # force a recovery to IDLE before evaluating the trigger.  Without
+        # this, a pipeline crash between THINKING and SPEAKING leaves every
+        # subsequent user message rejected as "state=Thinking" until the
+        # server is restarted.
+        if self._state_machine is not None:
+            try:
+                recovered = self._state_machine.force_recover_if_stuck(
+                    thinking_timeout_s=self._thinking_timeout_s,
+                    speaking_timeout_s=self._speaking_timeout_s,
+                )
+                if recovered:
+                    current_state = self._state_machine.state
+            except Exception as _exc:
+                # Watchdog must never raise into the trigger path.
+                self._log(
+                    f"FSM watchdog raised: {type(_exc).__name__}: {_exc}"
+                )
 
         if not readiness.can_start_conversation:
             detail = readiness.blocking_reasons[0] if readiness.blocking_reasons else "system not ready"
@@ -524,6 +620,7 @@ class ConversationManager:
         self._log = log_fn
         self.state_machine = ConversationStateMachine(log_fn)
         self.behavior = BehaviorController(log_fn)
+        self.behavior.bind_state_machine(self.state_machine)
         self.response_filter = ResponseFilter(log_fn)
 
     @property
@@ -542,7 +639,7 @@ class ConversationManager:
         self.behavior.mark_startup_complete()
         self.state_machine.transition(ReviaState.IDLE, reason, force=True)
 
-    def transition_state(self, new_state: ReviaState | str, reason: str = "", force: bool = False):
+    def transition_state(self, new_state, reason: str = "", force: bool = False):
         changed = self.state_machine.transition(new_state, reason, force=force)
         if isinstance(new_state, ReviaState) and changed and new_state == ReviaState.COOLDOWN:
             self.behavior.active_cooldowns()

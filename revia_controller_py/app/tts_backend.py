@@ -106,6 +106,9 @@ class QwenTTSBackend(QObject):
     playback_started = Signal()
     playback_finished = Signal()
     playback_interrupted = Signal()
+    # Emitted whenever the Qwen3-TTS server's advertised endpoints change.
+    # Payload dict: {variant, label, modes, api_names, server_url}
+    capabilities_changed = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -151,11 +154,20 @@ class QwenTTSBackend(QObject):
             # server may expose a different model (Base / CustomVoice /
             # VoiceDesign) with different api_names per the QwenLM/Qwen3-TTS
             # demo (qwen_tts/cli/demo.py).
-            with self._lock:
-                self._qwen_clients.clear()
-            with self._qwen_api_cache_lock:
-                self._qwen_api_cache.clear()
+            self.reset_qwen_connection()
         self._qwen_url = new_url
+
+    def reset_qwen_connection(self):
+        """Clear cached Gradio clients and endpoint discovery.
+
+        The UI can stop one Qwen model and start another on the same port.
+        A cached gradio_client.Client or api_name list from the old process
+        is then stale even though the URL is unchanged.
+        """
+        with self._lock:
+            self._qwen_clients.clear()
+        with self._qwen_api_cache_lock:
+            self._qwen_api_cache.clear()
 
     def set_output_device(self, device, label: str = ""):
         """Route TTS playback to a specific output device.
@@ -552,7 +564,7 @@ class QwenTTSBackend(QObject):
         except Exception as e:
             raise ConnectionError(f"Cannot connect to Qwen3-TTS at {url}: {e}")
 
-    def _get_qwen_api_names(self, client=None):
+    def _get_qwen_api_names(self, client=None, force_refresh=False):
         """Return public Gradio API names exposed by the active Qwen server.
 
         Cached per server URL so repeated synthesis calls don't pay the
@@ -565,10 +577,14 @@ class QwenTTSBackend(QObject):
         url = (self._qwen_url or "").rstrip("/")
         cache_key = url or "<default>"
 
-        with self._qwen_api_cache_lock:
-            cached = self._qwen_api_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        if force_refresh:
+            with self._qwen_api_cache_lock:
+                self._qwen_api_cache.pop(cache_key, None)
+        else:
+            with self._qwen_api_cache_lock:
+                cached = self._qwen_api_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         names = set()
 
@@ -596,6 +612,10 @@ class QwenTTSBackend(QObject):
         if names:
             with self._qwen_api_cache_lock:
                 self._qwen_api_cache[cache_key] = names
+            try:
+                self.emit_capabilities(names)
+            except Exception as _exc:
+                _log.debug("[TTS] capability emit skipped: %s", _exc)
         return names
 
     @staticmethod
@@ -621,15 +641,143 @@ class QwenTTSBackend(QObject):
     def _format_api_names(api_names):
         return ", ".join(sorted(api_names)) if api_names else "none advertised"
 
+    @staticmethod
+    def _is_missing_api_name_error(exc):
+        msg = str(exc or "")
+        return "api_name" in msg and "Cannot find a function" in msg
+
+    @staticmethod
+    def _voice_design_api_candidates(api_names):
+        names = set(api_names or ())
+        candidates = []
+        for api_name in (
+            "/run_voice_design",
+            "/generate_voice_design",
+            "/generate_custom_voice",
+        ):
+            if api_name in names:
+                candidates.append(api_name)
+        if not names:
+            # Endpoint discovery can fail against slow/local Gradio servers.
+            # Probe known compatible endpoints instead of hard-coding one.
+            candidates.extend([
+                "/run_voice_design",
+                "/generate_voice_design",
+                "/generate_custom_voice",
+            ])
+        return candidates
+
+    def _predict_voice_design(self, client, api_name, text, language, voice_description):
+        if api_name == "/generate_custom_voice":
+            return client.predict(
+                text,
+                language,
+                "Ryan",
+                voice_description or "",
+                "0.6B",
+                api_name=api_name,
+            )
+        # Both /run_voice_design (local) and /generate_voice_design (HF)
+        # accept (text, language, voice_description).
+        return client.predict(
+            text,
+            language,
+            voice_description,
+            api_name=api_name,
+        )
+
+    # --- Qwen variant classification ---------------------------------
+    # Each Qwen3-TTS model variant exposes a different set of Gradio
+    # endpoints.  We detect which one is active so we can:
+    #   1) tell the user *which model* they need to load to unlock the
+    #      missing voice mode, and
+    #   2) keep the UI in sync (active mode label + supported mode badges).
+
+    @classmethod
+    def classify_qwen_variant(cls, api_names):
+        """Return ``(variant_id, label, supported_modes)`` for the given
+        advertised endpoint names."""
+        names = set(api_names or ())
+        if "/generate_voice_design" in names:
+            return ("hf_space",
+                    "HuggingFace public Space (Qwen/Qwen3-TTS)",
+                    ("design", "clone", "custom"))
+        if "/run_voice_design" in names:
+            return ("design",
+                    "VoiceDesign server (Qwen3-TTS-12Hz-1.7B-VoiceDesign)",
+                    ("design",))
+        if "/run_instruct" in names:
+            return ("custom",
+                    "CustomVoice server (Qwen3-TTS-12Hz-*-CustomVoice)",
+                    ("custom",))
+        if "/run_voice_clone" in names or "/load_prompt_and_gen" in names:
+            return ("base_clone",
+                    "Base Voice-Clone server (Qwen3-TTS-12Hz-*-Base)",
+                    ("clone",))
+        return ("unknown", "Unknown Qwen3-TTS server", ())
+
+    @staticmethod
+    def required_model_for_mode(mode):
+        """Return human-readable Qwen model name that exposes ``mode``."""
+        m = (mode or "").lower()
+        if m == "design":
+            return "VoiceDesign 1.7B (Qwen3-TTS-12Hz-1.7B-VoiceDesign)"
+        if m == "custom":
+            return "CustomVoice 0.6B / 1.7B (Qwen3-TTS-12Hz-*-CustomVoice)"
+        if m == "clone":
+            return "Base 0.6B / 1.7B (Qwen3-TTS-12Hz-*-Base)"
+        return "a Qwen3-TTS server"
+
+    def emit_capabilities(self, api_names=None):
+        """Emit ``capabilities_changed`` with the current server's variant."""
+        if api_names is None:
+            try:
+                api_names = self._get_qwen_api_names()
+            except Exception as exc:
+                _log.debug("[TTS] capabilities probe failed: %s", exc)
+                api_names = set()
+        variant, label, modes = self.classify_qwen_variant(api_names)
+        payload = {
+            "variant": variant,
+            "label": label,
+            "modes": list(modes),
+            "api_names": sorted(str(n) for n in api_names),
+            "server_url": (self._qwen_url or ""),
+        }
+        try:
+            self.capabilities_changed.emit(payload)
+        except Exception as exc:
+            _log.debug("[TTS] capabilities_changed emit failed: %s", exc)
+        return payload
+
     def _report_qwen_mode_unavailable(self, mode_name, required_endpoint, api_names):
         available = self._format_api_names(api_names)
+        variant, variant_label, supported_modes = self.classify_qwen_variant(api_names)
+        canonical_mode = mode_name.lower().replace(" ", "")
+        if "design" in canonical_mode:
+            canonical_mode = "design"
+        elif "clone" in canonical_mode:
+            canonical_mode = "clone"
+        else:
+            canonical_mode = "custom"
+        required_model = self.required_model_for_mode(canonical_mode)
+        if supported_modes:
+            modes_str = ", ".join(m.title() for m in supported_modes)
+        else:
+            modes_str = "none detected"
         msg = (
-            f"{mode_name} is not available on the current Qwen3-TTS server "
-            f"(missing {required_endpoint}; available: {available}). "
-            "Select the matching Qwen model and restart the TTS server, or use a supported voice mode."
+            f"{mode_name} is not available on the current Qwen3-TTS server: "
+            f"it is the {variant_label}, which only supports: {modes_str}. "
+            f"To use {mode_name}, stop the current TTS server and start "
+            f"the {required_model} model instead. "
+            f"(missing endpoint: {required_endpoint}; advertised: {available})"
         )
         _log.warning("[TTS] %s", msg)
         self.status_updated.emit(msg)
+        try:
+            self.emit_capabilities(api_names)
+        except Exception:
+            pass
         return None, msg
 
     def _qwen_design(self, text, voice_description, language, output_path):
@@ -651,20 +799,8 @@ class QwenTTSBackend(QObject):
         with self._synth_semaphore:
             try:
                 api_names = self._get_qwen_api_names(client)
-                api_name = None
-                if not api_names or "/run_voice_design" in api_names:
-                    api_name = "/run_voice_design"
-                elif "/generate_voice_design" in api_names:
-                    api_name = "/generate_voice_design"
-                elif "/generate_custom_voice" in api_names:
-                    self.status_updated.emit(
-                        "Voice Design endpoint unavailable; using CustomVoice style fallback."
-                    )
-                    _log.info(
-                        "[TTS] Voice Design endpoint unavailable; using /generate_custom_voice"
-                    )
-                    api_name = "/generate_custom_voice"
-                else:
+                candidates = self._voice_design_api_candidates(api_names)
+                if not candidates:
                     return self._report_qwen_mode_unavailable(
                         "Voice Design",
                         "/run_voice_design or /generate_voice_design",
@@ -673,25 +809,65 @@ class QwenTTSBackend(QObject):
 
                 t0 = time.perf_counter()
                 self.synthesis_started.emit()
-                _log.info("[TTS] Voice Design via %s lang=%s len=%d",
-                          api_name, language, len(text or ""))
-                if api_name == "/generate_custom_voice":
-                    result = client.predict(
-                        text,
-                        language,
-                        "Ryan",
-                        voice_description or "",
-                        "0.6B",
-                        api_name=api_name,
-                    )
-                else:
-                    # Both /run_voice_design (local) and /generate_voice_design (HF)
-                    # accept (text, language, voice_description).
-                    result = client.predict(
-                        text,
-                        language,
-                        voice_description,
-                        api_name=api_name,
+                attempted = set()
+                last_missing_api_error = None
+                result = None
+                api_name = None
+
+                while candidates:
+                    api_name = candidates.pop(0)
+                    if api_name in attempted:
+                        continue
+                    attempted.add(api_name)
+                    if api_name == "/generate_custom_voice":
+                        self.status_updated.emit(
+                            "Voice Design endpoint unavailable; using CustomVoice style fallback."
+                        )
+                        _log.info(
+                            "[TTS] Voice Design endpoint unavailable; using /generate_custom_voice"
+                        )
+                    _log.info("[TTS] Voice Design via %s lang=%s len=%d",
+                              api_name, language, len(text or ""))
+                    try:
+                        result = self._predict_voice_design(
+                            client,
+                            api_name,
+                            text,
+                            language,
+                            voice_description,
+                        )
+                        break
+                    except Exception as exc:
+                        if not self._is_missing_api_name_error(exc):
+                            raise
+                        last_missing_api_error = exc
+                        _log.info(
+                            "[TTS] Voice Design endpoint %s missing; refreshing API list",
+                            api_name,
+                        )
+                        refreshed_names = self._get_qwen_api_names(
+                            client,
+                            force_refresh=True,
+                        )
+                        for candidate in self._voice_design_api_candidates(refreshed_names):
+                            if candidate not in attempted and candidate not in candidates:
+                                candidates.append(candidate)
+
+                if result is None:
+                    if last_missing_api_error is not None:
+                        refreshed_names = self._get_qwen_api_names(
+                            client,
+                            force_refresh=True,
+                        )
+                        return self._report_qwen_mode_unavailable(
+                            "Voice Design",
+                            "/run_voice_design or /generate_voice_design",
+                            refreshed_names,
+                        )
+                    return self._report_qwen_mode_unavailable(
+                        "Voice Design",
+                        "/run_voice_design or /generate_voice_design",
+                        api_names,
                     )
                 _log.info("[TTS] Voice Design predict() returned in %.2fs", time.perf_counter() - t0)
                 wav_path = self._extract_wav(result, output_path)

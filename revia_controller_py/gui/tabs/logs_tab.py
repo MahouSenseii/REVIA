@@ -4,7 +4,7 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QTextEdit, QComboBox, QGroupBox,
+    QLabel, QLineEdit, QTextEdit, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem,
     QProgressBar, QSplitter, QFrame, QSizePolicy,
 )
@@ -12,6 +12,7 @@ from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor, QTextBloc
 from PySide6.QtCore import Qt, QTimer
 
 from app.ui_status import apply_status_style
+from gui.widgets.settings_card import SettingsCard
 
 
 # Log level detection + theme-aware colors
@@ -193,9 +194,12 @@ class LogsTab(QWidget):
         layout.addWidget(self.log_view, stretch=1)
 
         # ── Pipeline Timing ─────────────────────────────────────
-        timing_group = QGroupBox("Pipeline Timing")
-        timing_group.setObjectName("settingsGroup")
-        t = QVBoxLayout(timing_group)
+        timing_card = SettingsCard(
+            "Pipeline Timing",
+            subtitle="Stage durations",
+            icon="P",
+        )
+        t = QVBoxLayout()
 
         self.timing_list = QTableWidget()
         self.timing_list.setColumnCount(4)
@@ -206,7 +210,8 @@ class LogsTab(QWidget):
         self.timing_list.setMaximumHeight(160)
         t.addWidget(self.timing_list)
 
-        layout.addWidget(timing_group)
+        timing_card.add_layout(t)
+        layout.addWidget(timing_card)
 
         # ── Internal state ──────────────────────────────────────
         self._log_buffer: list[LogEntry] = []

@@ -67,6 +67,29 @@ class TestPersonaPipeline(unittest.TestCase):
         self.assertAlmostEqual(profile["behavior"]["verbosity"], 0.85)
         self.assertAlmostEqual(profile["emotion"]["emotion_intensity"], 0.30)
 
+    def test_profile_engine_applies_diana_inspired_behavior(self):
+        engine = ProfileEngine(log_fn=lambda _msg: None)
+        profile = engine.load(
+            {
+                "persona_preset": "diana_inspired",
+                "character_name": "Revia",
+            }
+        )
+
+        self.assertEqual(profile["persona_preset"], "diana_inspired")
+        self.assertEqual(profile["name"], "Revia-Diana-Inspired")
+        self.assertAlmostEqual(profile["behavior"]["verbosity"], 0.46)
+        self.assertAlmostEqual(profile["emotion"]["sarcasm_ceiling"], 0.12)
+        self.assertIn("bright", profile["persona_definition"]["traits"])
+
+    def test_profile_engine_loads_diana_preset_by_name(self):
+        engine = ProfileEngine(log_fn=lambda _msg: None)
+        profile = engine.load_preset("diana_inspired")
+
+        self.assertEqual(profile["persona_preset"], "diana_inspired")
+        self.assertIn("Diana-inspired", profile["persona"])
+        self.assertAlmostEqual(profile["emotion"]["sarcasm_ceiling"], 0.12)
+
     def test_diana_inspired_preset_carries_examples_into_context(self):
         manager = CharacterProfileManager(log_fn=lambda _msg: None)
         profile = normalize_profile(

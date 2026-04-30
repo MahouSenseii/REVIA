@@ -1,12 +1,13 @@
 import logging
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QTextEdit, QComboBox, QGroupBox,
+    QLabel, QLineEdit, QTextEdit, QComboBox,
     QSpinBox, QCheckBox, QPushButton,
 )
 from PySide6.QtGui import QFont
 
 from app.ui_status import apply_status_style
+from gui.widgets.settings_card import SettingsCard
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,12 @@ class MemoryTab(QScrollArea):
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         layout.addWidget(header)
 
-        docker_group = QGroupBox("Docker Memory Backend (Long-Term)")
-        docker_group.setObjectName("settingsGroup")
-        dg = QHBoxLayout(docker_group)
-
+        docker_card = SettingsCard(
+            "Docker Memory Backend",
+            subtitle="Long-Term storage status",
+            icon="D",
+        )
+        dg = QHBoxLayout()
         self.docker_status = QLabel("Status: not checked")
         self.docker_status.setFont(QFont("Consolas", 9))
         self.docker_status.setObjectName("metricLabel")
@@ -41,11 +44,15 @@ class MemoryTab(QScrollArea):
         docker_check_btn.setObjectName("secondaryBtn")
         docker_check_btn.clicked.connect(self._check_docker_status)
         dg.addWidget(docker_check_btn)
-        layout.addWidget(docker_group)
+        docker_card.add_layout(dg)
+        layout.addWidget(docker_card)
 
-        backend_group = QGroupBox("Memory Store")
-        backend_group.setObjectName("settingsGroup")
-        bg = QFormLayout(backend_group)
+        backend_card = SettingsCard(
+            "Memory Store",
+            subtitle="Backend & collection config",
+            icon="M",
+        )
+        bg = QFormLayout()
 
         self.memory_backend = QComboBox()
         self.memory_backend.addItems(
@@ -66,11 +73,14 @@ class MemoryTab(QScrollArea):
         self.auto_store = QCheckBox("Auto-store conversations")
         self.auto_store.setChecked(True)
         bg.addRow("", self.auto_store)
-        layout.addWidget(backend_group)
+        backend_card.add_layout(bg)
+        layout.addWidget(backend_card)
 
-        st_group = QGroupBox("Short-Term Memory (Conversation)")
-        st_group.setObjectName("settingsGroup")
-        stl = QVBoxLayout(st_group)
+        st_card = SettingsCard(
+            "Short-Term Memory",
+            subtitle="Conversation context",
+            icon="S",
+        )
 
         st_info = QLabel(
             "Active conversation context. Recent exchanges are kept in a sliding "
@@ -78,7 +88,8 @@ class MemoryTab(QScrollArea):
         )
         st_info.setFont(QFont("Segoe UI", 8))
         st_info.setWordWrap(True)
-        stl.addWidget(st_info)
+        st_info.setObjectName("cardSubText")
+        st_card.add_widget(st_info)
 
         st_stats = QHBoxLayout()
         self.st_count = QLabel("Entries: 0")
@@ -92,13 +103,13 @@ class MemoryTab(QScrollArea):
         self.st_window.setSuffix(" messages")
         st_stats.addWidget(QLabel("Window:"))
         st_stats.addWidget(self.st_window)
-        stl.addLayout(st_stats)
+        st_card.add_layout(st_stats)
 
         self.st_list = QTextEdit()
         self.st_list.setReadOnly(True)
         self.st_list.setMaximumHeight(160)
         self.st_list.setPlaceholderText("No conversation history yet...")
-        stl.addWidget(self.st_list)
+        st_card.add_widget(self.st_list)
 
         st_btn_row = QHBoxLayout()
         st_refresh = QPushButton("Refresh")
@@ -110,12 +121,14 @@ class MemoryTab(QScrollArea):
         st_clear.setObjectName("secondaryBtn")
         st_clear.clicked.connect(self._clear_short_term)
         st_btn_row.addWidget(st_clear)
-        stl.addLayout(st_btn_row)
-        layout.addWidget(st_group)
+        st_card.add_layout(st_btn_row)
+        layout.addWidget(st_card)
 
-        lt_group = QGroupBox("Long-Term Memory (Persistent)")
-        lt_group.setObjectName("settingsGroup")
-        ltl = QVBoxLayout(lt_group)
+        lt_card = SettingsCard(
+            "Long-Term Memory",
+            subtitle="Persistent storage",
+            icon="L",
+        )
 
         lt_info = QLabel(
             "Persistent memory stored on Redis (if available) or local JSONL fallback. "
@@ -123,22 +136,23 @@ class MemoryTab(QScrollArea):
         )
         lt_info.setFont(QFont("Segoe UI", 8))
         lt_info.setWordWrap(True)
-        ltl.addWidget(lt_info)
+        lt_info.setObjectName("cardSubText")
+        lt_card.add_widget(lt_info)
 
         self.lt_count = QLabel("Entries: 0")
         self.lt_count.setFont(QFont("Consolas", 9))
         self.lt_count.setObjectName("metricLabel")
-        ltl.addWidget(self.lt_count)
+        lt_card.add_widget(self.lt_count)
 
         recent_lbl = QLabel("Recent Saved Items")
         recent_lbl.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        ltl.addWidget(recent_lbl)
+        lt_card.add_widget(recent_lbl)
 
         self.lt_recent = QTextEdit()
         self.lt_recent.setReadOnly(True)
         self.lt_recent.setMaximumHeight(150)
         self.lt_recent.setPlaceholderText("Recent long-term memories will appear here...")
-        ltl.addWidget(self.lt_recent)
+        lt_card.add_widget(self.lt_recent)
 
         recent_btn_row = QHBoxLayout()
         show_recent_btn = QPushButton("Show Recent")
@@ -146,7 +160,7 @@ class MemoryTab(QScrollArea):
         show_recent_btn.clicked.connect(self._refresh_long_term_recent)
         recent_btn_row.addWidget(show_recent_btn)
         recent_btn_row.addStretch()
-        ltl.addLayout(recent_btn_row)
+        lt_card.add_layout(recent_btn_row)
 
         delete_row = QHBoxLayout()
         self.lt_delete_select = QComboBox()
@@ -156,7 +170,7 @@ class MemoryTab(QScrollArea):
         delete_btn.setObjectName("secondaryBtn")
         delete_btn.clicked.connect(self._delete_selected_long_term)
         delete_row.addWidget(delete_btn)
-        ltl.addLayout(delete_row)
+        lt_card.add_layout(delete_row)
 
         search_row = QHBoxLayout()
         self.lt_search = QLineEdit()
@@ -167,13 +181,13 @@ class MemoryTab(QScrollArea):
         search_btn.setObjectName("secondaryBtn")
         search_btn.clicked.connect(self._search_long_term)
         search_row.addWidget(search_btn)
-        ltl.addLayout(search_row)
+        lt_card.add_layout(search_row)
 
         self.lt_results = QTextEdit()
         self.lt_results.setReadOnly(True)
         self.lt_results.setMaximumHeight(160)
         self.lt_results.setPlaceholderText("Search results will appear here...")
-        ltl.addWidget(self.lt_results)
+        lt_card.add_widget(self.lt_results)
 
         note_row = QHBoxLayout()
         self.lt_note = QLineEdit()
@@ -184,7 +198,7 @@ class MemoryTab(QScrollArea):
         save_note_btn.setObjectName("primaryBtn")
         save_note_btn.clicked.connect(self._save_note)
         note_row.addWidget(save_note_btn)
-        ltl.addLayout(note_row)
+        lt_card.add_layout(note_row)
 
         lt_btn_row = QHBoxLayout()
         lt_refresh = QPushButton("Refresh Stats")
@@ -196,9 +210,9 @@ class MemoryTab(QScrollArea):
         lt_clear.setObjectName("secondaryBtn")
         lt_clear.clicked.connect(self._clear_long_term)
         lt_btn_row.addWidget(lt_clear)
-        ltl.addLayout(lt_btn_row)
+        lt_card.add_layout(lt_btn_row)
 
-        layout.addWidget(lt_group)
+        layout.addWidget(lt_card)
         layout.addStretch()
         self.setWidget(container)
 

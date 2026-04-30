@@ -5,11 +5,13 @@ Configure and control Discord & Twitch bot integrations.
 import logging
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QGroupBox, QCheckBox, QPushButton,
+    QLabel, QLineEdit, QCheckBox, QPushButton,
     QSpinBox, QTextEdit,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
+
+from gui.widgets.settings_card import SettingsCard
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +43,12 @@ class IntegrationsTab(QScrollArea):
         layout.addWidget(sub)
 
         # ---------- Discord ----------
-        discord_group = QGroupBox("Discord Bot")
-        discord_group.setObjectName("settingsGroup")
-        dg = QVBoxLayout(discord_group)
+        discord_card = SettingsCard(
+            "Discord Bot",
+            subtitle="Chat integration",
+            icon="D",
+        )
+        dg = QVBoxLayout()
 
         self.discord_enabled = QCheckBox("Enable Discord integration")
         dg.addWidget(self.discord_enabled)
@@ -92,12 +97,16 @@ class IntegrationsTab(QScrollArea):
         self.discord_msgs_lbl = QLabel("Messages processed: 0")
         dg.addWidget(self.discord_msgs_lbl)
 
-        layout.addWidget(discord_group)
+        discord_card.add_layout(dg)
+        layout.addWidget(discord_card)
 
         # ---------- Twitch ----------
-        twitch_group = QGroupBox("Twitch Chat Bot")
-        twitch_group.setObjectName("settingsGroup")
-        tg = QVBoxLayout(twitch_group)
+        twitch_card = SettingsCard(
+            "Twitch Chat Bot",
+            subtitle="Live stream integration",
+            icon="T",
+        )
+        tg = QVBoxLayout()
 
         self.twitch_enabled = QCheckBox("Enable Twitch integration")
         tg.addWidget(self.twitch_enabled)
@@ -151,7 +160,8 @@ class IntegrationsTab(QScrollArea):
         self.twitch_msgs_lbl = QLabel("Messages processed: 0")
         tg.addWidget(self.twitch_msgs_lbl)
 
-        layout.addWidget(twitch_group)
+        twitch_card.add_layout(tg)
+        layout.addWidget(twitch_card)
 
         # ---------- Save button ----------
         save_btn = QPushButton("Save Configuration")

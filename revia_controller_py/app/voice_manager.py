@@ -173,6 +173,14 @@ class VoiceManager(QObject):
     def save_voice(self, profile):
         return self.library.save_profile(profile)
 
+    def delete_voice(self, name):
+        active_name = getattr(self._active_profile, "name", "")
+        deleted = self.library.delete(name)
+        if deleted and active_name == name:
+            self._active_profile = self.library.get_default()
+            self.voice_changed.emit(getattr(self._active_profile, "name", ""))
+        return deleted
+
     def create_design_profile(self, name, voice_description, language="Auto"):
         p = VoiceProfile(name, VoiceMode.DESIGN)
         p.voice_description = voice_description

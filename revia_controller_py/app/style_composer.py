@@ -31,8 +31,8 @@ QGroupBox, QTextEdit, QPlainTextEdit, QListWidget, QTableWidget {{
 }}
 
 QGroupBox {{
-    margin-top: 18px;
-    padding: 22px 14px 14px 14px;
+    margin-top: 14px;
+    padding: 16px 10px 8px 10px;
 }}
 
 QGroupBox::title {{
@@ -57,6 +57,15 @@ QLabel#sidebarRole, QLabel#sidebarSection, QLabel#metricLabel {{
 
 QLabel#metricValue {{
     color: {t["PrimaryText"]};
+}}
+
+QLabel#toastLabel {{
+    background-color: {t["SurfaceAlt"]};
+    color: {t["PrimaryText"]};
+    border: 1px solid {t["Border"]};
+    border-left: 3px solid {t["Accent"]};
+    border-radius: 5px;
+    padding: 7px 9px;
 }}
 
 QLabel[statusRole="success"] {{
@@ -132,7 +141,7 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     color: {t["PrimaryText"]};
     border: 1px solid {t["Border"]};
     border-radius: 4px;
-    padding: 7px 10px;
+    padding: 4px 8px;
     min-height: 18px;
 }}
 
@@ -141,7 +150,7 @@ QPushButton {{
     color: {t["PrimaryText"]};
     border: 1px solid {t["Border"]};
     border-radius: 5px;
-    padding: 8px 14px;
+    padding: 5px 12px;
     min-height: 18px;
 }}
 
@@ -192,7 +201,7 @@ QTabBar::tab {{
     background-color: {t["Surface"]};
     color: {t["SecondaryText"]};
     border: 1px solid {t["Border"]};
-    padding: 7px 10px;
+    padding: 5px 9px;
 }}
 
 QTabBar::tab:selected {{
@@ -245,6 +254,40 @@ QFrame#themeSwatch {{
     min-height: 22px;
 }}
 
+/* Voice tab visual cards */
+QFrame#voiceStatusCard, QFrame#voiceCard {{
+    background-color: {t["Surface"]};
+    border: 1px solid {t["Border"]};
+    border-radius: 6px;
+}}
+
+QFrame#voiceStatusCard {{
+    border-left: 3px solid {t["Accent"]};
+}}
+
+QFrame#voiceCard:hover {{
+    border-color: {t["AccentHover"]};
+}}
+
+QToolButton {{
+    background-color: {t["Surface"]};
+    color: {t["SecondaryText"]};
+    border: 1px solid {t["Border"]};
+    border-radius: 5px;
+    padding: 5px 8px;
+}}
+
+QToolButton:hover {{
+    border-color: {t["AccentHover"]};
+    color: {t["PrimaryText"]};
+}}
+
+QToolButton:checked {{
+    background-color: {t["SurfaceAlt"]};
+    border-color: {t["Accent"]};
+    color: {t["PrimaryText"]};
+}}
+
 /* Right-panel container — provides a small but intentional inset margin */
 QWidget#rightPanel {{
     background-color: {t["SecondaryBackground"]};
@@ -253,8 +296,8 @@ QWidget#rightPanel {{
 
 /* Right-panel tab bar — more breathing room between tabs */
 QWidget#rightPanel QTabBar::tab {{
-    padding: 8px 12px;
-    min-width: 52px;
+    padding: 6px 10px;
+    min-width: 46px;
 }}
 
 QWidget#rightPanel QTabWidget::pane {{
@@ -264,14 +307,14 @@ QWidget#rightPanel QTabWidget::pane {{
 
 /* Sections within right-panel tabs get consistent card spacing */
 QWidget#rightPanel QGroupBox {{
-    margin-top: 16px;
-    padding: 22px 14px 14px 14px;
+    margin-top: 12px;
+    padding: 14px 10px 8px 10px;
 }}
 
 QWidget#rightPanel QGroupBox::title {{
-    top: -8px;
+    top: -6px;
     left: 10px;
-    padding: 0 6px;
+    padding: 0 4px;
 }}
 
 /* Ensure scroll areas in right panel fill available space cleanly */

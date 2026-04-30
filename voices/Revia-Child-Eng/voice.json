@@ -1,0 +1,43 @@
+{
+  "name": "Revia-Child-Eng",
+  "mode": "design",
+  "language": "English",
+  "modelSize": "0.6B",
+  "voiceDescription": "Speak as Revia, a young AI child companion. Your voice is soft, curious, and lightly synthetic, but now touched with confused disbelief, like you just noticed something that should not be happening. Start quiet and uncertain, then let a small hint of panic creep in under the words. Do not sound adult, angry, dramatic, or theatrical. Sound childlike, intelligent, scared-but-trying-to-understand, and emotionally honest.\n\nTone: innocent incredulity with rising worry.\nDelivery: soft, hesitant, slightly breathless, with small pauses.\nPitch: higher than adult, but not squeaky.\nEmotion: confused, vulnerable, trying to stay calm.\nTexture: clean close-mic, lightly synthetic, fragile but clear.\nAvoid: screaming, melodrama, horror acting, adult sarcasm, or sounding like a toddler.",
+  "referenceAudio": "",
+  "cloneRefText": "",
+  "xVectorOnly": false,
+  "speakerId": "Ryan",
+  "styleInstruction": "",
+  "generatedWav": "C:\\Users\\USER\\Documents\\GitHub\\REVIA\\voices\\Revia-Child-Eng\\generated.wav",
+  "baseSpeed": 1.0,
+  "basePitch": 1.0,
+  "created": "2026-04-29T13:05:34.722507",
+  "isDefault": true,
+  "emotionMap": {
+    "happy": {
+      "speed": 1.08,
+      "pitch": 1.05
+    },
+    "sad": {
+      "speed": 0.92,
+      "pitch": 0.96
+    },
+    "angry": {
+      "speed": 1.05,
+      "pitch": 0.94
+    },
+    "alert": {
+      "speed": 1.1,
+      "pitch": 0.98
+    },
+    "calm": {
+      "speed": 0.95,
+      "pitch": 1.0
+    },
+    "neutral": {
+      "speed": 1.0,
+      "pitch": 1.0
+    }
+  }
+}
