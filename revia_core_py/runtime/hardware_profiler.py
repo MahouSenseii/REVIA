@@ -24,7 +24,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -45,11 +45,19 @@ class GpuInfo:
     index: int
     name: str
     vram_total_mb: int
+    vram_used_mb: int = 0
+    load_percent: float = 0.0
+    cuda_supported: bool = True
     driver: str = ""
     compute_capability: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["vram_free_mb"] = max(
+            0,
+            int(self.vram_total_mb or 0) - int(self.vram_used_mb or 0),
+        )
+        return d
 
 
 @dataclass
@@ -98,6 +106,14 @@ class HardwareProfiler:
     """Discover machine fingerprint once at boot."""
 
     DEFAULT_FINGERPRINT_PATH = Path("data/hw_fingerprint.json")
+    SUPPORT_GPU_TASKS = [
+        "speech_to_text",
+        "text_to_speech",
+        "vision",
+        "memory_embeddings",
+        "emotion_classifier",
+        "background_agents",
+    ]
 
     def __init__(self, log_fn=None, fingerprint_path: Path | None = None):
         self._log = log_fn or _log.info
@@ -169,7 +185,12 @@ class HardwareProfiler:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return None
         try:
-            gpus = [GpuInfo(**g) for g in data.get("cuda_devices", []) or []]
+            gpu_keys = {f.name for f in fields(GpuInfo)}
+            gpus = [
+                GpuInfo(**{k: v for k, v in g.items() if k in gpu_keys})
+                for g in data.get("cuda_devices", []) or []
+                if isinstance(g, dict)
+            ]
             data["cuda_devices"] = gpus
             return HardwareFingerprint(**data)
         except TypeError:
@@ -303,6 +324,11 @@ class HardwareProfiler:
                     if isinstance(name, bytes):
                         name = name.decode("utf-8", "ignore")
                     mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                    load = 0.0
+                    try:
+                        load = float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+                    except Exception:
+                        pass
                     cc = ""
                     try:
                         major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(h)
@@ -313,6 +339,9 @@ class HardwareProfiler:
                         index=i,
                         name=str(name),
                         vram_total_mb=int(mem.total // (1024 * 1024)),
+                        vram_used_mb=int(mem.used // (1024 * 1024)),
+                        load_percent=load,
+                        cuda_supported=True,
                         driver=str(driver),
                         compute_capability=cc,
                     ))
@@ -332,7 +361,7 @@ class HardwareProfiler:
             out = subprocess.check_output(
                 [
                     "nvidia-smi",
-                    "--query-gpu=index,name,memory.total,driver_version,compute_cap",
+                    "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,driver_version,compute_cap",
                     "--format=csv,noheader,nounits",
                 ],
                 timeout=3, stderr=subprocess.DEVNULL,
@@ -342,19 +371,24 @@ class HardwareProfiler:
         gpus: list[GpuInfo] = []
         for line in out.strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 3:
+            if len(parts) < 5:
                 continue
             try:
                 idx = int(parts[0])
                 vram = int(float(parts[2]))
+                used = int(float(parts[3]))
+                load = float(parts[4])
             except ValueError:
                 continue
             gpus.append(GpuInfo(
                 index=idx,
                 name=parts[1],
                 vram_total_mb=vram,
-                driver=parts[3] if len(parts) > 3 else "",
-                compute_capability=parts[4] if len(parts) > 4 else "",
+                vram_used_mb=used,
+                load_percent=load,
+                cuda_supported=True,
+                driver=parts[5] if len(parts) > 5 else "",
+                compute_capability=parts[6] if len(parts) > 6 else "",
             ))
         return gpus
 
@@ -377,12 +411,176 @@ class HardwareProfiler:
                     index=i,
                     name=str(props.name),
                     vram_total_mb=int(props.total_memory // (1024 * 1024)),
+                    vram_used_mb=0,
+                    load_percent=0.0,
+                    cuda_supported=True,
                     driver="",
                     compute_capability=cc,
                 ))
             except Exception:
                 continue
         return out
+
+    # ------------------------------------------------------------------
+    # Routing policy helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def default_hardware_policy(cls, fp: HardwareFingerprint | None) -> dict[str, Any]:
+        gpu_count = len(getattr(fp, "cuda_devices", []) or [])
+        if gpu_count <= 0:
+            return {
+                "hardware_mode": "cpu_only",
+                "main_llm_gpu": "cpu",
+                "support_gpu": "cpu",
+                "allow_model_splitting": False,
+                "allow_parallel_agents": False,
+                "fallback_to_cpu": True,
+            }
+        if gpu_count == 1:
+            profile = str(getattr(fp, "suggested_profile", "") or "")
+            return {
+                "hardware_mode": "single_gpu_auto",
+                "main_llm_gpu": "auto_best",
+                "support_gpu": "cpu",
+                "allow_model_splitting": False,
+                "allow_parallel_agents": profile not in {"", "low_8gb"},
+                "fallback_to_cpu": True,
+            }
+        return {
+            "hardware_mode": "multi_gpu_auto",
+            "main_llm_gpu": "auto_best",
+            "support_gpu": "auto_secondary",
+            "allow_model_splitting": False,
+            "allow_parallel_agents": True,
+            "fallback_to_cpu": True,
+        }
+
+    @classmethod
+    def normalize_hardware_policy(
+        cls,
+        fp: HardwareFingerprint | None,
+        policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized = cls.default_hardware_policy(fp)
+        if isinstance(policy, dict):
+            normalized.update(policy)
+
+        mode = str(normalized.get("hardware_mode") or "").strip().lower()
+        gpu_count = len(getattr(fp, "cuda_devices", []) or [])
+        if mode in {"auto", "auto_recommended", "recommended"}:
+            normalized["hardware_mode"] = cls.default_hardware_policy(fp)["hardware_mode"]
+        elif mode in {"both", "use_both", "multi_gpu"}:
+            normalized["hardware_mode"] = "multi_gpu_auto" if gpu_count != 1 else "single_gpu_auto"
+        elif mode in {"advanced", "advanced_multi_gpu", "multi_gpu_advanced"}:
+            normalized["hardware_mode"] = "advanced_multi_gpu"
+            normalized["allow_model_splitting"] = True
+            normalized["allow_parallel_agents"] = True
+        elif mode in {"single", "single_gpu"}:
+            normalized["hardware_mode"] = "single_gpu"
+            normalized["support_gpu"] = "cpu"
+            normalized["allow_model_splitting"] = False
+
+        if gpu_count == 1 and normalized.get("hardware_mode") == "multi_gpu_auto":
+            normalized["hardware_mode"] = "single_gpu_auto"
+            normalized["support_gpu"] = "cpu"
+            normalized["allow_model_splitting"] = False
+            if str(getattr(fp, "suggested_profile", "") or "") in {"", "low_8gb"}:
+                normalized["allow_parallel_agents"] = False
+        elif gpu_count <= 0 and not isinstance(policy, dict):
+            normalized["hardware_mode"] = "cpu_only"
+
+        normalized["allow_model_splitting"] = bool(
+            normalized.get("allow_model_splitting", False)
+        )
+        normalized["allow_parallel_agents"] = bool(
+            normalized.get("allow_parallel_agents", True)
+        )
+        normalized["fallback_to_cpu"] = bool(normalized.get("fallback_to_cpu", True))
+        return normalized
+
+    @staticmethod
+    def _gpu_rank_score(gpu: GpuInfo) -> tuple[int, int, float]:
+        total = int(gpu.vram_total_mb or 0)
+        used = int(gpu.vram_used_mb or 0)
+        load = float(gpu.load_percent or 0.0)
+        return total, max(0, total - used), -load
+
+    @classmethod
+    def ranked_cuda_devices(cls, fp: HardwareFingerprint | None) -> list[GpuInfo]:
+        devices = list(getattr(fp, "cuda_devices", []) or [])
+        return sorted(devices, key=cls._gpu_rank_score, reverse=True)
+
+    @staticmethod
+    def _gpu_index(gpu: GpuInfo | None) -> int | None:
+        return int(gpu.index) if gpu is not None else None
+
+    @staticmethod
+    def _coerce_gpu_index(value: Any, devices: list[GpuInfo]) -> int | None:
+        indices = {int(g.index) for g in devices}
+        if isinstance(value, int):
+            return value if value in indices else None
+        text = str(value or "").strip().lower()
+        for prefix in ("gpu:", "cuda:"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        try:
+            idx = int(text)
+        except ValueError:
+            return None
+        return idx if idx in indices else None
+
+    @classmethod
+    def resolve_gpu_roles(
+        cls,
+        fp: HardwareFingerprint | None,
+        policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        policy = cls.normalize_hardware_policy(fp, policy)
+        devices = list(getattr(fp, "cuda_devices", []) or [])
+        ranked = cls.ranked_cuda_devices(fp)
+        best = ranked[0] if ranked else None
+        secondary = ranked[1] if len(ranked) > 1 else None
+        mode = str(policy.get("hardware_mode") or "").strip().lower()
+
+        main = cls._coerce_gpu_index(policy.get("main_llm_gpu"), devices)
+        if main is None and policy.get("main_llm_gpu") in (None, "", "auto_best"):
+            main = cls._gpu_index(best)
+
+        support: int | None = None
+        support_raw = str(policy.get("support_gpu") or "").strip().lower()
+        if support_raw not in {"", "cpu", "none"}:
+            support = cls._coerce_gpu_index(policy.get("support_gpu"), devices)
+            if support is None and support_raw == "auto_secondary":
+                support = cls._gpu_index(secondary)
+
+        if mode in {"cpu_only", "single_gpu", "single_gpu_auto"}:
+            support = None
+        if main is not None and support == main:
+            support = None
+
+        main_gpu = next((g for g in devices if int(g.index) == main), None)
+        support_gpu = next((g for g in devices if int(g.index) == support), None)
+        split_allowed = bool(policy.get("allow_model_splitting")) and len(devices) > 1
+        split_reason = (
+            "Disabled until model fit, runtime support, and performance checks pass."
+            if split_allowed else "Disabled by policy."
+        )
+        return {
+            "hardware_mode": policy.get("hardware_mode"),
+            "main_llm_gpu_index": main,
+            "main_llm_gpu_name": main_gpu.name if main_gpu else "",
+            "support_gpu_index": support,
+            "support_gpu_name": support_gpu.name if support_gpu else "",
+            "support_tasks": list(cls.SUPPORT_GPU_TASKS) if support is not None else [],
+            "visible_main_llm_devices": [main] if main is not None else [],
+            "visible_support_devices": [support] if support is not None else [],
+            "model_splitting": {
+                "allowed_by_policy": split_allowed,
+                "enabled": False,
+                "reason": split_reason,
+            },
+        }
 
     @staticmethod
     def _http_alive(base_url: str, timeout_s: float = 0.6) -> bool:

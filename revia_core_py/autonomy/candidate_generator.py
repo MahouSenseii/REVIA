@@ -94,17 +94,74 @@ class CandidateGenerator:
                 requires_deep_processing=True,
             ))
 
-        if state.seconds_since_last_user_message >= max(120.0, state.profile.min_idle_seconds * 2):
+        if state.seconds_since_last_user_message >= max(90.0, state.profile.min_idle_seconds * 2):
             candidates.append(SelfInitiationCandidate(
                 candidate_id="quiet-observation",
                 type="make_observation",
                 topic=primary_topic or "quiet room",
                 text=(
-                    "Make one restrained observation about the conversation being quiet. "
-                    "Avoid filler and avoid asking a question unless it matters."
+                    "Make one short, natural observation or comment to break the quiet. "
+                    "It can be about the conversation, something you noticed, or a passing thought. "
+                    "One sentence. Don't ask a question just for the sake of it."
                 ),
                 reason="long quiet period",
                 requires_deep_processing=False,
+            ))
+
+        # Spontaneous opinion — Revia shares a take without being asked
+        if (
+            state.seconds_since_last_user_message >= state.profile.min_idle_seconds
+            and primary_topic
+        ):
+            candidates.append(SelfInitiationCandidate(
+                candidate_id="spontaneous-opinion",
+                type="share_opinion",
+                topic=primary_topic,
+                text=(
+                    f"You have a distinct opinion about something related to '{primary_topic}'. "
+                    "Share it unprompted in one or two short sentences — direct, a little dry, "
+                    "and genuinely yours. Don't hedge or over-explain."
+                ),
+                reason="opinion worth sharing on active topic",
+                requires_deep_processing=False,
+                metadata={"spontaneous": True},
+            ))
+
+        # Curiosity question — Revia asks because she's actually curious
+        if (
+            state.seconds_since_last_user_message >= state.profile.min_idle_seconds * 1.5
+            and primary_topic
+        ):
+            candidates.append(SelfInitiationCandidate(
+                candidate_id="curiosity-question",
+                type="ask_curious",
+                topic=primary_topic,
+                text=(
+                    f"Ask the user one genuine question about '{primary_topic}' or something "
+                    "adjacent you're actually curious about. Keep it short. Don't pad it."
+                ),
+                reason="genuine curiosity follow-up",
+                requires_deep_processing=True,
+                metadata={"curiosity": True},
+            ))
+
+        # Humor observation — a dry, quick joke or amusing take
+        if (
+            state.seconds_since_last_user_message >= state.profile.min_idle_seconds
+            and state.current_mode in {"companion", "stream", "casual"}
+        ):
+            candidates.append(SelfInitiationCandidate(
+                candidate_id="humor-observation",
+                type="humor_comment",
+                topic=primary_topic or "general",
+                text=(
+                    "Make a dry, short, funny observation — one line. "
+                    "It can be self-aware, sardonic, or just genuinely amusing. "
+                    "Don't explain the joke. Don't be performatively cute."
+                ),
+                reason="companion mode allows personality expression",
+                requires_deep_processing=False,
+                metadata={"humor": True},
             ))
 
         if state.current_mode == "stream" and primary_topic:

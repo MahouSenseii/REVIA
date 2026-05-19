@@ -2,9 +2,28 @@
 
 import tempfile
 import unittest
+import wave
+from unittest.mock import patch
 from pathlib import Path
 
 from tts_backend import QwenTTSBackend, _strip_leading_style_directives
+
+
+def _make_test_wav(path: str) -> None:
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(b"\x00\x00" * 160)
+
+
+def _make_temp_wav(testcase: unittest.TestCase) -> str:
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    _make_test_wav(tmp_path)
+    testcase.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+    return tmp_path
 
 
 class TestTTSStyleSanitizer(unittest.TestCase):
@@ -51,6 +70,54 @@ class EndpointAwareFakeQwenClient(FakeQwenClient):
 
 
 class TestQwenEndpointHandling(unittest.TestCase):
+    def test_is_ready_caches_success_and_api_names(self):
+        backend = QwenTTSBackend()
+        backend.set_qwen_server("http://localhost:8000")
+        calls = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"named_endpoints": {"/run_voice_clone": {}}}'
+
+        def _urlopen(url, timeout):
+            calls.append((url, timeout))
+            return _Response()
+
+        with patch("tts_backend.urllib.request.urlopen", _urlopen):
+            self.assertTrue(backend.is_ready())
+            self.assertTrue(backend.is_ready())
+            self.assertEqual(backend._get_qwen_api_names(), {"/run_voice_clone"})
+
+        self.assertEqual(len(calls), 1)
+
+    def test_is_ready_caches_short_failure(self):
+        backend = QwenTTSBackend()
+        backend.set_qwen_server("http://localhost:8000")
+        calls = []
+
+        def _urlopen(url, timeout):
+            calls.append((url, timeout))
+            raise OSError("not ready")
+
+        with patch("tts_backend.urllib.request.urlopen", _urlopen):
+            self.assertFalse(backend.is_ready())
+            self.assertFalse(backend.is_ready())
+
+        self.assertEqual(len(calls), 1)
+
+    def test_synthesis_concurrency_clamps_to_safe_range(self):
+        backend = QwenTTSBackend()
+        backend.set_synthesis_concurrency(0)
+        self.assertEqual(backend.synthesis_concurrency, 1)
+        backend.set_synthesis_concurrency(99)
+        self.assertEqual(backend.synthesis_concurrency, 4)
+
     def test_voice_design_missing_endpoint_is_nonfatal(self):
         backend = QwenTTSBackend()
         client = FakeQwenClient()
@@ -74,9 +141,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertTrue(statuses)
 
     def test_voice_design_uses_local_run_endpoint_when_available(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         client = FakeQwenClient(tmp_path)
@@ -104,9 +169,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_voice_design_uses_custom_endpoint_when_available(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         client = FakeQwenClient(tmp_path)
@@ -136,9 +199,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertTrue(any("CustomVoice style fallback" in s for s in statuses))
 
     def test_voice_design_retries_when_discovery_misses_hf_endpoint(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         backend.set_qwen_server("local-test-server")
@@ -166,9 +227,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_voice_design_refreshes_stale_endpoint_cache(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         backend.set_qwen_server("local-test-server")
@@ -201,9 +260,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertTrue(any("CustomVoice style fallback" in s for s in statuses))
 
     def test_custom_voice_uses_local_run_instruct_when_available(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         client = FakeQwenClient(tmp_path)
@@ -233,9 +290,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_custom_voice_falls_back_to_hf_endpoint(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
         client = FakeQwenClient(tmp_path)
@@ -263,9 +318,7 @@ class TestQwenEndpointHandling(unittest.TestCase):
         ))
 
     def test_extract_wav_accepts_gradio_file_dict(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+        tmp_path = _make_temp_wav(self)
 
         backend = QwenTTSBackend()
 
@@ -273,6 +326,16 @@ class TestQwenEndpointHandling(unittest.TestCase):
             backend._extract_wav(({"path": tmp_path}, "ok"), None),
             tmp_path,
         )
+
+    def test_extract_wav_rejects_empty_file(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        self.addCleanup(lambda: Path(tmp_path).unlink(missing_ok=True))
+
+        backend = QwenTTSBackend()
+
+        self.assertIsNone(backend._extract_wav({"path": tmp_path}, None))
 
 
 if __name__ == "__main__":

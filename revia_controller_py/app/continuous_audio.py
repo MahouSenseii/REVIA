@@ -133,6 +133,7 @@ class ContinuousAudioPipeline(QObject):
         # When None, falls back to pyaudio if available
         self._audio_source: Callable[[], bytes] | None = None
         self._pa_stream   = None
+        self._pa_instance = None  # PyAudio instance — must be terminated on close
 
     # Public API
 
@@ -328,7 +329,8 @@ class ContinuousAudioPipeline(QObject):
             samples = struct.unpack(f"<{n}h", raw_frame[:n * 2])
             rms     = (sum(s * s for s in samples) / n) ** 0.5
             energy  = rms / 32768.0   # normalise to [0, 1]
-        except Exception:
+        except Exception as exc:
+            _log.debug("[ContinuousAudio] VAD frame decode error: %s", exc)
             return False, 0.0
 
         self._update_ambient_noise(energy)
@@ -367,7 +369,7 @@ class ContinuousAudioPipeline(QObject):
             return   # custom source — skip pyaudio
         try:
             import pyaudio
-            pa              = pyaudio.PyAudio()
+            pa = pyaudio.PyAudio()
             try:
                 self._pa_stream = pa.open(
                     format            = pyaudio.paInt16,
@@ -376,6 +378,9 @@ class ContinuousAudioPipeline(QObject):
                     input             = True,
                     frames_per_buffer = _FRAME_SAMPLES,
                 )
+                # Store instance so _close_pa_stream can call pa.terminate()
+                # and release the PortAudio host API resources properly.
+                self._pa_instance = pa
                 _log.info("[ContinuousAudio] pyaudio stream opened at %d Hz", _SAMPLE_RATE)
             except Exception:
                 pa.terminate()
@@ -392,12 +397,14 @@ class ContinuousAudioPipeline(QObject):
         if self._audio_source is not None:
             try:
                 return self._audio_source()
-            except Exception:
+            except Exception as exc:
+                _log.debug("[ContinuousAudio] Custom audio source read error: %s", exc)
                 return None
         if self._pa_stream is not None:
             try:
                 return self._pa_stream.read(_FRAME_SAMPLES, exception_on_overflow=False)
-            except Exception:
+            except Exception as exc:
+                _log.debug("[ContinuousAudio] PyAudio read error: %s", exc)
                 return None
         return None
 
@@ -406,9 +413,15 @@ class ContinuousAudioPipeline(QObject):
             try:
                 self._pa_stream.stop_stream()
                 self._pa_stream.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("[ContinuousAudio] Error closing PA stream: %s", exc)
             self._pa_stream = None
+        if self._pa_instance is not None:
+            try:
+                self._pa_instance.terminate()
+            except Exception as exc:
+                _log.debug("[ContinuousAudio] Error terminating PyAudio: %s", exc)
+            self._pa_instance = None
 
     # Partial transcription
 

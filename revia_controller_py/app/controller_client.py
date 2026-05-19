@@ -272,6 +272,16 @@ class ControllerClient(QObject):
         self.ws_connected = True
         self.ws_connection_timer.stop()
         self._set_core_reachability(True)
+
+        # Log reconnection if we had previously failed
+        if self._reconnect_attempt > 0:
+            msg = f"[Revia] Server reconnected after {self._reconnect_attempt} attempt(s)"
+            _log.info("[ControllerClient] %s", msg)
+            try:
+                self.event_bus.log_entry.emit(msg)
+            except Exception as exc:
+                _log.debug("[ControllerClient] Reconnect success log failed: %s", exc)
+
         # Reset exponential backoff - connection is healthy again.
         self._reconnect_attempt = 0
         self.reconnect_timer.setInterval(self._reconnect_base_ms)
@@ -303,10 +313,26 @@ class ControllerClient(QObject):
                 self._reconnect_max_ms,
             )
             self.reconnect_timer.setInterval(new_interval)
-            _log.debug(
-                "[ControllerClient] Reconnect backoff: attempt=%d interval=%dms",
-                self._reconnect_attempt, new_interval,
+
+            # NOTIFY USER: Log reconnection attempt with wait time
+            wait_seconds = new_interval // 1000
+            msg = (
+                f"[Revia] Server disconnected. "
+                f"Reconnection attempt {self._reconnect_attempt}, "
+                f"retrying in {wait_seconds} seconds..."
             )
+            _log.warning(
+                "[ControllerClient] %s (interval=%dms)",
+                msg, new_interval,
+            )
+
+            # Emit signals for UI/TTS notification
+            try:
+                self.event_bus.log_entry.emit(msg)
+                self.event_bus.connection_retry_attempt.emit(self._reconnect_attempt)
+                self.event_bus.connection_retry_waiting.emit(new_interval)
+            except Exception as exc:
+                _log.debug("[ControllerClient] Retry signal emit failed: %s", exc)
 
     def _on_ws_message(self, msg):
         try:
@@ -364,6 +390,15 @@ class ControllerClient(QObject):
                 sentence = data.get("sentence", "")
                 req_id = data.get("request_id", "")
                 if sentence:
+                    sentence_payload = {
+                        "sentence": sentence,
+                        "request_id": req_id,
+                        "turn_id": data.get("turn_id", 0),
+                        "emotion": data.get("emotion", {}) or {},
+                        "is_thinking_pause": bool(data.get("is_thinking_pause", False)),
+                    }
+                    if hasattr(self.event_bus, "chat_sentence_payload"):
+                        self.event_bus.chat_sentence_payload.emit(sentence_payload)
                     self.event_bus.chat_sentence.emit(sentence, req_id)
             elif msg_type == "interrupt_ack":
                 self.event_bus.interrupt_ack.emit()
@@ -389,7 +424,7 @@ class ControllerClient(QObject):
                     f"{self.BASE_URL}/api/status",
                     timeout=(0.5, 1.0),
                 )
-                result = r.json() if r.ok else None
+                result = self._decode_json_response(r)
             except Exception as exc:
                 _log.debug("[ControllerClient] Poll status error: %s", exc)
                 result = None

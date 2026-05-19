@@ -62,6 +62,7 @@ class EmotionsTab(QScrollArea):
 
         self._chart_tick = 0
         self._prob_rows = []
+        self._response_prob_rows = []
         self._emotion_history = deque(maxlen=1000)
 
         container = QWidget()
@@ -75,8 +76,8 @@ class EmotionsTab(QScrollArea):
         layout.addWidget(header)
 
         probs_card = SettingsCard(
-            "Neural Inference",
-            subtitle="Top probabilities",
+            "Input Affect",
+            subtitle="Latest user/context inference",
             icon="N",
         )
         pg = QVBoxLayout()
@@ -112,9 +113,46 @@ class EmotionsTab(QScrollArea):
         probs_card.add_layout(pg)
         layout.addWidget(probs_card)
 
+        response_card = SettingsCard(
+            "Revia Expression",
+            subtitle="Tone inferred from latest reply",
+            icon="R",
+        )
+        rg = QVBoxLayout()
+
+        self.response_scope_label = QLabel("Waiting for Revia response tone.")
+        self.response_scope_label.setFont(QFont("Segoe UI", 8))
+        self.response_scope_label.setWordWrap(True)
+        apply_status_style(self.response_scope_label, role="muted")
+        rg.addWidget(self.response_scope_label)
+
+        for _ in range(5):
+            row = QHBoxLayout()
+            lbl = QLabel("-")
+            lbl.setMinimumWidth(80)
+            lbl.setFont(QFont("Consolas", 9))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFormat("%v%%")
+            row.addWidget(lbl)
+            row.addWidget(bar)
+            rg.addLayout(row)
+            self._response_prob_rows.append((lbl, bar))
+
+        self.response_signals_view = QTextEdit()
+        self.response_signals_view.setReadOnly(True)
+        self.response_signals_view.setMaximumHeight(80)
+        self.response_signals_view.setFont(QFont("Consolas", 8))
+        self.response_signals_view.setPlaceholderText("Response tone values will appear here.")
+        rg.addWidget(self.response_signals_view)
+
+        response_card.add_layout(rg)
+        layout.addWidget(response_card)
+
         chart_card = SettingsCard(
             "Emotion Timeline",
-            subtitle="History over time",
+            subtitle="Input affect history over time",
             icon="T",
         )
         cgl = QVBoxLayout()
@@ -187,7 +225,7 @@ class EmotionsTab(QScrollArea):
 
         info = QLabel(
             "This context is appended to the AI system prompt so responses adapt to "
-            "the inferred emotional state."
+            "the inferred user/context affect."
         )
         info.setFont(QFont("Segoe UI", 8))
         info.setWordWrap(True)
@@ -263,10 +301,16 @@ class EmotionsTab(QScrollArea):
         return chart_view, series_map, x_axis
 
     def _on_telemetry(self, data):
-        emo = data.get("emotion", {}) if isinstance(data, dict) else {}
+        emo = {}
+        response_emo = {}
+        if isinstance(data, dict):
+            emo = data.get("input_emotion", {}) or data.get("emotion", {}) or {}
+            response_emo = data.get("response_emotion", {}) or {}
         if not isinstance(emo, dict) or not emo:
             return
         self._update_display(emo)
+        if isinstance(response_emo, dict) and response_emo:
+            self._update_response_display(response_emo)
 
     def _update_display(self, emo):
         label = str(emo.get("label", "Neutral"))
@@ -289,13 +333,38 @@ class EmotionsTab(QScrollArea):
             top_text = ", ".join(f"{name}:{prob:.0%}" for name, prob in ranked[:3]) or f"{label}:{conf:.0%}"
             hint = _INJECT_HINTS.get(label, "Adjust tone to match emotional context.")
             preview = (
-                f"[Emotional context inference: top hypotheses {top_text}. "
+                f"[Input affect inference: top hypotheses {top_text}. "
                 f"Current best read: {label} (valence {v:+.2f}, confidence {conf:.0%}). "
                 f"{hint}]"
             )
         else:
             preview = "(No emotion text injected: neutral/disabled or injection off)"
         self.inject_preview.setPlainText(preview)
+
+    def _update_response_display(self, emo):
+        state = str(emo.get("state", "ready") or "ready").strip().lower()
+        label = str(emo.get("label", "Neutral"))
+        conf = self._as_float(emo.get("confidence", 0.0))
+        probs = self._coerce_probabilities(emo.get("emotion_probs", {}))
+        ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+        if not ranked and label:
+            ranked = [(label, conf)]
+        self._update_probability_rows(ranked, rows=self._response_prob_rows)
+        self._update_reasoning_views(
+            emo,
+            signals_view=self.response_signals_view,
+            temporal_view=None,
+        )
+
+        excerpt = str(emo.get("source_excerpt", "") or "").strip()
+        if state in ("pending", "idle"):
+            self.response_scope_label.setText("Waiting for Revia response tone.")
+        elif excerpt:
+            self.response_scope_label.setText(
+                f"Latest reply tone: {label} ({conf:.0%}) from \"{excerpt[:90]}\""
+            )
+        else:
+            self.response_scope_label.setText(f"Latest reply tone: {label} ({conf:.0%})")
 
     @staticmethod
     def _as_float(value, default=0.0):
@@ -315,8 +384,9 @@ class EmotionsTab(QScrollArea):
             out[str(key)] = max(0.0, min(1.0, p))
         return out
 
-    def _update_probability_rows(self, ranked):
-        for i, (lbl, bar) in enumerate(self._prob_rows):
+    def _update_probability_rows(self, ranked, rows=None):
+        target_rows = rows if rows is not None else self._prob_rows
+        for i, (lbl, bar) in enumerate(target_rows):
             if i < len(ranked):
                 name, prob = ranked[i]
                 color = _EMOTION_COLORS.get(name, "#94a3b8")
@@ -330,7 +400,9 @@ class EmotionsTab(QScrollArea):
                 bar.setValue(0)
                 bar.setStyleSheet("")
 
-    def _update_reasoning_views(self, emo):
+    def _update_reasoning_views(self, emo, signals_view=None, temporal_view=None):
+        signals_widget = signals_view if signals_view is not None else self.signals_view
+        temporal_widget = temporal_view if temporal_view is not None else self.temporal_view
         sig = emo.get("signals", {})
         if isinstance(sig, dict) and sig:
             lines = ["Signals"]
@@ -341,10 +413,12 @@ class EmotionsTab(QScrollArea):
             ):
                 if k in sig:
                     lines.append(f"{k:>16}: {self._as_float(sig[k], 0.0):.3f}")
-            self.signals_view.setPlainText("\n".join(lines))
+            signals_widget.setPlainText("\n".join(lines))
         else:
-            self.signals_view.setPlainText("Signals\n(no data)")
+            signals_widget.setPlainText("Signals\n(no data)")
 
+        if temporal_widget is None:
+            return
         tmp = emo.get("temporal", {})
         if isinstance(tmp, dict) and tmp:
             lines = ["Temporal"]
@@ -359,9 +433,9 @@ class EmotionsTab(QScrollArea):
                         lines.append(f"{k:>20}: {val:.3f}")
                     else:
                         lines.append(f"{k:>20}: {val}")
-            self.temporal_view.setPlainText("\n".join(lines))
+            temporal_widget.setPlainText("\n".join(lines))
         else:
-            self.temporal_view.setPlainText("Temporal\n(no data)")
+            temporal_widget.setPlainText("Temporal\n(no data)")
 
     def _add_chart_point(self, label, confidence, probs=None):
         self._chart_tick += 1
@@ -451,12 +525,13 @@ class EmotionsTab(QScrollArea):
             pair_layout = self.findChild(object, f"emo_legend_{idx}")
             # Fallback: find all QLabel children with "●" text and re-color
         # Re-apply probability bar chunk styles
-        for i, (lbl, bar) in enumerate(self._prob_rows):
-            if lbl.text() and lbl.text() != "-":
-                color = _EMOTION_COLORS.get(lbl.text(), "#94a3b8")
-                bar.setStyleSheet(
-                    f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
-                )
+        for rows in (self._prob_rows, self._response_prob_rows):
+            for i, (lbl, bar) in enumerate(rows):
+                if lbl.text() and lbl.text() != "-":
+                    color = _EMOTION_COLORS.get(lbl.text(), "#94a3b8")
+                    bar.setStyleSheet(
+                        f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+                    )
         # Re-apply chart background if available
         if _CHARTS_AVAILABLE and hasattr(self, '_chart_view') and self._chart_view:
             self._chart_view.setStyleSheet("background: transparent; border: none;")

@@ -98,6 +98,27 @@ class VisionTab(QScrollArea):
         self.cam_status.setFont(QFont("Consolas", 9))
         cam_card.add_widget(self.cam_status)
 
+        # Screen capture — lets Revia see what's on screen (games, apps, etc.)
+        # without needing a physical camera.  Frames go through the same YOLO
+        # and vision-context pipeline so no other code changes are needed.
+        screen_row = QHBoxLayout()
+        self.screen_capture_cb = QCheckBox("Screen capture mode")
+        self.screen_capture_cb.setToolTip(
+            "Stream desktop screenshots through the vision pipeline every few seconds.\n"
+            "Revia can then comment on what you're doing on screen."
+        )
+        self.screen_capture_cb.toggled.connect(self._on_screen_capture_toggled)
+        screen_row.addWidget(self.screen_capture_cb)
+        self.screen_interval = QSpinBox()
+        self.screen_interval.setRange(1, 30)
+        self.screen_interval.setValue(3)
+        self.screen_interval.setSuffix("s")
+        self.screen_interval.setToolTip("Seconds between screen captures")
+        self.screen_interval.setMaximumWidth(72)
+        screen_row.addWidget(self.screen_interval)
+        screen_row.addStretch()
+        cam_card.add_layout(screen_row)
+
         layout.addWidget(cam_card)
 
         # --- Object Identification ---
@@ -511,3 +532,15 @@ class VisionTab(QScrollArea):
             if src_type:
                 return src_type
         return str(source)
+
+    def _on_screen_capture_toggled(self, enabled: bool):
+        """Start or stop desktop screen capture via CameraService."""
+        if not self.camera_service:
+            return
+        if enabled:
+            interval_ms = self.screen_interval.value() * 1000
+            self.camera_service.start_screen_capture(
+                interval_ms=interval_ms, monitor=0
+            )
+        else:
+            self.camera_service.stop_screen_capture()

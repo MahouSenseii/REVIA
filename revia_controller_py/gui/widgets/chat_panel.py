@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSizePolicy,
     QApplication,
+    QToolButton,
 )
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
@@ -61,6 +62,8 @@ class ChatPanel(QFrame):
         self._current_response = ""
         self._full_response = ""
         self._vision_active = False
+        self._current_input_emotion = "neutral"
+        self._current_response_emotion = "neutral"
         self._current_emotion = "neutral"
         # Sentence-level streaming TTS
         self._tts_sentence_buf = ""
@@ -74,6 +77,7 @@ class ChatPanel(QFrame):
         self._pending_request_id = ""
         self._current_request_id = ""
         self._last_completed_text = ""
+        self._last_rated_request_id = ""
         self._ignored_request_ids = []
         self._tts_session_interrupted = False
         self._server_sentence_streaming = False  # Set True when chat_sentence events arrive
@@ -94,6 +98,12 @@ class ChatPanel(QFrame):
         self._activity_tts_playback_duration = 0.0
         self._activity_waiting_for_tts = False
         self._activity_interrupted = False
+        self._activity_request_started_at = 0.0
+        self._activity_first_token_duration = 0.0
+        self._activity_first_tts_ready_duration = 0.0
+        self._activity_first_playback_duration = 0.0
+        self._activity_tts_chunk_count = 0
+        self._activity_request_seq = 0
         self._activity_summary = "Ready"
         self._activity_timer = QTimer(self)
         self._activity_timer.setInterval(100)
@@ -126,6 +136,36 @@ class ChatPanel(QFrame):
         apply_status_style(self.activity_label, role="muted")
         self.activity_label.setContentsMargins(10, 6, 10, 6)
         layout.addWidget(self.activity_label)
+
+        # --- Rating bar: shown after each successful assistant response ---
+        self._rating_bar = QFrame()
+        self._rating_bar.setObjectName("ratingBar")
+        self._rating_bar.setFixedHeight(34)
+        _rb_layout = QHBoxLayout(self._rating_bar)
+        _rb_layout.setContentsMargins(10, 2, 10, 2)
+        _rb_layout.setSpacing(6)
+        _rb_label = QLabel("Rate this response:")
+        _rb_label.setFont(QFont("Segoe UI", 9))
+        _rb_layout.addWidget(_rb_label)
+        self._btn_thumbs_up = QToolButton()
+        self._btn_thumbs_up.setText("👍")
+        self._btn_thumbs_up.setToolTip("Good response — positive feedback")
+        self._btn_thumbs_dn = QToolButton()
+        self._btn_thumbs_dn.setText("👎")
+        self._btn_thumbs_dn.setToolTip("Poor response — negative feedback")
+        _rb_layout.addWidget(self._btn_thumbs_up)
+        _rb_layout.addWidget(self._btn_thumbs_dn)
+        _rb_layout.addStretch()
+        _rb_dismiss = QToolButton()
+        _rb_dismiss.setText("✕")
+        _rb_dismiss.setToolTip("Dismiss")
+        _rb_dismiss.setAutoRaise(True)
+        _rb_layout.addWidget(_rb_dismiss)
+        self._rating_bar.hide()
+        layout.addWidget(self._rating_bar)
+        self._btn_thumbs_up.clicked.connect(lambda: self._on_rate(1))
+        self._btn_thumbs_dn.clicked.connect(lambda: self._on_rate(-1))
+        _rb_dismiss.clicked.connect(self._rating_bar.hide)
 
         input_row = QFrame()
         input_row.setObjectName("chatInputRow")
@@ -184,7 +224,10 @@ class ChatPanel(QFrame):
         self.event_bus.chat_complete_payload.connect(self._on_complete_payload)
         self.event_bus.proactive_start.connect(self._on_proactive_start)
         self.event_bus.telemetry_updated.connect(self._on_telemetry)
-        self.event_bus.chat_sentence.connect(self._on_chat_sentence)
+        if hasattr(self.event_bus, "chat_sentence_payload"):
+            self.event_bus.chat_sentence_payload.connect(self._on_chat_sentence_payload)
+        else:
+            self.event_bus.chat_sentence.connect(self._on_chat_sentence)
         self.event_bus.interrupt_ack.connect(self._on_interrupt_ack)
 
         # Wire up audio service
@@ -333,7 +376,35 @@ class ChatPanel(QFrame):
         if self.audio_service and not self.audio_service._always_listening:
             self.mic_btn.setChecked(False)
 
-    def _on_chat_sentence(self, sentence, request_id):
+    def _emotion_label_from_state(self, emotion_state, default=None):
+        if isinstance(emotion_state, dict):
+            label = str(emotion_state.get("label", "") or "").strip().lower()
+        else:
+            label = str(emotion_state or "").strip().lower()
+        if label in ("", "disabled", "---", "pending", "empty", "none"):
+            return default
+        return label
+
+    def _apply_delivery_emotion(self, emotion_state):
+        label = self._emotion_label_from_state(emotion_state)
+        if not label:
+            return ""
+        self._current_response_emotion = label
+        self._current_emotion = label
+        if self.voice_manager and isinstance(emotion_state, dict):
+            self.voice_manager.apply_emotion_modifiers(emotion_state)
+        return label
+
+    def _on_chat_sentence_payload(self, payload):
+        if not isinstance(payload, dict):
+            return
+        self._on_chat_sentence(
+            payload.get("sentence", ""),
+            payload.get("request_id", ""),
+            emotion=payload.get("emotion", {}) or None,
+        )
+
+    def _on_chat_sentence(self, sentence, request_id, emotion=None):
         """Server emitted a complete sentence — queue it for TTS immediately.
 
         This enables sentence-level streaming: TTS starts speaking the first
@@ -354,7 +425,9 @@ class ChatPanel(QFrame):
         if request_id and self._current_request_id and request_id != self._current_request_id:
             return
         try:
-            self._tts_queue.put_nowait((sentence, self._current_emotion))
+            delivery_emotion = self._emotion_label_from_state(emotion, self._current_emotion)
+            self._apply_delivery_emotion(emotion)
+            self._tts_queue.put_nowait((sentence, delivery_emotion))
             self._ensure_tts_worker()
         except queue.Full:
             logger.warning("[ChatPanel] TTS queue full, dropping sentence")
@@ -569,6 +642,8 @@ class ChatPanel(QFrame):
         self._full_response = ""
         self._tts_sentence_buf = ""
         self._server_sentence_streaming = False  # Reset for each new request
+        self._current_response_emotion = "neutral"
+        self._current_emotion = self._current_input_emotion or "neutral"
         drained = self._drain_tts_queue()
         if drained:
             logger.debug("[ChatPanel] Cleared %d stale TTS items before request start", drained)
@@ -676,13 +751,40 @@ class ChatPanel(QFrame):
             self.tts_session_started.emit()
             threading.Thread(target=self._tts_worker_prefetch, daemon=True).start()
 
+    def _preferred_tts_parallelism(self):
+        backend = getattr(self.voice_manager, "backend", None) if self.voice_manager else None
+        configured = getattr(backend, "synthesis_concurrency", None)
+        try:
+            return max(1, min(4, int(configured)))
+        except (TypeError, ValueError):
+            return 3
+
+    def _record_tts_chunk_ready(self, activity_seq, seq, synth_seconds, wav_path):
+        if activity_seq != self._activity_request_seq:
+            return
+        if not wav_path:
+            return
+        now = time.monotonic()
+        self._activity_tts_chunk_count = max(self._activity_tts_chunk_count, int(seq) + 1)
+        if self._activity_request_started_at > 0.0 and self._activity_first_tts_ready_duration <= 0.0:
+            self._activity_first_tts_ready_duration = max(
+                0.0,
+                now - self._activity_request_started_at,
+            )
+        logger.info(
+            "[ChatPanel] TTS chunk ready seq=%s synth=%.2fs first_audio=%.2fs",
+            seq,
+            synth_seconds,
+            self._activity_first_tts_ready_duration,
+        )
+
     def _tts_worker_prefetch(self):
         """Synthesize upcoming chunks while the current chunk is playing.
 
-        Uses a ThreadPoolExecutor so up to 3 sentences are synthesized in
-        parallel.  A sequence-numbered ordered buffer ensures playback always
-        happens in the original sentence order even when faster-synthesizing
-        chunks finish ahead of slower ones.
+        Uses a hardware-aware ThreadPoolExecutor for prefetch.  A
+        sequence-numbered ordered buffer ensures playback always happens in
+        the original sentence order even when faster-synthesizing chunks finish
+        ahead of slower ones.
         """
         if not self.voice_manager:
             with self._tts_worker_lock:
@@ -695,6 +797,7 @@ class ChatPanel(QFrame):
         import heapq
         from concurrent.futures import ThreadPoolExecutor
 
+        activity_seq = self._activity_request_seq
         ready_queue = queue.Queue(maxsize=6)
         sentinel = object()
         stop_event = threading.Event()
@@ -728,7 +831,7 @@ class ChatPanel(QFrame):
 
         def _synth_loop():
             """Submit synthesis jobs to the thread pool; put results in order."""
-            MAX_PARALLEL = 3
+            MAX_PARALLEL = self._preferred_tts_parallelism()
             executor = ThreadPoolExecutor(
                 max_workers=MAX_PARALLEL, thread_name_prefix="revia-synth"
             )
@@ -738,6 +841,7 @@ class ChatPanel(QFrame):
             def _do_synth(sentence, emotion, seq):
                 wav_path = None
                 error = ""
+                synth_t0 = time.monotonic()
                 try:
                     if sentence and hasattr(self.voice_manager, "synthesize_to_wav"):
                         wav_path, info = self.voice_manager.synthesize_to_wav(
@@ -750,6 +854,12 @@ class ChatPanel(QFrame):
                 except Exception as exc:
                     error = str(exc)
                     logger.error("[ChatPanel] TTS synthesis error: %s", exc)
+                self._record_tts_chunk_ready(
+                    activity_seq,
+                    seq,
+                    time.monotonic() - synth_t0,
+                    wav_path,
+                )
                 return seq, sentence, emotion, wav_path, error
 
             def _on_future_done(future, seq):
@@ -890,11 +1000,20 @@ class ChatPanel(QFrame):
 
     def _on_telemetry(self, data):
         emotion = data.get("emotion", {}) if isinstance(data, dict) else {}
-        label = str(emotion.get("label", "neutral")).strip().lower()
-        if label:
-            self._current_emotion = label
-        if self.voice_manager and emotion:
-            self.voice_manager.apply_emotion_modifiers(emotion)
+        input_label = self._emotion_label_from_state(emotion, "neutral")
+        if input_label:
+            self._current_input_emotion = input_label
+        response_emotion = data.get("response_emotion", {}) if isinstance(data, dict) else {}
+        response_state = ""
+        if isinstance(response_emotion, dict):
+            response_state = str(response_emotion.get("state", "") or "").strip().lower()
+        response_label = None
+        if response_state not in ("", "pending", "idle", "empty"):
+            response_label = self._emotion_label_from_state(response_emotion)
+        if response_label:
+            self._apply_delivery_emotion(response_emotion)
+        elif input_label:
+            self._current_emotion = input_label
         self._recover_stale_reply_state(data)
 
     def _on_complete_payload(self, payload):
@@ -924,6 +1043,9 @@ class ChatPanel(QFrame):
             return
         if request_id and not self._current_request_id:
             self._current_request_id = request_id
+        response_emotion = metadata.get("response_emotion", {}) if isinstance(metadata, dict) else {}
+        if isinstance(response_emotion, dict):
+            self._apply_delivery_emotion(response_emotion)
 
         # This completion belongs to the active request, so the watchdog can
         # be safely disarmed now.
@@ -1003,6 +1125,19 @@ class ChatPanel(QFrame):
         self._clear_reply_tracking()
         self._schedule_next_queued_request()
 
+        # Show thumbs rating bar for non-interrupted successful responses so
+        # user feedback can flow back to the RL reward model.
+        if success and text and error_type != "interrupted":
+            self._last_rated_request_id = request_id or ""
+            self._rating_bar.show()
+
+    def _on_rate(self, value: int):
+        """Handle thumbs-up (+1) / thumbs-down (-1) feedback for last response."""
+        rid = self._last_rated_request_id
+        self._rating_bar.hide()
+        if hasattr(self.event_bus, "reward_signal"):
+            self.event_bus.reward_signal.emit(rid, value)
+
     def interrupt_assistant_output(self):
         self._tts_sentence_buf = ""
         self._activity_interrupted = True
@@ -1035,6 +1170,8 @@ class ChatPanel(QFrame):
 
     def _begin_activity_request(self):
         now = time.monotonic()
+        self._activity_request_seq += 1
+        self._activity_request_started_at = now
         self._activity_thinking_started_at = now
         self._activity_thinking_duration = 0.0
         self._activity_generation_started_at = None
@@ -1048,6 +1185,10 @@ class ChatPanel(QFrame):
         self._activity_tts_playback_duration = 0.0
         self._activity_waiting_for_tts = False
         self._activity_interrupted = False
+        self._activity_first_token_duration = 0.0
+        self._activity_first_tts_ready_duration = 0.0
+        self._activity_first_playback_duration = 0.0
+        self._activity_tts_chunk_count = 0
         # Inject inline thinking indicator into the chat stream
         self._insert_inline_status("Thinking...")
         # Arm the hard-timeout watchdog - stops automatically when reply arrives
@@ -1058,6 +1199,8 @@ class ChatPanel(QFrame):
         if self._activity_generation_started_at is not None:
             return
         now = time.monotonic()
+        if self._activity_request_started_at > 0.0 and self._activity_first_token_duration <= 0.0:
+            self._activity_first_token_duration = max(0.0, now - self._activity_request_started_at)
         if self._activity_thinking_started_at is not None:
             self._activity_thinking_duration = max(
                 0.0,
@@ -1115,6 +1258,11 @@ class ChatPanel(QFrame):
 
     def _on_tts_playback_started(self):
         self._ensure_tts_activity_session()
+        if self._activity_request_started_at > 0.0 and self._activity_first_playback_duration <= 0.0:
+            self._activity_first_playback_duration = max(
+                0.0,
+                time.monotonic() - self._activity_request_started_at,
+            )
         if self._activity_tts_playback_started_at is None:
             self._activity_tts_playback_started_at = time.monotonic()
         self._refresh_activity_indicator()
@@ -1179,10 +1327,14 @@ class ChatPanel(QFrame):
             parts.append(f"Thinking {self._activity_thinking_duration:.1f}s")
         if self._activity_generation_duration > 0.0:
             parts.append(f"Generating {self._activity_generation_duration:.1f}s")
+        if self._activity_first_tts_ready_duration > 0.0:
+            parts.append(f"First Audio {self._activity_first_tts_ready_duration:.1f}s")
         if self._activity_tts_generation_duration > 0.0:
             parts.append(f"TTS Gen {self._activity_tts_generation_duration:.1f}s")
         if self._activity_tts_playback_duration > 0.0:
             parts.append(f"Speaking {self._activity_tts_playback_duration:.1f}s")
+        if self._activity_tts_chunk_count > 0:
+            parts.append(f"Chunks {self._activity_tts_chunk_count}")
         if not parts:
             self._activity_summary = "Interrupted" if self._activity_interrupted else "Ready"
         else:
@@ -1190,6 +1342,7 @@ class ChatPanel(QFrame):
             if self._activity_interrupted:
                 summary = f"Interrupted | {summary}"
             self._activity_summary = summary
+            logger.info("[ChatPanel] Turn latency summary: %s", self._activity_summary)
         self._refresh_activity_indicator()
 
     def _current_activity_text(self):

@@ -98,6 +98,70 @@ class TestHardwareProfiler(unittest.TestCase):
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertIn("cuda_devices", data)
 
+    def test_multi_gpu_auto_routes_best_to_llm_and_secondary_to_support(self):
+        fp = HardwareFingerprint(
+            has_cuda=True,
+            cuda_devices=[
+                GpuInfo(index=0, name="NVIDIA RTX 2070 Super", vram_total_mb=8192),
+                GpuInfo(index=1, name="NVIDIA RTX 5070", vram_total_mb=12288),
+            ],
+        )
+        policy = HardwareProfiler.normalize_hardware_policy(fp, {
+            "hardware_mode": "auto_recommended",
+        })
+        roles = HardwareProfiler.resolve_gpu_roles(fp, policy)
+        self.assertEqual(policy["hardware_mode"], "multi_gpu_auto")
+        self.assertEqual(roles["main_llm_gpu_index"], 1)
+        self.assertEqual(roles["support_gpu_index"], 0)
+        self.assertIn("text_to_speech", roles["support_tasks"])
+        self.assertFalse(policy["allow_model_splitting"])
+        self.assertFalse(roles["model_splitting"]["enabled"])
+
+    def test_advanced_multi_gpu_only_allows_not_enables_splitting(self):
+        fp = HardwareFingerprint(
+            has_cuda=True,
+            cuda_devices=[
+                GpuInfo(index=0, name="NVIDIA RTX 2070 Super", vram_total_mb=8192),
+                GpuInfo(index=1, name="NVIDIA RTX 5070", vram_total_mb=12288),
+            ],
+        )
+        policy = HardwareProfiler.normalize_hardware_policy(fp, {
+            "hardware_mode": "advanced_multi_gpu",
+        })
+        roles = HardwareProfiler.resolve_gpu_roles(fp, policy)
+        self.assertTrue(policy["allow_model_splitting"])
+        self.assertTrue(roles["model_splitting"]["allowed_by_policy"])
+        self.assertFalse(roles["model_splitting"]["enabled"])
+        self.assertIn("performance checks", roles["model_splitting"]["reason"])
+
+    def test_detected_single_low_vram_gpu_coerces_multi_gpu_policy(self):
+        fp = HardwareFingerprint(
+            has_cuda=True,
+            cuda_devices=[
+                GpuInfo(
+                    index=0,
+                    name="NVIDIA GeForce RTX 3070 Laptop GPU",
+                    vram_total_mb=8192,
+                ),
+            ],
+            suggested_profile="low_8gb",
+        )
+        policy = HardwareProfiler.normalize_hardware_policy(fp, {
+            "hardware_mode": "multi_gpu_auto",
+            "main_llm_gpu": "auto_best",
+            "support_gpu": "auto_secondary",
+            "allow_model_splitting": False,
+            "allow_parallel_agents": True,
+            "fallback_to_cpu": True,
+        })
+        roles = HardwareProfiler.resolve_gpu_roles(fp, policy)
+        self.assertEqual(policy["hardware_mode"], "single_gpu_auto")
+        self.assertFalse(policy["allow_parallel_agents"])
+        self.assertEqual(roles["main_llm_gpu_index"], 0)
+        self.assertIsNone(roles["support_gpu_index"])
+        self.assertEqual(roles["support_tasks"], [])
+        self.assertFalse(roles["model_splitting"]["enabled"])
+
 
 # ---------------------------------------------------------------------------
 # HardwareAgent

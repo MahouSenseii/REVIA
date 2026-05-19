@@ -15,6 +15,14 @@ from PySide6.QtCore import QProcess, QTimer, Signal
 
 from gui.widgets.settings_card import SettingsCard
 
+from app.hardware_routing import (
+    default_hardware_policy,
+    detect_nvidia_smi_gpus,
+    normalize_hardware_policy,
+    read_saved_hardware_policy,
+    resolve_gpu_roles,
+    write_profile_hardware_policy,
+)
 from app.ui_status import apply_status_style, clear_status_role
 
 logger = logging.getLogger(__name__)
@@ -35,6 +43,9 @@ class ModelTab(QScrollArea):
         self._loading = True  # guard: prevents saving while loading
         self._pending_source = None  # source to push once core connects
         self._llm_server_kind = ""
+        self._hardware_gpus = []
+        self._hardware_roles = {}
+        self._hardware_policy = read_saved_hardware_policy()
         self.setWidgetResizable(True)
 
         container = QWidget()
@@ -319,6 +330,37 @@ class ModelTab(QScrollArea):
         ])
         gg.addRow("Quantization:", self.quant)
 
+        self.hardware_mode = QComboBox()
+        self.hardware_mode.addItem("Auto Recommended", "auto_recommended")
+        self.hardware_mode.addItem("Single GPU", "single_gpu")
+        self.hardware_mode.addItem("Advanced Multi-GPU", "advanced_multi_gpu")
+        gg.addRow("GPU Routing:", self.hardware_mode)
+
+        self.main_gpu_combo = QComboBox()
+        self.main_gpu_combo.addItem("Auto best", "auto_best")
+        gg.addRow("Single GPU:", self.main_gpu_combo)
+
+        self.hardware_status = QLabel("GPU routing: not detected yet")
+        self.hardware_status.setWordWrap(True)
+        self.hardware_status.setFont(QFont("Consolas", 8))
+        self.hardware_status.setObjectName("metricLabel")
+        gg.addRow("Detected:", self.hardware_status)
+
+        hw_btn_row = QHBoxLayout()
+        detect_hw_btn = QPushButton("Detect / Optimize")
+        detect_hw_btn.setObjectName("secondaryBtn")
+        detect_hw_btn.clicked.connect(
+            lambda _checked=False: self._refresh_hardware_routing(
+                apply_recommendations=True
+            )
+        )
+        hw_btn_row.addWidget(detect_hw_btn)
+        apply_hw_btn = QPushButton("Apply Routing")
+        apply_hw_btn.setObjectName("primaryBtn")
+        apply_hw_btn.clicked.connect(self._apply_hardware_routing)
+        hw_btn_row.addWidget(apply_hw_btn)
+        gg.addRow("", hw_btn_row)
+
         self.gpu_card.add_layout(gg)
         layout.addWidget(self.gpu_card)
 
@@ -403,6 +445,8 @@ class ModelTab(QScrollArea):
         self._connect_save_signal(self.batch_size.valueChanged)
         self._connect_save_signal(self.threads.valueChanged)
         self._connect_save_signal(self.quant.currentTextChanged)
+        self._connect_save_signal(self.hardware_mode.currentTextChanged)
+        self._connect_save_signal(self.main_gpu_combo.currentTextChanged)
 
     # --- Slots ---
 
@@ -642,6 +686,11 @@ class ModelTab(QScrollArea):
             apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
 
+        route_label = ""
+        if self.local_backend.currentText().strip().upper() in {"CUDA", "GPU"}:
+            route_env, route_label = self._main_llm_gpu_env_updates()
+            env_updates.update(route_env)
+
         self._kill_port_listener(port)
 
         self._llm_process = QProcess(self)
@@ -669,6 +718,10 @@ class ModelTab(QScrollArea):
 
         cmd_str = Path(exe).name + " " + " ".join(args)
         self.event_bus.log_entry.emit(f"[LLM] Starting: {cmd_str}")
+        if route_label:
+            self.event_bus.log_entry.emit(
+                f"[Hardware] Local LLM routed to {route_label}; model splitting disabled by default."
+            )
         self._llm_ready_attempts = 0
 
         # Keep URL aligned with server launch settings.
@@ -831,6 +884,428 @@ class ModelTab(QScrollArea):
             self._save_settings()
 
     # ------------------------------------------------------------------
+    # Hardware routing
+    # ------------------------------------------------------------------
+
+    def _hardware_mode_key(self):
+        return self.hardware_mode.currentData() or "auto_recommended"
+
+    def _current_hardware_policy(self):
+        gpu_count = len(self._hardware_gpus)
+        mode = self._hardware_mode_key()
+        if mode == "auto_recommended" and gpu_count == 0:
+            saved_mode = str((self._hardware_policy or {}).get("hardware_mode") or "")
+            if saved_mode and saved_mode != "cpu_only":
+                return normalize_hardware_policy(self._hardware_policy, gpu_count)
+        if mode == "single_gpu":
+            selected = self.main_gpu_combo.currentData()
+            policy = {
+                "hardware_mode": "single_gpu",
+                "main_llm_gpu": selected if selected is not None else "auto_best",
+                "support_gpu": "cpu",
+                "allow_model_splitting": False,
+                "allow_parallel_agents": True,
+                "fallback_to_cpu": True,
+            }
+        elif mode == "advanced_multi_gpu":
+            policy = {
+                "hardware_mode": "advanced_multi_gpu",
+                "main_llm_gpu": "auto_best",
+                "support_gpu": "auto_secondary",
+                "allow_model_splitting": True,
+                "allow_parallel_agents": True,
+                "fallback_to_cpu": True,
+            }
+        else:
+            policy = default_hardware_policy(gpu_count)
+            if gpu_count > 1:
+                policy["hardware_mode"] = "multi_gpu_auto"
+                policy["main_llm_gpu"] = "auto_best"
+                policy["support_gpu"] = "auto_secondary"
+            elif gpu_count == 1:
+                policy["hardware_mode"] = "single_gpu_auto"
+                policy["main_llm_gpu"] = "auto_best"
+                policy["support_gpu"] = "cpu"
+                policy["allow_parallel_agents"] = False
+        self._hardware_policy = normalize_hardware_policy(policy, gpu_count)
+        return dict(self._hardware_policy)
+
+    def _apply_policy_to_controls(self, policy):
+        if not isinstance(policy, dict):
+            return
+        self._hardware_policy = normalize_hardware_policy(
+            policy, len(self._hardware_gpus)
+        )
+        mode = str(policy.get("hardware_mode") or "").lower()
+        target = "auto_recommended"
+        if mode == "single_gpu":
+            target = "single_gpu"
+        elif mode in {"advanced_multi_gpu", "multi_gpu_advanced"}:
+            target = "advanced_multi_gpu"
+        for i in range(self.hardware_mode.count()):
+            if self.hardware_mode.itemData(i) == target:
+                self.hardware_mode.blockSignals(True)
+                self.hardware_mode.setCurrentIndex(i)
+                self.hardware_mode.blockSignals(False)
+                break
+
+        main = policy.get("main_llm_gpu")
+        if isinstance(main, int) or str(main or "").isdigit():
+            main = int(main)
+            for i in range(self.main_gpu_combo.count()):
+                if self.main_gpu_combo.itemData(i) == main:
+                    self.main_gpu_combo.blockSignals(True)
+                    self.main_gpu_combo.setCurrentIndex(i)
+                    self.main_gpu_combo.blockSignals(False)
+                    break
+
+    def _populate_gpu_combo(self, gpus):
+        current = self.main_gpu_combo.currentData()
+        self.main_gpu_combo.blockSignals(True)
+        self.main_gpu_combo.clear()
+        self.main_gpu_combo.addItem("Auto best", "auto_best")
+        for gpu in gpus:
+            try:
+                idx = int(gpu.get("index"))
+            except (TypeError, ValueError):
+                continue
+            name = str(gpu.get("name") or f"GPU {idx}")
+            total = float(gpu.get("vram_total_mb", 0) or 0) / 1024.0
+            used = float(gpu.get("vram_used_mb", 0) or 0) / 1024.0
+            load = float(gpu.get("load_percent", gpu.get("gpu_percent", 0.0)) or 0.0)
+            self.main_gpu_combo.addItem(
+                f"{idx}: {name} ({total:.1f} GB, {used:.1f} used, {load:.0f}% load)",
+                idx,
+            )
+        for i in range(self.main_gpu_combo.count()):
+            if self.main_gpu_combo.itemData(i) == current:
+                self.main_gpu_combo.setCurrentIndex(i)
+                break
+        self.main_gpu_combo.blockSignals(False)
+
+    def _describe_hardware_routing(self, gpus, roles, policy):
+        if not gpus:
+            return "No CUDA GPU detected. REVIA will use CPU fallback."
+        lines = [f"REVIA detected {len(gpus)} GPU{'s' if len(gpus) != 1 else ''}:"]
+        for gpu in gpus:
+            idx = gpu.get("index", "?")
+            name = str(gpu.get("name") or f"GPU {idx}")
+            total = float(gpu.get("vram_total_mb", 0) or 0) / 1024.0
+            used = float(gpu.get("vram_used_mb", 0) or 0) / 1024.0
+            load = float(gpu.get("load_percent", gpu.get("gpu_percent", 0.0)) or 0.0)
+            lines.append(f"{idx}. {name} | {total:.1f} GB VRAM | {used:.1f} used | {load:.0f}% load")
+        main = roles.get("main_llm_gpu_name") or roles.get("main_llm_gpu_index")
+        support = roles.get("support_gpu_name") or roles.get("support_gpu_index") or "CPU fallback"
+        split = roles.get("model_splitting", {}) or {}
+        lines.append(f"Main LLM: {main}")
+        lines.append(f"Support: {support}")
+        lines.append(
+            "Model splitting: "
+            + ("allowed, not enabled yet" if split.get("allowed_by_policy") else "disabled")
+        )
+        lines.append(f"Mode: {policy.get('hardware_mode')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _gpu_float(gpu, key, fallback=0.0):
+        try:
+            return float(gpu.get(key, fallback) or fallback)
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    def _selected_main_gpu(self, gpus, roles):
+        main_idx = roles.get("main_llm_gpu_index")
+        for gpu in gpus:
+            try:
+                if int(gpu.get("index")) == int(main_idx):
+                    return gpu
+            except (TypeError, ValueError):
+                continue
+        if not gpus:
+            return None
+        return max(
+            gpus,
+            key=lambda gpu: (
+                self._gpu_float(gpu, "vram_total_mb"),
+                self._gpu_float(gpu, "vram_free_mb", self._gpu_float(gpu, "vram_total_mb")),
+                -self._gpu_float(gpu, "load_percent", self._gpu_float(gpu, "gpu_percent")),
+            ),
+        )
+
+    def _model_recommendations_for_hardware(self, gpus, roles):
+        threads = max(4, min(8, int((os.cpu_count() or 8) - 2)))
+        main_gpu = self._selected_main_gpu(gpus, roles)
+        if not main_gpu:
+            return {
+                "profile": "cpu_fallback",
+                "local_backend": "CPU",
+                "srv_gpu_layers": 0,
+                "gpu_layers": 0,
+                "srv_ctx": 2048,
+                "ctx_length": 2048,
+                "batch_size": 64,
+                "max_tokens": 160,
+                "threads": threads,
+                "fast_mode": False,
+            }
+
+        vram_mb = self._gpu_float(main_gpu, "vram_total_mb")
+        model_path = self.local_path.text().lower()
+        quant = self.quant.currentText()
+        if "q5_k_s" in model_path:
+            quant = "Q5_K_S"
+        elif "q4_k_m" in model_path:
+            quant = "Q4_K_M"
+
+        if vram_mb < 9 * 1024:
+            return {
+                "profile": "cuda_8gb_balanced",
+                "local_backend": "CUDA",
+                "local_loader": "llama.cpp",
+                "local_format": "GGUF (llama.cpp)",
+                "srv_gpu_layers": 28,
+                "gpu_layers": 28,
+                "srv_ctx": 3072,
+                "ctx_length": 3072,
+                "batch_size": 128,
+                "max_tokens": 220,
+                "threads": threads,
+                "quant": quant,
+                "fast_mode": False,
+            }
+        if vram_mb < 17 * 1024:
+            return {
+                "profile": "cuda_12gb_balanced",
+                "local_backend": "CUDA",
+                "local_loader": "llama.cpp",
+                "local_format": "GGUF (llama.cpp)",
+                "srv_gpu_layers": -1,
+                "gpu_layers": 40,
+                "srv_ctx": 4096,
+                "ctx_length": 4096,
+                "batch_size": 256,
+                "max_tokens": 384,
+                "threads": threads,
+                "quant": quant,
+                "fast_mode": False,
+            }
+        return {
+            "profile": "cuda_high_vram",
+            "local_backend": "CUDA",
+            "local_loader": "llama.cpp",
+            "local_format": "GGUF (llama.cpp)",
+            "srv_gpu_layers": -1,
+            "gpu_layers": 60,
+            "srv_ctx": 8192,
+            "ctx_length": 8192,
+            "batch_size": 512,
+            "max_tokens": 512,
+            "threads": threads,
+            "quant": quant,
+            "fast_mode": False,
+        }
+
+    def _set_combo_text_if_present(self, combo, text):
+        if not text:
+            return
+        idx = combo.findText(str(text))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _apply_model_recommendations(self, gpus, roles, *, save=True):
+        rec = self._model_recommendations_for_hardware(gpus, roles)
+        widgets = [
+            self.local_backend, self.local_loader, self.local_format,
+            self.srv_gpu_layers, self.gpu_layers, self.srv_ctx, self.ctx_length,
+            self.batch_size, self.max_tokens, self.threads, self.quant,
+            self.fast_mode,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self._set_combo_text_if_present(self.local_backend, rec.get("local_backend"))
+            self._set_combo_text_if_present(self.local_loader, rec.get("local_loader"))
+            self._set_combo_text_if_present(self.local_format, rec.get("local_format"))
+            self.srv_gpu_layers.setValue(int(rec["srv_gpu_layers"]))
+            self.gpu_layers.setValue(int(rec["gpu_layers"]))
+            self.srv_ctx.setValue(int(rec["srv_ctx"]))
+            self.ctx_length.setValue(int(rec["ctx_length"]))
+            self.batch_size.setValue(int(rec["batch_size"]))
+            self.max_tokens.setValue(int(rec["max_tokens"]))
+            self.threads.setValue(int(rec["threads"]))
+            if rec.get("quant"):
+                self._set_combo_text_if_present(self.quant, rec.get("quant"))
+            self.fast_mode.setChecked(bool(rec.get("fast_mode", False)))
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+        main_gpu = self._selected_main_gpu(gpus, roles)
+        label = str(main_gpu.get("name")) if main_gpu else "CPU"
+        detail = (
+            f"Optimized model tab for {label}: "
+            f"{rec['profile']}, ctx={rec['ctx_length']}, "
+            f"gpu_layers={rec['srv_gpu_layers']}, batch={rec['batch_size']}, "
+            f"max_tokens={rec['max_tokens']}"
+        )
+        self.event_bus.log_entry.emit(f"[Hardware] {detail}")
+        if save:
+            self._save_settings()
+        return detail
+
+    def _describe_model_recommendations(self, gpus, roles):
+        rec = self._model_recommendations_for_hardware(gpus, roles)
+        main_gpu = self._selected_main_gpu(gpus, roles)
+        label = str(main_gpu.get("name")) if main_gpu else "CPU"
+        return (
+            f"Recommended for {label}: {rec['profile']}, "
+            f"ctx={rec['ctx_length']}, gpu_layers={rec['srv_gpu_layers']}, "
+            f"batch={rec['batch_size']}, max_tokens={rec['max_tokens']} "
+            "(not applied)"
+        )
+
+    def _refresh_hardware_routing(self, _checked=False, *, apply_recommendations=False):
+        self.hardware_status.setText("Detecting GPUs...")
+        apply_status_style(self.hardware_status, "color: #ccaa00;")
+
+        def _fallback_local(_error=None, _detail=None):
+            gpus = detect_nvidia_smi_gpus()
+            self._hardware_gpus = gpus
+            policy = self._current_hardware_policy() if gpus else default_hardware_policy(0)
+            roles = resolve_gpu_roles(gpus, policy)
+            self._hardware_policy = policy
+            self._hardware_roles = roles
+            self._populate_gpu_combo(gpus)
+            optimize_detail = (
+                self._apply_model_recommendations(gpus, roles, save=True)
+                if apply_recommendations
+                else self._describe_model_recommendations(gpus, roles)
+            )
+            self.hardware_status.setText(
+                self._describe_hardware_routing(gpus, roles, policy)
+                + "\n"
+                + optimize_detail
+            )
+            apply_status_style(
+                self.hardware_status,
+                "color: #00aa40;" if gpus else "color: #ccaa00;",
+            )
+
+        def _on_success(data):
+            if not isinstance(data, dict):
+                _fallback_local()
+                return
+            fingerprint = data.get("fingerprint", {}) or {}
+            gpus = list(fingerprint.get("cuda_devices") or [])
+            if not gpus:
+                snapshot = data.get("snapshot", {}) or {}
+                gpus = list(snapshot.get("gpus") or [])
+            routing = data.get("routing", {}) or {}
+            policy = (
+                routing.get("policy")
+                if gpus
+                else default_hardware_policy(0)
+            ) or self._current_hardware_policy()
+            roles = routing.get("roles") or resolve_gpu_roles(gpus, policy)
+            self._hardware_gpus = gpus
+            self._hardware_roles = roles
+            self._hardware_policy = policy
+            self._populate_gpu_combo(gpus)
+            self._apply_policy_to_controls(policy)
+            optimize_detail = (
+                self._apply_model_recommendations(gpus, roles, save=True)
+                if apply_recommendations
+                else self._describe_model_recommendations(gpus, roles)
+            )
+            self.hardware_status.setText(
+                self._describe_hardware_routing(gpus, roles, policy)
+                + "\n"
+                + optimize_detail
+            )
+            apply_status_style(
+                self.hardware_status,
+                "color: #00aa40;" if gpus else "color: #ccaa00;",
+            )
+
+        self.client.get_async(
+            "/api/agents/hardware",
+            timeout=4,
+            default={},
+            on_success=_on_success,
+            on_error=_fallback_local,
+        )
+
+    def _apply_hardware_routing(self):
+        if not self._hardware_gpus:
+            self._hardware_gpus = detect_nvidia_smi_gpus()
+            self._populate_gpu_combo(self._hardware_gpus)
+        policy = self._current_hardware_policy()
+        roles = resolve_gpu_roles(self._hardware_gpus, policy)
+        self._hardware_policy = policy
+        self._hardware_roles = roles
+        optimize_detail = self._apply_model_recommendations(
+            self._hardware_gpus, roles, save=False
+        )
+        self._save_settings()
+        try:
+            write_profile_hardware_policy(
+                policy,
+                roles=roles,
+                detected_gpus=self._hardware_gpus,
+            )
+        except Exception as exc:
+            self.event_bus.log_entry.emit(
+                f"[Hardware] Could not update profile settings: {exc}"
+            )
+
+        self.hardware_status.setText(
+            self._describe_hardware_routing(self._hardware_gpus, roles, policy)
+            + "\n"
+            + optimize_detail
+        )
+        apply_status_style(self.hardware_status, "color: #00aa40;")
+
+        def _on_success(data):
+            if isinstance(data, dict):
+                self._hardware_roles = data.get("roles") or self._hardware_roles
+            self.event_bus.log_entry.emit(
+                f"[Hardware] Routing saved: {policy.get('hardware_mode')}"
+            )
+            self._refresh_hardware_routing()
+
+        def _on_error(error=None, detail=None):
+            self.event_bus.log_entry.emit(
+                f"[Hardware] Routing saved locally; core sync pending: {error or detail or 'offline'}"
+            )
+
+        self.client.post_async(
+            "/api/hardware/config",
+            json={"policy": policy},
+            timeout=5,
+            default={},
+            on_success=_on_success,
+            on_error=_on_error,
+        )
+
+    def _main_llm_gpu_env_updates(self):
+        policy = self._current_hardware_policy()
+        gpus = self._hardware_gpus or detect_nvidia_smi_gpus()
+        roles = resolve_gpu_roles(gpus, policy)
+        self._hardware_roles = roles
+        visible = roles.get("visible_main_llm_devices") or []
+        if not visible:
+            return {}, ""
+        main = visible[0]
+        updates = {
+            "CUDA_VISIBLE_DEVICES": str(main),
+            "REVIA_MAIN_LLM_GPU": str(main),
+        }
+        support = roles.get("support_gpu_index")
+        if support is not None:
+            updates["REVIA_SUPPORT_GPU"] = str(support)
+        return updates, f"main GPU {main}"
+
+    # ------------------------------------------------------------------
     # Settings persistence
     # ------------------------------------------------------------------
 
@@ -873,9 +1348,18 @@ class ModelTab(QScrollArea):
             "batch_size": self.batch_size.value(),
             "threads": self.threads.value(),
             "quant": self.quant.currentText(),
+            "hardware_policy": self._current_hardware_policy(),
         }
         try:
             _SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            try:
+                write_profile_hardware_policy(
+                    data["hardware_policy"],
+                    roles=self._hardware_roles,
+                    detected_gpus=self._hardware_gpus,
+                )
+            except Exception:
+                pass
             self._save_secret_settings()
         except Exception as e:
             self.event_bus.log_entry.emit(f"[Model] Could not save settings: {e}")
@@ -931,6 +1415,8 @@ class ModelTab(QScrollArea):
             logger.warning(f"Error loading model settings: {e}")
             return
         data.update(self._load_secret_settings())
+        if not isinstance(data.get("hardware_policy"), dict):
+            data["hardware_policy"] = read_saved_hardware_policy()
 
         self._loading = True
         try:
@@ -1024,6 +1510,7 @@ class ModelTab(QScrollArea):
                 idx = self.quant.findText(quant)
                 if idx >= 0:
                     self.quant.setCurrentIndex(idx)
+            self._apply_policy_to_controls(data.get("hardware_policy") or {})
 
             # Apply source-page visibility
             self._on_source_changed(src)
@@ -1136,6 +1623,7 @@ class ModelTab(QScrollArea):
             "ctx_length": self.ctx_length.value(),
             "fast_mode": self.fast_mode.isChecked(),
             "verified": bool(verified),
+            "hardware_policy": self._current_hardware_policy(),
         }
         if source == "local":
             cfg["local_path"] = self.local_path.text().strip()
@@ -1363,6 +1851,7 @@ class ModelTab(QScrollArea):
             if self._pending_source:
                 self._push_config_to_core(self._pending_source)
                 self._pending_source = None
+            self._refresh_hardware_routing()
         else:
             self.conn_status.setText("Status: Waiting for core status...")
             apply_status_style(self.conn_status, "color: #ccaa00;")

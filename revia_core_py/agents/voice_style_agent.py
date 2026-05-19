@@ -204,7 +204,7 @@ class VoiceStyleAgent(Agent):
     @staticmethod
     def _signature_phrase(intent_label: str, tone: str) -> str:
         if intent_label == "greeting":
-            return "" if tone == "focused" else "hey there"
+            return ""
         if intent_label == "farewell":
             return "talk soon"
         if intent_label == "compliment" and tone in ("playful", "warm"):

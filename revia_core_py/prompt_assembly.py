@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from persona_manager import DEFAULT_PROMPT_PROFILE, normalize_profile
 from runtime_models import ResponseMode
 
@@ -7,6 +9,7 @@ from runtime_models import ResponseMode
 class CharacterProfileManager:
     def __init__(self, log_fn):
         self._log = log_fn
+        self._context_cache: dict[tuple[bool, str], str] = {}
 
     def get_active_profile(self, profile: dict | None) -> dict:
         merged = normalize_profile(profile)
@@ -39,6 +42,15 @@ class CharacterProfileManager:
 
     def build_character_context(self, profile: dict | None, *, include_greeting_instruction: bool = False) -> str:
         prof = self.get_active_profile(profile)
+        try:
+            cache_blob = json.dumps(prof, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            cache_blob = str(prof)
+        cache_key = (bool(include_greeting_instruction), cache_blob)
+        cached = self._context_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         persona_def = prof.get("persona_definition", {}) or {}
         interaction = persona_def.get("interaction_style", {}) or {}
 
@@ -167,7 +179,12 @@ class CharacterProfileManager:
         parts.append(
             f"Active persona confirmation: you are {name}."
         )
-        return "\n".join(parts)
+        context = "\n".join(parts)
+        self._context_cache[cache_key] = context
+        if len(self._context_cache) > 16:
+            oldest_key = next(iter(self._context_cache))
+            self._context_cache.pop(oldest_key, None)
+        return context
 
     def validate_profile_context(self, profile: dict | None) -> tuple[bool, list[str]]:
         prof = normalize_profile(profile)

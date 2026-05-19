@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 import unittest
 
 # Make the package directory importable when running this file directly.
@@ -71,14 +70,14 @@ class TestFSMWatchdog(unittest.TestCase):
 
     def test_force_recover_unsticks_thinking_after_timeout(self):
         self._drive_to_thinking()
-        time.sleep(0.06)
+        self.sm._state_entered_at -= 0.1
         recovered = self.sm.force_recover_if_stuck(thinking_timeout_s=0.05)
         self.assertTrue(recovered)
         self.assertEqual(self.sm.state, self.RS.IDLE.value)
 
     def test_evaluate_recovers_stuck_thinking_and_allows_user_reply(self):
         self._drive_to_thinking()
-        time.sleep(0.06)  # exceed timeout
+        self.sm._state_entered_at -= 0.1
         trigger = self.TR(
             source=self.TS.USER_MESSAGE.value,
             kind=self.TK.RESPONSE.value,

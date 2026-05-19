@@ -691,6 +691,7 @@ class AssistantStatusManager(QObject):
         with self._telemetry_lock:
             telemetry = dict(self._last_telemetry or {})
         emotion = telemetry.get("emotion", {}) or {}
+        response_emotion = telemetry.get("response_emotion", {}) or {}
         llm = telemetry.get("llm_connection", {}) or {}
         runtime = telemetry.get("runtime_status", {}) or {}
         source_is_online = self.model_tab.source_type.currentIndex() == 1
@@ -733,8 +734,14 @@ class AssistantStatusManager(QObject):
             or local_model_name
             or "None"
         )
+        response_state = str(response_emotion.get("state", "") or "").strip().lower()
         current_emotion = str(
-            emotion.get("label")
+            (
+                response_emotion.get("label")
+                if response_state not in ("", "pending", "idle", "empty")
+                else ""
+            )
+            or emotion.get("label")
             or runtime.get("current_emotion")
             or "Neutral"
         )

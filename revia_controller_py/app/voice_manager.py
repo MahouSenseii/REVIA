@@ -131,8 +131,10 @@ class VoiceManager(QObject):
         self.backend.play_wav_sync(wav_path)
 
     def apply_emotion_modifiers(self, emotion_state):
-        """Called by EmotionNet to update current emotion."""
-        label = emotion_state.get("label", "neutral").lower()
+        """Update the delivery emotion used by the active TTS backend."""
+        label = str(emotion_state.get("label", "neutral") or "neutral").strip().lower()
+        if label in ("", "disabled", "---", "pending", "empty"):
+            label = "neutral"
         self._current_emotion = label
 
     # Generation methods (produce WAV files)

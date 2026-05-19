@@ -70,8 +70,20 @@ class EventBus(QObject):
         (sentence_text, request_id) — a complete sentence extracted from the
         LLM stream, ready for TTS synthesis. Emitted in streaming order.
 
+    chat_sentence_payload(object -> dict)
+        Enriched sentence event with optional response emotion metadata:
+        {"sentence": str, "request_id": str, "emotion": dict, ...}.
+
     interrupt_ack()
         No payload. Server acknowledged a barge-in / interrupt request.
+
+    connection_retry_attempt(int)
+        Emitted when the server connection fails and a retry is scheduled.
+        Payload: attempt number (1, 2, 3, ...).
+
+    connection_retry_waiting(int)
+        Emitted after retry is scheduled, with the wait time.
+        Payload: milliseconds to wait before next retry attempt.
     """
     telemetry_updated = Signal(dict)
     status_changed = Signal(str)
@@ -90,10 +102,18 @@ class EventBus(QObject):
     camera_frame = Signal(QPixmap)
     proactive_start = Signal()
     chat_sentence = Signal(str, str)  # (sentence_text, request_id)
+    chat_sentence_payload = Signal(object)
     interrupt_ack = Signal()
+
+    # Connection retry feedback signals
+    connection_retry_attempt = Signal(int)     # attempt number
+    connection_retry_waiting = Signal(int)     # milliseconds to wait
 
     # Sing mode signals
     sing_state_changed = Signal(str)           # new state string
     sing_progress = Signal(str, int, int)      # (stage, current, total)
     sing_lyrics_update = Signal(int, str)      # (line_index, lyric_text)
     sing_queue_changed = Signal()              # queue was modified
+
+    # User feedback / RL reward signals
+    reward_signal = Signal(str, int)           # (request_id, value: +1 thumbs-up / -1 thumbs-down)

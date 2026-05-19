@@ -1,5 +1,6 @@
 """TTS backend for REVIA. Supports Qwen3-TTS via gradio_client and local pyttsx3 fallback."""
 import logging
+import os
 import re
 import json
 import sys
@@ -41,13 +42,26 @@ QWEN_LANGUAGES = [
 ]
 
 QWEN_MODEL_SIZES = ["0.6B", "1.7B"]
+_QWEN_READY_SUCCESS_TTL_S = 3.0
+_QWEN_READY_FAILURE_TTL_S = 1.0
+_DEFAULT_SYNTH_CONCURRENCY = 3
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_MODEL_SETTINGS_FILE = _PROJECT_ROOT / "model_settings.json"
+_PROFILE_SETTINGS_FILE = _PROJECT_ROOT / "profile_settings.json"
 
 # Emotion-based TTS style instructions for natural speech variation
 _EMOTION_STYLE_MAP = {
     "happy": "Speak with bright, upbeat energy and a warm smile in your voice",
     "excited": "Speak with high energy, faster pace, and enthusiastic emphasis",
+    "curious": "Speak with engaged, inquisitive energy and clear upward emphasis",
     "sad": "Speak softly, slowly, with a gentle melancholic tone",
     "angry": "Speak with sharp, clipped intensity and firm emphasis",
+    "frustrated": "Speak with restrained tension, direct pacing, and controlled emphasis",
+    "fear": "Speak cautiously with softer volume and careful pacing",
+    "lonely": "Speak warmly and intimately, with a gentle connected tone",
+    "concerned": "Speak with calm seriousness, warmth, and steady pacing",
+    "confident": "Speak clearly with steady pace, grounded confidence, and direct emphasis",
     "nervous": "Speak with slight hesitation, softer volume, and uncertain pacing",
     "amused": "Speak with a light, playful lilt and hint of laughter",
     "neutral": "Speak naturally with balanced pacing and clear tone",
@@ -71,6 +85,70 @@ _STYLE_DIRECTIVE_HINTS = (
     "balanced",
     "clear",
 )
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _coerce_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_synth_concurrency(value) -> int:
+    return max(1, min(4, _coerce_int(value, _DEFAULT_SYNTH_CONCURRENCY)))
+
+
+def _saved_tts_hardware_context() -> tuple[dict, list[dict]]:
+    model = _read_json_file(_MODEL_SETTINGS_FILE)
+    profile = _read_json_file(_PROFILE_SETTINGS_FILE)
+
+    policy = model.get("hardware_policy")
+    if not isinstance(policy, dict):
+        hardware = profile.get("hardware")
+        if isinstance(hardware, dict):
+            policy = hardware.get("routing_policy") or hardware
+    if not isinstance(policy, dict):
+        policy = {}
+
+    hardware = profile.get("hardware") if isinstance(profile.get("hardware"), dict) else {}
+    gpus = hardware.get("detected_gpus") if isinstance(hardware, dict) else []
+    if not isinstance(gpus, list):
+        gpus = []
+    return policy, [gpu for gpu in gpus if isinstance(gpu, dict)]
+
+
+def _recommended_synth_concurrency() -> int:
+    override = os.environ.get("REVIA_TTS_MAX_PARALLEL")
+    if override:
+        return _clamp_synth_concurrency(override)
+
+    policy, gpus = _saved_tts_hardware_context()
+    mode = str(policy.get("hardware_mode") or "").strip().lower()
+    support = str(policy.get("support_gpu") or "").strip().lower()
+    allow_parallel = bool(policy.get("allow_parallel_agents", True))
+
+    if len(gpus) > 1 and support not in {"", "cpu", "none"} and allow_parallel:
+        return 3
+
+    if len(gpus) == 1:
+        vram = _coerce_int(gpus[0].get("vram_total_mb"), 0)
+        if vram and vram <= 6 * 1024:
+            return 1
+        return 2
+
+    if mode.startswith("single_gpu") or (support in {"cpu", "none"} and not allow_parallel):
+        return 2
+    if mode == "cpu_only":
+        return 2
+    return _DEFAULT_SYNTH_CONCURRENCY
 
 
 def _strip_leading_style_directives(text: str) -> str:
@@ -115,7 +193,8 @@ class QwenTTSBackend(QObject):
         self._lock = threading.Lock()          # guards _qwen_clients, _output_device
         self._pyttsx3_lock = threading.Lock()  # guards _pyttsx3_engine exclusively (separate from _lock
                                                # so device-routing reads never wait on synthesis)
-        self._synth_semaphore = threading.Semaphore(3)  # allows up to 3 parallel Gradio synthesis calls
+        self._synth_max_parallel = _recommended_synth_concurrency()
+        self._synth_semaphore = threading.Semaphore(self._synth_max_parallel)
         self._metrics_lock = threading.Lock()  # guards last_metrics only
         self._engine_name = "qwen3-tts"
         self._qwen_url = ""  # custom Qwen3-TTS server URL (Gradio)
@@ -126,6 +205,8 @@ class QwenTTSBackend(QObject):
         # to "hang" while the inspect call was in flight).
         self._qwen_api_cache = {}
         self._qwen_api_cache_lock = threading.Lock()
+        self._qwen_ready_cache = {}
+        self._qwen_ready_cache_lock = threading.Lock()
         self._pyttsx3_voice_id = None
         self._pyttsx3_engine = None
         self.last_metrics = TTSMetrics()
@@ -146,6 +227,18 @@ class QwenTTSBackend(QObject):
 
     def set_engine(self, name):
         self._engine_name = name
+
+    @property
+    def synthesis_concurrency(self):
+        return self._synth_max_parallel
+
+    def set_synthesis_concurrency(self, max_parallel):
+        max_parallel = _clamp_synth_concurrency(max_parallel)
+        if max_parallel == self._synth_max_parallel:
+            return
+        self._synth_max_parallel = max_parallel
+        self._synth_semaphore = threading.Semaphore(max_parallel)
+        _log.info("[TTS] Synthesis concurrency set to %d", max_parallel)
 
     def set_qwen_server(self, url):
         new_url = url.rstrip("/") if url else ""
@@ -168,6 +261,8 @@ class QwenTTSBackend(QObject):
             self._qwen_clients.clear()
         with self._qwen_api_cache_lock:
             self._qwen_api_cache.clear()
+        with self._qwen_ready_cache_lock:
+            self._qwen_ready_cache.clear()
 
     def set_output_device(self, device, label: str = ""):
         """Route TTS playback to a specific output device.
@@ -203,15 +298,52 @@ class QwenTTSBackend(QObject):
         """Get TTS style instruction based on current emotion."""
         return _EMOTION_STYLE_MAP.get(emotion.lower(), _EMOTION_STYLE_MAP["neutral"])
 
-    def is_ready(self):
+    def _qwen_cache_key(self):
+        return (self._qwen_url or "").rstrip("/") or "<default>"
+
+    def _cache_qwen_ready(self, cache_key, ready, ttl_s):
+        with self._qwen_ready_cache_lock:
+            self._qwen_ready_cache[cache_key] = (time.monotonic() + ttl_s, bool(ready))
+
+    def _cache_qwen_api_names(self, cache_key, names):
+        if not names:
+            return
+        with self._qwen_api_cache_lock:
+            self._qwen_api_cache[cache_key] = set(names)
+        try:
+            self.emit_capabilities(names)
+        except Exception as exc:
+            _log.debug("[TTS] capability emit skipped: %s", exc)
+
+    def is_ready(self, force_refresh=False):
         if self._engine_name == "pyttsx3":
             return True
         url = (self._qwen_url or "http://localhost:8000").rstrip("/")
+        cache_key = self._qwen_cache_key()
+        if not force_refresh:
+            now = time.monotonic()
+            with self._qwen_ready_cache_lock:
+                cached = self._qwen_ready_cache.get(cache_key)
+            if cached is not None:
+                expires_at, ready = cached
+                if expires_at > now:
+                    return bool(ready)
+
         try:
-            with urllib.request.urlopen(url + "/gradio_api/info", timeout=1.5):
-                return True
+            with urllib.request.urlopen(url + "/gradio_api/info", timeout=1.5) as response:
+                raw = response.read()
+            names = set()
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                names = self._extract_api_names(payload)
+            except Exception as exc:
+                _log.debug("[TTS] Ready probe response parse skipped: %s", exc)
+            self._cache_qwen_ready(cache_key, True, _QWEN_READY_SUCCESS_TTL_S)
+            self._cache_qwen_api_names(cache_key, names)
+            return True
         except Exception as exc:
             _log.debug("[TTS] Server not ready: %s", exc)
+            self._cache_qwen_ready(cache_key, False, _QWEN_READY_FAILURE_TTL_S)
             return False
 
     def stop_output(self):
@@ -355,9 +487,40 @@ class QwenTTSBackend(QObject):
         """Play a WAV file through the selected audio device (or OS default)."""
         def _do():
             started = False
+            wav_path_obj = Path(wav_path)
+
+            # PRE-FLIGHT VALIDATION: File exists and is not empty
+            if not wav_path_obj.exists():
+                _log.error("[TTS] WAV file does not exist: %s", wav_path)
+                self.error_occurred.emit(f"Audio file not found: {wav_path}")
+                return
+
+            try:
+                file_size = wav_path_obj.stat().st_size
+                if file_size == 0:
+                    _log.error("[TTS] WAV file is empty (0 bytes): %s", wav_path)
+                    self.error_occurred.emit("Generated audio is empty (0 bytes)")
+                    return
+                _log.debug("[TTS] WAV file size: %d bytes", file_size)
+            except Exception as exc:
+                _log.error("[TTS] Cannot stat WAV file: %s", exc)
+                self.error_occurred.emit(f"Cannot access audio file: {exc}")
+                return
+
             try:
                 import sounddevice as sd
                 import soundfile as sf
+
+                # Validate WAV format before attempting full read
+                try:
+                    info = sf.info(str(wav_path))
+                    _log.debug("[TTS] WAV format valid: %d Hz, %d channel(s), %d frames",
+                              info.samplerate, info.channels, info.frames)
+                except Exception as format_err:
+                    _log.error("[TTS] WAV format invalid or corrupted: %s", format_err)
+                    self.error_occurred.emit(f"Invalid audio format: corrupted WAV file")
+                    return
+
                 data, sr = sf.read(str(wav_path))
                 self._begin_playback()
                 started = True
@@ -386,7 +549,8 @@ class QwenTTSBackend(QObject):
                 started = True
                 self._play_wav_winsound(wav_path)
             except Exception as exc:
-                _log.error("[TTS] Playback error: %s", exc)
+                exc_type = type(exc).__name__
+                _log.error("[TTS] Playback error (%s): %s", exc_type, exc)
                 self.error_occurred.emit(f"Playback error: {exc}")
             finally:
                 if started:
@@ -497,9 +661,40 @@ class QwenTTSBackend(QObject):
     def _play_wav_blocking(self, wav_path):
         """Play WAV synchronously (called from background thread)."""
         started = False
+        wav_path_obj = Path(wav_path)
+
+        # PRE-FLIGHT VALIDATION: File exists and is not empty
+        if not wav_path_obj.exists():
+            _log.error("[TTS] WAV file does not exist: %s", wav_path)
+            self.error_occurred.emit(f"Audio file not found: {wav_path}")
+            return
+
+        try:
+            file_size = wav_path_obj.stat().st_size
+            if file_size == 0:
+                _log.error("[TTS] WAV file is empty (0 bytes): %s", wav_path)
+                self.error_occurred.emit("Generated audio is empty (0 bytes)")
+                return
+            _log.debug("[TTS] WAV file size: %d bytes", file_size)
+        except Exception as exc:
+            _log.error("[TTS] Cannot stat WAV file: %s", exc)
+            self.error_occurred.emit(f"Cannot access audio file: {exc}")
+            return
+
         try:
             import sounddevice as sd
             import soundfile as sf
+
+            # Validate WAV format before attempting full read
+            try:
+                info = sf.info(str(wav_path))
+                _log.debug("[TTS] WAV format valid: %d Hz, %d channel(s), %d frames",
+                          info.samplerate, info.channels, info.frames)
+            except Exception as format_err:
+                _log.error("[TTS] WAV format invalid or corrupted: %s", format_err)
+                self.error_occurred.emit(f"Invalid audio format: corrupted WAV file")
+                return
+
             data, sr = sf.read(str(wav_path))
             self._begin_playback()
             started = True
@@ -528,7 +723,8 @@ class QwenTTSBackend(QObject):
             started = True
             self._play_wav_winsound(wav_path)
         except Exception as exc:
-            _log.error("[TTS] Playback error: %s", exc)
+            exc_type = type(exc).__name__
+            _log.error("[TTS] Playback error (%s): %s", exc_type, exc)
             self.error_occurred.emit(f"Playback error: {exc}")
         finally:
             if started:
@@ -575,7 +771,7 @@ class QwenTTSBackend(QObject):
         connection.
         """
         url = (self._qwen_url or "").rstrip("/")
-        cache_key = url or "<default>"
+        cache_key = self._qwen_cache_key()
 
         if force_refresh:
             with self._qwen_api_cache_lock:
@@ -596,6 +792,7 @@ class QwenTTSBackend(QObject):
                 with urllib.request.urlopen(url + "/gradio_api/info", timeout=2.0) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 names.update(self._extract_api_names(payload))
+                self._cache_qwen_ready(cache_key, True, _QWEN_READY_SUCCESS_TTL_S)
             except Exception as exc:
                 _log.debug("[TTS] Could not inspect Gradio API info: %s", exc)
 
@@ -610,12 +807,7 @@ class QwenTTSBackend(QObject):
                 _log.debug("[TTS] Could not inspect Gradio client API: %s", exc)
 
         if names:
-            with self._qwen_api_cache_lock:
-                self._qwen_api_cache[cache_key] = names
-            try:
-                self.emit_capabilities(names)
-            except Exception as _exc:
-                _log.debug("[TTS] capability emit skipped: %s", _exc)
+            self._cache_qwen_api_names(cache_key, names)
         return names
 
     @staticmethod
@@ -1044,8 +1236,34 @@ class QwenTTSBackend(QObject):
             else:
                 wav_path = _candidate_path(result)
 
+            # VALIDATE: Ensure WAV file is not empty
+            if wav_path:
+                try:
+                    wav_size = Path(wav_path).stat().st_size
+                    if wav_size == 0:
+                        _log.error("[TTS] Extracted WAV is empty (0 bytes): %s", wav_path)
+                        Path(wav_path).unlink(missing_ok=True)
+                        return None
+                    _log.debug("[TTS] Extracted WAV valid: %d bytes", wav_size)
+                except Exception as stat_err:
+                    _log.error("[TTS] Cannot validate extracted WAV: %s", stat_err)
+                    return None
+
             if wav_path and output_path:
                 shutil.copy2(wav_path, str(output_path))
+
+                # VALIDATE: Ensure copy succeeded with data
+                try:
+                    copy_size = Path(output_path).stat().st_size
+                    if copy_size == 0:
+                        _log.error("[TTS] Copied WAV is empty (0 bytes): %s", output_path)
+                        Path(output_path).unlink(missing_ok=True)
+                        return None
+                    _log.debug("[TTS] Copied WAV valid: %d bytes", copy_size)
+                except Exception as copy_err:
+                    _log.error("[TTS] Cannot validate copied WAV: %s", copy_err)
+                    return None
+
                 return str(output_path)
             return wav_path
         except Exception as exc:

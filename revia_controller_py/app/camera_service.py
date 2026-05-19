@@ -80,11 +80,104 @@ class CameraService(QObject):
         )
         self._detector_future = None
 
+        # Screen capture mode — separate timer from the camera timer so both
+        # camera and screen can run simultaneously if needed.
+        self._screen_active = False
+        self._screen_timer = QTimer(self)
+        self._screen_timer.timeout.connect(self._grab_screen_frame)
+        self._screen_monitor = 0  # 0 = primary monitor
+
     def detect_cameras(self, max_check=5):
         self._detected_cameras = self._detect_local_cameras(max_check=max_check)
         self._detected_cameras.extend(self._detect_luxonis_cameras())
         self.camera_list_updated.emit(self._detected_cameras)
         return self._detected_cameras
+
+    # ------------------------------------------------------------------
+    # Screen capture — streams desktop frames through frame_ready signal
+    # so YOLO detection and the preview panel work unchanged.
+    # ------------------------------------------------------------------
+
+    def start_screen_capture(self, interval_ms: int = 2000, monitor: int = 0):
+        """Begin capturing desktop frames at the given interval (ms).
+
+        Uses ``PIL.ImageGrab`` (cross-platform) with ``mss`` as a fallback.
+        Frames are emitted via ``frame_ready`` so all existing vision hooks
+        (YOLO, VisionTab preview, context builder) work without any changes.
+
+        Args:
+            interval_ms: Milliseconds between captures (default 2000 = 0.5 fps).
+            monitor:     Monitor index — 0 is the primary display.
+        """
+        self._screen_monitor = monitor
+        self._screen_active = True
+        self._screen_timer.start(max(500, int(interval_ms)))
+        self.status_changed.emit("Screen capture active")
+
+    def stop_screen_capture(self):
+        """Stop desktop frame capture."""
+        self._screen_active = False
+        self._screen_timer.stop()
+        self.status_changed.emit("Screen capture stopped")
+
+    @property
+    def is_screen_capture_active(self) -> bool:
+        return self._screen_active
+
+    def _grab_screen_frame(self):
+        """Capture one desktop frame and emit it as a QPixmap via frame_ready."""
+        if not self._screen_active:
+            return
+        try:
+            pixmap = self._capture_screen_pixmap(self._screen_monitor)
+        except Exception:
+            return
+        if pixmap is None or pixmap.isNull():
+            return
+        self._latest_frame = pixmap  # keep for build_live_context()
+        self.frame_ready.emit(pixmap)
+        # Optionally run YOLO on the screen frame
+        if self._detector_enabled:
+            img = pixmap.toImage()
+            buf = img.bits()
+            if buf:
+                try:
+                    arr = np.frombuffer(buf, dtype=np.uint8).reshape(
+                        img.height(), img.width(), 4
+                    )
+                    frame_bgr = arr[:, :, :3][..., ::-1].copy()
+                    self._submit_detection(frame_bgr)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _capture_screen_pixmap(monitor: int = 0) -> "QPixmap | None":
+        """Grab the screen and return a QPixmap.  Tries PIL then mss."""
+        # --- PIL.ImageGrab (Windows / macOS) ---
+        try:
+            from PIL import ImageGrab
+            img_pil = ImageGrab.grab(all_screens=False)
+            data = img_pil.convert("RGBA").tobytes()
+            w, h = img_pil.size
+            qimg = QImage(data, w, h, QImage.Format_RGBA8888)
+            return QPixmap.fromImage(qimg)
+        except Exception:
+            pass
+        # --- mss (cross-platform fallback) ---
+        try:
+            import mss
+            with mss.mss() as sct:
+                monitors = sct.monitors
+                idx = min(monitor + 1, len(monitors) - 1)  # monitors[0] = all
+                mon = monitors[idx]
+                shot = sct.grab(mon)
+                qimg = QImage(
+                    shot.raw, shot.width, shot.height, QImage.Format_RGBA8888
+                )
+                return QPixmap.fromImage(qimg)
+        except Exception:
+            pass
+        return None
 
     def get_detected(self):
         return list(self._detected_cameras)
@@ -121,7 +214,8 @@ class CameraService(QObject):
             return []
         try:
             devices = list(_DEPTHAI.Device.getAllAvailableDevices())
-        except Exception:
+        except Exception as exc:
+            _log.debug("[CameraService] Failed to enumerate Luxonis devices: %s", exc)
             return []
 
         found = []

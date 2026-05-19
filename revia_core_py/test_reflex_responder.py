@@ -1,6 +1,6 @@
 import unittest
 
-from reflex_responder import get_reflex_reply
+from reflex_responder import _DEFAULT_GREETING_POOL, get_reflex_reply
 
 
 class _Memory:
@@ -12,12 +12,22 @@ class _Memory:
 
 
 class TestReflexResponder(unittest.TestCase):
-    def test_greeting_uses_profile_greeting(self):
-        reply = get_reflex_reply("hello", profile={"greeting": "I'm here. What happened?"})
+    def test_greeting_uses_profile_greeting_pool(self):
+        profile = {"greeting": "I'm here. What happened?"}
+        reply = get_reflex_reply("hello", profile=profile)
 
         self.assertIsNotNone(reply)
         self.assertEqual(reply.reason, "simple_greeting")
-        self.assertEqual(reply.text, "I'm here. What happened?")
+        self.assertIn(reply.text, {"I'm here. What happened?", *_DEFAULT_GREETING_POOL})
+
+    def test_greeting_varies_for_same_profile(self):
+        profile = {"greeting": "I'm here. What happened?"}
+        first = get_reflex_reply("hello", profile=profile)
+        second = get_reflex_reply("hello", profile=profile)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first.text, second.text)
 
     def test_quiet_request_marks_quiet(self):
         reply = get_reflex_reply("wait")

@@ -29,6 +29,8 @@ from gui.tabs.theme_tab import ThemeTab
 from gui.tabs.emotions_tab import EmotionsTab
 from gui.tabs.integrations_tab import IntegrationsTab
 from gui.tabs.sing_tab import SingTab
+from gui.tabs.vtube_tab import VtubeTab
+from app.vtube_service import VTubeService
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +45,7 @@ class MainWindow(QMainWindow):
         self.sing_library = None
         self.sing_queue = None
         self.sing_handler = None
+        self.vtube_service = VTubeService(event_bus=event_bus, parent=self)
         self.behavior_controller = None
         self.conversation_starter = None
         self.runtime_state_sync = None
@@ -139,7 +142,8 @@ class MainWindow(QMainWindow):
 
         self.sing_tab = SingTab(self.event_bus, self.client)
         self.personality_tabs.addTab(self.sing_tab, "Sing")
-        self._init_sing_system()
+        # NOTE: _init_sing_system() is called AFTER voice_tab is created below
+        # (voice_tab.voice_mgr.backend is required to build the sing system)
 
         # ── Tab 2: System ─────────────────────────────────────────
         system_container = QWidget()
@@ -161,11 +165,18 @@ class MainWindow(QMainWindow):
             self.event_bus, self.client, self.audio_service
         )
         self.system_tabs.addTab(self.voice_tab, "Voice")
+        # voice_tab is now ready — initialise the sing system that depends on it
+        self._init_sing_system()
 
         self.vision_tab = VisionTab(
             self.event_bus, self.client, self.camera_service
         )
         self.system_tabs.addTab(self.vision_tab, "Vision")
+
+        self.vtube_tab = VtubeTab(
+            self.event_bus, self.client, self.vtube_service
+        )
+        self.system_tabs.addTab(self.vtube_tab, "VTube")
 
         self.system_tab = SystemTab(
             self.event_bus, self.client, self.theme_mgr
@@ -215,7 +226,7 @@ class MainWindow(QMainWindow):
             self.client,
             self.event_bus,
             self.behavior_controller,
-            interval_ms=120_000,
+            interval_ms=60_000,
             parent=self,
         )
         self.chat_panel.set_conversation_starter(self.conversation_starter)
@@ -279,6 +290,11 @@ class MainWindow(QMainWindow):
     def _current_mood_label(self):
         snapshot = self.client.get_status_snapshot()
         emotion = snapshot.get("emotion", {}) if isinstance(snapshot, dict) else {}
+        response_emotion = snapshot.get("response_emotion", {}) if isinstance(snapshot, dict) else {}
+        if isinstance(response_emotion, dict):
+            response_state = str(response_emotion.get("state", "") or "").strip().lower()
+            if response_state not in ("", "pending", "idle", "empty"):
+                return str(response_emotion.get("label", "neutral") or "neutral").lower()
         return str(emotion.get("label", "neutral") or "neutral").lower()
 
     def _init_sing_system(self):
@@ -310,6 +326,61 @@ class MainWindow(QMainWindow):
             self.event_bus.connection_changed.connect(
                 lambda _connected: self.runtime_state_sync.schedule_sync()
             )
+        # Wire real-time EmotionNet output → TTS voice modulation so Revia's
+        # speaking style (speed, pitch, energy) tracks her emotional state on
+        # every turn — previously neural_updated was never forwarded to the
+        # voice manager, so emotion had zero effect on how she sounded.
+        self.event_bus.neural_updated.connect(
+            self.voice_tab.voice_mgr.apply_emotion_modifiers
+        )
+        # Wire EmotionNet → VTube Studio avatar expressions (when tracking enabled)
+        self.event_bus.neural_updated.connect(self._on_neural_updated_vtube)
+        # Wire TTS playback → VTube lip sync (speaking state)
+        try:
+            backend = self.voice_tab.voice_mgr.backend
+            backend.playback_started.connect(
+                lambda: self.vtube_service.set_speaking(True)
+            )
+            backend.playback_finished.connect(
+                lambda: self.vtube_service.set_speaking(False)
+            )
+            backend.playback_interrupted.connect(
+                lambda: self.vtube_service.set_speaking(False)
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.event_bus.log_entry.emit(f"[VTube] TTS signal wiring skipped: {exc}")
+        # Wire user thumbs feedback → reward log (also consumed by RL engine)
+        if hasattr(self.event_bus, "reward_signal"):
+            self.event_bus.reward_signal.connect(self._on_reward_signal)
+
+    def _on_neural_updated_vtube(self, data: dict):
+        """Forward EmotionNet updates to the VTube Studio avatar when tracking is on."""
+        try:
+            if not (self.vtube_service and self.vtube_service.is_connected):
+                return
+            if not self.vtube_tab.emotion_tracking_enabled:
+                return
+            emotion = str(data.get("label", "") or "").lower().strip()
+            if emotion:
+                self.vtube_service.set_emotion(emotion)
+        except Exception:
+            pass
+
+    def _on_reward_signal(self, request_id: str, value: int):
+        """Log user feedback and forward to core for RL scoring."""
+        label = "👍 positive" if value > 0 else "👎 negative"
+        self.event_bus.log_entry.emit(
+            f"[Feedback] {label} feedback for request {request_id or 'unknown'}"
+        )
+        # Forward to core server so the RL engine can update its reward model.
+        # Uses fire-and-forget via the non-blocking post() helper.
+        try:
+            self.client.post(
+                "/api/reward",
+                json={"request_id": request_id, "value": value},
+            )
+        except Exception:
+            pass  # Feedback is best-effort; don't crash on a missing endpoint
 
     def _on_connection(self, connected):
         self.topbar.set_health("Online" if connected else "Offline")
@@ -331,6 +402,11 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1400, self.runtime_state_sync.schedule_sync)
 
     def closeEvent(self, event):
+        try:
+            if self.vtube_service and self.vtube_service.is_connected:
+                self.vtube_service.disconnect()
+        except Exception:
+            pass
         self.camera_service.disconnect_camera()
         try:
             if self.continuous_audio:

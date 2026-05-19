@@ -13,12 +13,11 @@ or:
 """
 
 import json
+import importlib.util
 import os
 import sys
-import threading
-import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
 # Minimal stubs so core_server can be imported without all optional deps
@@ -34,16 +33,18 @@ def _make_stub_module(name):
     return mod
 
 
+def _stub_if_missing(name):
+    if name in sys.modules:
+        return
+    if importlib.util.find_spec(name) is None:
+        _make_stub_module(name)
+
+
 for _dep in [
-    "flask", "flask_sock", "redis", "requests",
+    "flask_sock", "redis", "requests",
     "psutil", "torch", "transformers",
-    "revia_core_py.vllm_backend", "vllm_backend",
-    "revia_core_py.neural_refiner", "neural_refiner",
-    "revia_core_py.parallel_pipeline", "parallel_pipeline",
-    "revia_core_py.integrations.integration_manager",
-    "integrations.integration_manager",
 ]:
-    _make_stub_module(_dep)
+    _stub_if_missing(_dep)
 
 
 class TestStatusEndpoint(unittest.TestCase):
@@ -173,7 +174,8 @@ class TestInterruptEndpoint(unittest.TestCase):
             content_type="application/json",
         )
         data = json.loads(resp.data)
-        self.assertIn("ack", data)
+        self.assertTrue(data.get("ok"))
+        self.assertIn("interrupted", data)
 
 
 class TestMemoryEndpoints(unittest.TestCase):
@@ -197,14 +199,14 @@ class TestMemoryEndpoints(unittest.TestCase):
 
     def test_memory_status_returns_200(self):
         self._skip_if_unavailable()
-        resp = self._client.get("/api/memory/status")
+        resp = self._client.get("/api/memory/docker/status")
         self.assertEqual(resp.status_code, 200)
 
     def test_memory_status_has_backend_key(self):
         self._skip_if_unavailable()
-        resp = self._client.get("/api/memory/status")
+        resp = self._client.get("/api/memory/docker/status")
         data = json.loads(resp.data)
-        self.assertIn("backend", data)
+        self.assertIn("long_term_backend", data)
 
 
 if __name__ == "__main__":

@@ -103,6 +103,61 @@ class SongAnalysis:
 
 
 # ---------------------------------------------------------------------------
+# Dependency check — call at startup so SingTab can surface missing packages
+# ---------------------------------------------------------------------------
+
+def check_sing_dependencies() -> dict[str, bool]:
+    """Return a dict of package → available for all sing-pipeline dependencies.
+
+    Usage in SingTab::
+
+        results = check_sing_dependencies()
+        missing = [pkg for pkg, ok in results.items() if not ok]
+        if missing:
+            self._status_label.setText(f"Missing: {', '.join(missing)}")
+    """
+    deps = {
+        "demucs": False,
+        "spleeter": False,
+        "openai-whisper (whisper)": False,
+        "librosa": False,
+        "soundfile": False,
+        "numpy": False,
+    }
+    try:
+        import demucs  # noqa: F401
+        deps["demucs"] = True
+    except ImportError:
+        pass
+    try:
+        import spleeter  # noqa: F401
+        deps["spleeter"] = True
+    except ImportError:
+        pass
+    try:
+        import whisper  # noqa: F401
+        deps["openai-whisper (whisper)"] = True
+    except ImportError:
+        pass
+    try:
+        import librosa  # noqa: F401
+        deps["librosa"] = True
+    except ImportError:
+        pass
+    try:
+        import soundfile  # noqa: F401
+        deps["soundfile"] = True
+    except ImportError:
+        pass
+    try:
+        import numpy  # noqa: F401
+        deps["numpy"] = True
+    except ImportError:
+        pass
+    return deps
+
+
+# ---------------------------------------------------------------------------
 # Pitch -> style instruction mapping
 # ---------------------------------------------------------------------------
 
@@ -639,44 +694,68 @@ class SingMode:
         try:
             # Get basic audio info
             analysis.duration_sec = _get_audio_duration(wav_path)
-            _log.info("[SingMode] Processing: %s (%.1fs)", wav_path, analysis.duration_sec)
+            _pipeline_start = time.time()
+            _log.info(
+                "[SingMode] ── Pipeline start ── %s (%.1fs)",
+                wav_path, analysis.duration_sec,
+            )
 
-            # Stage 1: Vocal separation
+            # Stage 1/5: Vocal separation
+            _t = time.time()
             self._set_state(SingModeState.SEPARATING)
             self._report_progress("Separating vocals", 0, 5)
+            _log.info("[SingMode] 1/5 Separating vocals — trying demucs → spleeter → spectral")
             instr_path, vocal_path = VocalSeparator.separate(wav_path, self._work_dir)
             analysis.instrumental_path = instr_path
             analysis.vocal_path = vocal_path
+            _log.info("[SingMode] 1/5 done in %.1fs", time.time() - _t)
 
             if self._interrupt.is_set():
                 self._set_state(SingModeState.IDLE)
                 return analysis
 
-            # Stage 2: Lyrics extraction
+            # Stage 2/5: Lyrics extraction
+            _t = time.time()
             self._set_state(SingModeState.TRANSCRIBING)
             self._report_progress("Extracting lyrics", 1, 5)
+            _log.info("[SingMode] 2/5 Extracting lyrics with Whisper from %s", vocal_path)
             analysis.lyrics = LyricsExtractor.extract(vocal_path, language)
+            _log.info(
+                "[SingMode] 2/5 done — %d lines in %.1fs",
+                len(analysis.lyrics), time.time() - _t,
+            )
 
             if self._interrupt.is_set():
                 self._set_state(SingModeState.IDLE)
                 return analysis
 
-            # Stage 3: Pitch analysis
+            # Stage 3/5: Pitch analysis
+            _t = time.time()
             self._set_state(SingModeState.ANALYSING)
             self._report_progress("Analysing pitch", 2, 5)
+            _log.info("[SingMode] 3/5 Analysing pitch (librosa pyin) + BPM/key detection")
             analysis.bpm = _detect_bpm(wav_path)
             analysis.key = _detect_key(wav_path)
             analysis.lyrics = PitchAnalyser.analyse(vocal_path, analysis.lyrics)
+            _log.info(
+                "[SingMode] 3/5 done — BPM=%.1f key=%s in %.1fs",
+                analysis.bpm, analysis.key, time.time() - _t,
+            )
 
             if self._interrupt.is_set():
                 self._set_state(SingModeState.IDLE)
                 return analysis
 
-            # Stage 4: Synthesise Revia's vocals
+            # Stage 4/5: Synthesise Revia's vocals
+            _t = time.time()
             self._set_state(SingModeState.SYNTHESISING)
             self._report_progress("Synthesising vocals", 3, 5)
             synth_dir = os.path.join(self._work_dir, "synth")
             os.makedirs(synth_dir, exist_ok=True)
+            _log.info(
+                "[SingMode] 4/5 Synthesising %d lyric lines via Qwen3-TTS",
+                len(analysis.lyrics),
+            )
 
             synthesiser = VocalSynthesiser(self._tts)
 
@@ -689,22 +768,29 @@ class SingMode:
                 analysis.lyrics, voice_profile, analysis.bpm,
                 synth_dir, on_progress=_synth_progress,
             )
+            _log.info("[SingMode] 4/5 done in %.1fs", time.time() - _t)
 
             if self._interrupt.is_set():
                 self._set_state(SingModeState.IDLE)
                 return analysis
 
-            # Stage 5: Mix
+            # Stage 5/5: Mix
+            _t = time.time()
             self._set_state(SingModeState.MIXING)
             self._report_progress("Mixing karaoke", 4, 5)
             output_path = os.path.join(self._work_dir, "karaoke_output.wav")
+            _log.info("[SingMode] 5/5 Mixing synth vocals onto instrumental → %s", output_path)
             AudioMixer.mix(analysis.instrumental_path, analysis.lyrics, output_path)
             analysis.karaoke_output_path = output_path
+            _log.info("[SingMode] 5/5 done in %.1fs", time.time() - _t)
 
             self._report_progress("Complete", 5, 5)
             self._set_state(SingModeState.READY)
             self._current_analysis = analysis
-            _log.info("[SingMode] Karaoke ready: %s", output_path)
+            _log.info(
+                "[SingMode] ── Pipeline complete — total %.1fs → %s",
+                time.time() - _pipeline_start, output_path,
+            )
             return analysis
 
         except InterruptedError:

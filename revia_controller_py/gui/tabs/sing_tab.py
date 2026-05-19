@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog,
     QComboBox, QLineEdit, QCheckBox, QProgressBar, QSplitter,
-    QTextEdit, QInputDialog, QMessageBox,
+    QTextEdit, QInputDialog, QMessageBox, QDialog, QDialogButtonBox,
+    QFormLayout,
 )
 from PySide6.QtGui import QFont, QColor
 
@@ -157,8 +158,9 @@ class SingTab(QWidget):
         lib_layout.addWidget(self._library_list)
 
         lib_btn_layout = QHBoxLayout()
-        self._btn_add_song = QPushButton("Add Song")
+        self._btn_add_song = QPushButton("+ Add Song")
         self._btn_add_song.setObjectName("primaryBtn")
+        self._btn_add_song.setToolTip("Import WAV / MP3 / FLAC / OGG / M4A into the library")
         self._btn_remove_song = QPushButton("Remove")
         self._btn_process_song = QPushButton("Process")
         self._btn_process_song.setToolTip("Run karaoke pipeline on selected song")
@@ -200,6 +202,11 @@ class SingTab(QWidget):
         self._search_input.textChanged.connect(self._refresh_library)
         self._filter_combo.currentIndexChanged.connect(self._refresh_library)
         self._library_list.itemDoubleClicked.connect(self._on_library_double_click)
+        # Pipeline stage progress → update status label with live stage text
+        if hasattr(self.event_bus, "sing_progress"):
+            self.event_bus.sing_progress.connect(self._on_sing_progress)
+        # Run dependency check once after a short delay so the UI is visible
+        QTimer.singleShot(2000, self._check_dependencies)
 
     # ------------------------------------------------------------------
     # External wiring (called after init by MainWindow)
@@ -248,31 +255,33 @@ class SingTab(QWidget):
     @Slot()
     def _on_add_song(self):
         if not self._library:
+            QMessageBox.warning(
+                self, "Sing System Not Ready",
+                "The sing system hasn't initialised yet — try again in a moment."
+            )
             return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Add Songs to Library",
-            "", "Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)"
+            "", "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a);;All Files (*)"
         )
+        if not paths:
+            return
+        added = 0
         for path in paths:
-            title = Path(path).stem.replace("_", " ").replace("-", " ").title()
-            # Ask for title and artist
-            title, ok = QInputDialog.getText(
-                self, "Song Title", "Enter song title:",
-                text=title
-            )
-            if not ok or not title:
+            default_title = Path(path).stem.replace("_", " ").replace("-", " ").title()
+            dlg = _AddSongDialog(default_title=default_title, parent=self)
+            if dlg.exec() != QDialog.Accepted:
                 continue
-            artist, _ = QInputDialog.getText(
-                self, "Artist", "Enter artist (optional):"
-            )
-            # Ask for mood/genre tags
-            tags_str, _ = QInputDialog.getText(
-                self, "Tags",
-                "Enter mood/genre tags (comma-separated, e.g. upbeat, pop, happy):"
-            )
-            tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
-            self._library.add_song(path, title, artist=artist or "", tags=tags)
-
+            title, artist, tags = dlg.get_values()
+            if not title:
+                continue
+            try:
+                self._library.add_song(path, title, artist=artist, tags=tags)
+                added += 1
+            except Exception as exc:
+                QMessageBox.warning(self, "Add Song Failed", str(exc))
+        if added:
+            self._status_label.setText(f"Added {added} song(s) to library.")
         self._refresh_library()
 
     @Slot()
@@ -434,6 +443,39 @@ class SingTab(QWidget):
         else:
             self._now_playing_label.setText("Nothing playing")
 
+    @Slot(str, int, int)
+    def _on_sing_progress(self, stage: str, current: int, total: int):
+        """Update the status label with live pipeline stage text."""
+        if stage == "Complete":
+            self._status_label.setText("✓ Processing complete — ready to play!")
+        else:
+            self._status_label.setText(f"⟳ {stage}…  ({current + 1}/{total})")
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(current)
+
+    def _check_dependencies(self):
+        """Run a one-time dependency check and surface missing packages in the UI."""
+        try:
+            from app.sing_mode import check_sing_dependencies
+        except Exception:
+            return
+        results = check_sing_dependencies()
+        missing = [pkg for pkg, ok in results.items() if not ok]
+        # At minimum we need numpy + soundfile for the spectral fallback.
+        critical_missing = [p for p in missing if p in ("numpy", "soundfile")]
+        if critical_missing:
+            self._status_label.setText(
+                f"⚠ Critical deps missing: {', '.join(critical_missing)}  "
+                f"— run: pip install {' '.join(critical_missing)}"
+            )
+            apply_status_style(self._status_label, role="error")
+        elif missing:
+            self._status_label.setText(
+                f"ℹ Optional deps missing (reduced quality): {', '.join(missing)}"
+            )
+        else:
+            self._status_label.setText("✓ All sing pipeline dependencies present")
+
     def update_lyrics(self, line_index: int, lyric_text: str):
         """Called externally when lyrics update during playback."""
         self._lyrics_display.setText(lyric_text)
@@ -448,3 +490,64 @@ class SingTab(QWidget):
             self._refresh_now_playing()
         elif state == "error":
             apply_status_style(self._now_playing_label, role="error")
+
+
+# ---------------------------------------------------------------------------
+# Add Song Dialog
+# ---------------------------------------------------------------------------
+
+class _AddSongDialog(QDialog):
+    """Single-form dialog for adding a song — replaces the old 3-popup flow."""
+
+    def __init__(self, default_title: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Song to Library")
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+
+        self._title_edit = QLineEdit(default_title)
+        self._title_edit.setPlaceholderText("Song title (required)")
+        form.addRow("Title:", self._title_edit)
+
+        self._artist_edit = QLineEdit()
+        self._artist_edit.setPlaceholderText("Artist name (optional)")
+        form.addRow("Artist:", self._artist_edit)
+
+        self._tags_edit = QLineEdit()
+        self._tags_edit.setPlaceholderText("e.g. upbeat, pop, happy  (comma-separated)")
+        form.addRow("Tags:", self._tags_edit)
+
+        layout.addLayout(form)
+
+        hint = QLabel("Tags help Revia auto-pick songs that match her current mood.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self._title_edit.setFocus()
+        self._title_edit.selectAll()
+
+    def _on_accept(self):
+        if not self._title_edit.text().strip():
+            self._title_edit.setPlaceholderText("Title is required!")
+            self._title_edit.setFocus()
+            return
+        self.accept()
+
+    def get_values(self) -> tuple[str, str, list[str]]:
+        """Return (title, artist, tags_list)."""
+        title = self._title_edit.text().strip()
+        artist = self._artist_edit.text().strip()
+        tags_raw = self._tags_edit.text()
+        tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        return title, artist, tags

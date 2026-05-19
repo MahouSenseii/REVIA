@@ -1,0 +1,45 @@
+{
+  "cpu_brand": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+  "cpu_cores_logical": 16,
+  "cpu_cores_physical": 8,
+  "ram_total_mb": 16236,
+  "has_cuda": true,
+  "cuda_runtime": "12.1",
+  "has_rocm": false,
+  "has_mps": false,
+  "cuda_devices": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 3070 Laptop GPU",
+      "vram_total_mb": 8192,
+      "vram_used_mb": 3848,
+      "load_percent": 31.0,
+      "cuda_supported": true,
+      "driver": "591.86",
+      "compute_capability": "8.6",
+      "vram_free_mb": 4344
+    }
+  ],
+  "has_flash_attn": false,
+  "torch_version": "2.5.1+cu121",
+  "python_version": "3.11.9",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "available_providers": {
+    "Ollama": false,
+    "LM Studio": false,
+    "llama.cpp": false,
+    "koboldcpp": false,
+    "vLLM": false,
+    "TabbyAPI": false
+  },
+  "suggested_profile": "low_8gb",
+  "recommended_defaults": {
+    "tts_model_size": "0.6B",
+    "reasoning_size": "7B",
+    "allow_critic_llm": false,
+    "max_concurrent_llms": 1,
+    "allow_vision": false,
+    "vram_safety_mb": 512
+  },
+  "detected_at": 1779127845.9148324
+}

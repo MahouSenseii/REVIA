@@ -42,6 +42,7 @@ class HardwareSnapshot:
     gpu_percent: float = 0.0
     vram_used_mb: int = 0
     vram_total_mb: int = 0
+    gpus: list[dict[str, Any]] = field(default_factory=list)
     in_flight_llms: int = 0
     last_llm_latency_ms: float = 0.0
     pressure: str = "normal"        # "spacious" | "normal" | "tight" | "critical"
@@ -56,6 +57,7 @@ class HardwareSnapshot:
             "gpu_percent": round(self.gpu_percent, 1),
             "vram_used_mb": int(self.vram_used_mb),
             "vram_total_mb": int(self.vram_total_mb),
+            "gpus": [dict(gpu) for gpu in self.gpus],
             "in_flight_llms": int(self.in_flight_llms),
             "last_llm_latency_ms": round(self.last_llm_latency_ms, 1),
             "pressure": self.pressure,
@@ -148,6 +150,7 @@ class HardwareAgent(Agent):
         gpu_percent = float(gpu.get("gpu_percent", 0.0) or 0.0)
         vram_used = int(gpu.get("vram_used_mb", 0) or 0)
         vram_total = int(gpu.get("vram_total_mb", 0) or 0)
+        gpus = list(gpu.get("gpus") or [])
 
         in_flight = 0
         if self._in_flight_provider is not None:
@@ -176,6 +179,7 @@ class HardwareAgent(Agent):
             gpu_percent=gpu_percent,
             vram_used_mb=vram_used,
             vram_total_mb=vram_total,
+            gpus=gpus,
             in_flight_llms=in_flight,
             last_llm_latency_ms=latency,
             pressure=pressure,

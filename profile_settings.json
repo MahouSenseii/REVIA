@@ -110,6 +110,32 @@
   "voice_path": "C:/Users/USER/REVIA/voices/audio.wav",
   "voice_tone": "Calm",
   "language": "English",
+  "hardware": {
+    "routing_policy": {
+      "hardware_mode": "single_gpu_auto",
+      "main_llm_gpu": "auto_best",
+      "support_gpu": "cpu",
+      "allow_model_splitting": false,
+      "allow_parallel_agents": false,
+      "fallback_to_cpu": true
+    },
+    "resolved_roles": {
+      "hardware_mode": "single_gpu_auto",
+      "main_llm_gpu_index": 0,
+      "support_gpu_index": null,
+      "support_tasks": [],
+      "visible_main_llm_devices": [
+        0
+      ],
+      "visible_support_devices": [],
+      "model_splitting": {
+        "allowed_by_policy": false,
+        "enabled": false,
+        "reason": "Disabled by policy."
+      }
+    },
+    "detected_gpus": []
+  },
   "persona_preset": "diana_inspired",
   "persona_definition": {
     "id": "revia-diana-inspired",

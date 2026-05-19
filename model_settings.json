@@ -8,7 +8,7 @@
   "local_loader": "llama.cpp",
   "llm_exe_path": "C:/Users/USER/Downloads/llama-b8089-bin-win-cuda-12.4-x64/llama-server.exe",
   "srv_gpu_layers": 28,
-  "srv_ctx": 4096,
+  "srv_ctx": 3072,
   "srv_port": 8080,
   "auto_start_llm": true,
   "api_provider": "OpenAI",
@@ -18,11 +18,19 @@
   "ctx_length": 3072,
   "temperature": 0.2,
   "top_p": 0.8,
-  "max_tokens": 2048,
+  "max_tokens": 220,
   "repeat_penalty": 1.05,
   "fast_mode": false,
   "gpu_layers": 28,
   "batch_size": 128,
   "threads": 8,
-  "quant": "Q5_K_S"
+  "quant": "Q5_K_S",
+  "hardware_policy": {
+    "hardware_mode": "single_gpu_auto",
+    "main_llm_gpu": "auto_best",
+    "support_gpu": "cpu",
+    "allow_model_splitting": false,
+    "allow_parallel_agents": false,
+    "fallback_to_cpu": true
+  }
 }

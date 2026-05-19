@@ -44,10 +44,12 @@ def _pick_greeting(profile: dict[str, Any] | None) -> str:
         if isinstance(profile, dict):
             legacy = str(profile.get("greeting") or "").strip()
         if legacy:
-            pool = [legacy]
+            pool = [legacy, *list(_DEFAULT_GREETING_POOL)]
 
     if not pool:
         pool = list(_DEFAULT_GREETING_POOL)
+
+    pool = list(dict.fromkeys(pool))
 
     if len(pool) == 1:
         return pool[0]

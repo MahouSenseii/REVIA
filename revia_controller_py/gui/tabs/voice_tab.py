@@ -21,6 +21,11 @@ from PySide6.QtGui import QFont, QPainter, QColor
 from app.voice_profile import VoiceMode
 from app.voice_manager import VoiceManager
 from app.tts_backend import QWEN_SPEAKERS, QWEN_LANGUAGES, QWEN_MODEL_SIZES
+from app.hardware_routing import (
+    detect_nvidia_smi_gpus,
+    read_saved_hardware_policy,
+    resolve_gpu_roles,
+)
 from app.ui_status import apply_status_style, clear_status_role
 from gui.widgets.settings_card import SettingsCard
 
@@ -2207,6 +2212,30 @@ class VoiceTab(QScrollArea):
 
     # Qwen3-TTS Local Server Management
 
+    def _tts_support_gpu_route(self):
+        policy = read_saved_hardware_policy()
+        gpus = detect_nvidia_smi_gpus()
+        roles = resolve_gpu_roles(gpus, policy)
+        support = roles.get("support_gpu_index")
+        if support is None:
+            if str(policy.get("fallback_to_cpu", True)).lower() != "false":
+                return {"CUDA_VISIBLE_DEVICES": ""}, "CPU", "cpu"
+            main = roles.get("main_llm_gpu_index")
+            if main is not None:
+                return {
+                    "CUDA_VISIBLE_DEVICES": str(main),
+                    "REVIA_MAIN_LLM_GPU": str(main),
+                }, f"GPU {main}", None
+            return {}, "", None
+        env = {
+            "CUDA_VISIBLE_DEVICES": str(support),
+            "REVIA_SUPPORT_GPU": str(support),
+        }
+        main = roles.get("main_llm_gpu_index")
+        if main is not None:
+            env["REVIA_MAIN_LLM_GPU"] = str(main)
+        return env, f"support GPU {support}", None
+
     def _start_tts_server(self, _checked=False, force_device=None):
         if self._tts_process and self._tts_process.state() != QProcess.NotRunning:
             self.tts_server_status.setText("Already running")
@@ -2263,11 +2292,17 @@ class VoiceTab(QScrollArea):
             self.stop_tts_btn.setEnabled(False)
             return
 
+        if force_device is None:
+            route_env, route_label, routed_force_device = self._tts_support_gpu_route()
+            effective_force_device = routed_force_device
+        else:
+            route_env, route_label = {}, f"manual {force_device}"
+            effective_force_device = force_device
         args, device_label = self._build_tts_server_args(
             qwen_module,
             model_id,
             port,
-            force_device=force_device,
+            force_device=effective_force_device,
         )
         self._tts_last_device_label = device_label
 
@@ -2282,6 +2317,8 @@ class VoiceTab(QScrollArea):
             else:
                 env.remove("CUDA_LAUNCH_BLOCKING")
             env.insert("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        for key, value in route_env.items():
+            env.insert(key, str(value))
 
         self._tts_process.setProcessEnvironment(env)
         self._qwen_activation_pending = True
@@ -2296,6 +2333,8 @@ class VoiceTab(QScrollArea):
 
         print(f"[TTS-SRV] Qwen module   : {qwen_module}")
         print(f"[TTS-SRV] Starting: {exe} {' '.join(args)}")
+        if route_label:
+            self._log_voice_startup(f"Qwen3-TTS routed to {route_label}")
         self._tts_process.start(exe, args)
 
         url = f"http://localhost:{port}"
@@ -2419,20 +2458,26 @@ class VoiceTab(QScrollArea):
             "import os\n"
             "import sys\n"
             "os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')\n"
+            "os.environ.setdefault('TORCHDYNAMO_DISABLE', '1')\n"
+            "os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')\n"
             "try:\n"
             "    import torch as _t\n"
             "    def _false(*_a, **_k):\n"
             "        return False\n"
-            "    def _zero(*_a, **_k):\n"
+            "    def _zero_device_count(*_a, **_k):\n"
             "        return 0\n"
-            "    def _none(*_a, **_k):\n"
+            "    def _zero_current_device(*_a, **_k):\n"
+            "        return 0\n"
+            "    def _none_empty_cache(*_a, **_k):\n"
+            "        return None\n"
+            "    def _none_set_device(*_a, **_k):\n"
             "        return None\n"
             "    _t.cuda.is_available = _false\n"
-            "    _t.cuda.device_count = _zero\n"
+            "    _t.cuda.device_count = _zero_device_count\n"
             "    _t.cuda.is_initialized = _false\n"
-            "    _t.cuda.current_device = _zero\n"
-            "    _t.cuda.empty_cache = _none\n"
-            "    _t.cuda.set_device = _none\n"
+            "    _t.cuda.current_device = _zero_current_device\n"
+            "    _t.cuda.empty_cache = _none_empty_cache\n"
+            "    _t.cuda.set_device = _none_set_device\n"
             "    if hasattr(_t, 'Tensor'):\n"
             "        _t.Tensor.cuda = lambda self, device=None, non_blocking=False, memory_format=None: self\n"
             "    if hasattr(_t, 'nn') and hasattr(_t.nn, 'Module'):\n"
