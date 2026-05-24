@@ -81,8 +81,10 @@ class ModelTab(QScrollArea):
         lp.setSpacing(6)
 
         file_row = QHBoxLayout()
-        self.local_path = QLineEdit()
-        self.local_path.setPlaceholderText(
+        self.local_path = QComboBox()
+        self.local_path.setEditable(True)
+        self.local_path.setInsertPolicy(QComboBox.NoInsert)
+        self.local_path.lineEdit().setPlaceholderText(
             "Path to .gguf, .ggml, .bin, .safetensors, .onnx ..."
         )
         file_row.addWidget(self.local_path, stretch=1)
@@ -105,10 +107,11 @@ class ModelTab(QScrollArea):
         )
         local_form.addRow("Server:", self.local_server)
 
-        self.local_server_url = QLineEdit("http://127.0.0.1:11434/v1")
-        self.local_server_url.setPlaceholderText(
-            "http://127.0.0.1:11434/v1"
-        )
+        self.local_server_url = QComboBox()
+        self.local_server_url.setEditable(True)
+        self.local_server_url.setInsertPolicy(QComboBox.NoInsert)
+        self.local_server_url.lineEdit().setPlaceholderText("http://127.0.0.1:11434/v1")
+        self.local_server_url.addItem("http://127.0.0.1:11434/v1")
         local_form.addRow("Server URL:", self.local_server_url)
 
         self.local_format = QComboBox()
@@ -143,8 +146,10 @@ class ModelTab(QScrollArea):
         scl.setSpacing(6)
 
         exe_row = QHBoxLayout()
-        self.llm_exe_path = QLineEdit()
-        self.llm_exe_path.setPlaceholderText(
+        self.llm_exe_path = QComboBox()
+        self.llm_exe_path.setEditable(True)
+        self.llm_exe_path.setInsertPolicy(QComboBox.NoInsert)
+        self.llm_exe_path.lineEdit().setPlaceholderText(
             "Path to llama-server.exe / ollama.exe ..."
         )
         exe_row.addWidget(self.llm_exe_path, stretch=1)
@@ -413,12 +418,12 @@ class ModelTab(QScrollArea):
 
     def _wire_settings_autosave(self):
         # Local
-        self._connect_save_signal(self.local_path.textChanged)
-        self._connect_save_signal(self.local_server_url.textChanged)
+        self._connect_save_signal(self.local_path.lineEdit().textChanged)
+        self._connect_save_signal(self.local_server_url.lineEdit().textChanged)
         self._connect_save_signal(self.local_format.currentTextChanged)
         self._connect_save_signal(self.local_backend.currentTextChanged)
         self._connect_save_signal(self.local_loader.currentTextChanged)
-        self._connect_save_signal(self.llm_exe_path.textChanged)
+        self._connect_save_signal(self.llm_exe_path.lineEdit().textChanged)
         self._connect_save_signal(self.srv_gpu_layers.valueChanged)
         self._connect_save_signal(self.srv_ctx.valueChanged)
         self._connect_save_signal(self.srv_port.valueChanged)
@@ -466,7 +471,7 @@ class ModelTab(QScrollArea):
         }
         url = urls.get(server, "")
         if url:
-            self.local_server_url.setText(url)
+            self.local_server_url.setEditText(url)
         ports = {
             "Ollama": 11434, "LM Studio": 1234, "llama.cpp": 8080,
             "koboldcpp": 5001, "vLLM": 8000, "TabbyAPI": 5000,
@@ -481,7 +486,7 @@ class ModelTab(QScrollArea):
             "Executables (*.exe);;All Files (*)",
         )
         if path:
-            self.llm_exe_path.setText(path)
+            self._push_history(self.llm_exe_path, path)
             self._save_settings()
 
     def _find_port_holders(self, port):
@@ -651,7 +656,7 @@ class ModelTab(QScrollArea):
             return
 
         server = self.local_server.currentText()
-        exe = self.llm_exe_path.text().strip()
+        exe = self.llm_exe_path.currentText().strip()
         if not exe:
             self.llm_server_status.setText("Server: Set executable path first")
             apply_status_style(self.llm_server_status, "color: #cc3040;")
@@ -661,7 +666,7 @@ class ModelTab(QScrollArea):
             apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
 
-        model_file = self.local_path.text().strip()
+        model_file = self.local_path.currentText().strip()
         port = self.srv_port.value()
         gpu_layers = self.srv_gpu_layers.value()
         ctx = self.srv_ctx.value()
@@ -725,7 +730,12 @@ class ModelTab(QScrollArea):
         self._llm_ready_attempts = 0
 
         # Keep URL aligned with server launch settings.
-        self.local_server_url.setText(f"http://127.0.0.1:{port}/v1")
+        _url = f"http://127.0.0.1:{port}/v1"
+        self._push_history(self.local_server_url, _url)
+        if model_file:
+            self._push_history(self.local_path, model_file)
+        if exe:
+            self._push_history(self.llm_exe_path, exe)
         QTimer.singleShot(3000, self._check_llm_ready)
 
     def _check_llm_ready(self):
@@ -736,7 +746,7 @@ class ModelTab(QScrollArea):
             self.llm_server_status.setText("Server: Timeout waiting for ready")
             apply_status_style(self.llm_server_status, "color: #cc3040;")
             return
-        ready, models = self._probe_local_server(self.local_server_url.text())
+        ready, models = self._probe_local_server(self.local_server_url.currentText())
         if ready:
             if models:
                 shown = ", ".join(models[:2])
@@ -871,6 +881,29 @@ class ModelTab(QScrollArea):
             self.api_key.setEchoMode(QLineEdit.Password)
             self.show_key_btn.setText("Show Key")
 
+    # ------------------------------------------------------------------
+    # History helpers
+    # ------------------------------------------------------------------
+
+    _MAX_HISTORY = 10
+
+    def _push_history(self, combo, value: str) -> None:
+        """Prepend *value* to combo's item list, dedup, cap at _MAX_HISTORY.
+
+        Used for model file paths, server URLs, and executable paths so the
+        user never has to retype a previously-used value.
+        """
+        if not value:
+            return
+        # Remove any existing occurrence so there are no duplicates
+        for i in range(combo.count() - 1, -1, -1):
+            if combo.itemText(i) == value:
+                combo.removeItem(i)
+        combo.insertItem(0, value)
+        while combo.count() > self._MAX_HISTORY:
+            combo.removeItem(combo.count() - 1)
+        combo.setCurrentIndex(0)
+
     def _browse_model(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Local Model File", "",
@@ -880,7 +913,7 @@ class ModelTab(QScrollArea):
             "All Files (*)",
         )
         if path:
-            self.local_path.setText(path)
+            self._push_history(self.local_path, path)
             self._save_settings()
 
     # ------------------------------------------------------------------
@@ -1050,7 +1083,7 @@ class ModelTab(QScrollArea):
             }
 
         vram_mb = self._gpu_float(main_gpu, "vram_total_mb")
-        model_path = self.local_path.text().lower()
+        model_path = self.local_path.currentText().lower()
         quant = self.quant.currentText()
         if "q5_k_s" in model_path:
             quant = "Q5_K_S"
@@ -1320,13 +1353,16 @@ class ModelTab(QScrollArea):
         data = {
             "source_index": self.source_type.currentIndex(),
             # Local model
-            "local_path": self.local_path.text(),
+            "local_path": self.local_path.currentText(),
+            "local_path_history": [self.local_path.itemText(i) for i in range(self.local_path.count())],
             "local_server": self.local_server.currentText(),
-            "local_server_url": self.local_server_url.text(),
+            "local_server_url": self.local_server_url.currentText(),
+            "local_server_url_history": [self.local_server_url.itemText(i) for i in range(self.local_server_url.count())],
             "local_format": self.local_format.currentText(),
             "local_backend": self.local_backend.currentText(),
             "local_loader": self.local_loader.currentText(),
-            "llm_exe_path": self.llm_exe_path.text(),
+            "llm_exe_path": self.llm_exe_path.currentText(),
+            "llm_exe_path_history": [self.llm_exe_path.itemText(i) for i in range(self.llm_exe_path.count())],
             "srv_gpu_layers": self.srv_gpu_layers.value(),
             "srv_ctx": self.srv_ctx.value(),
             "srv_port": self.srv_port.value(),
@@ -1427,7 +1463,12 @@ class ModelTab(QScrollArea):
             self.source_type.blockSignals(False)
 
             # --- Local model ---
-            self.local_path.setText(data.get("local_path", ""))
+            # Restore model file path history then set current value
+            for _h in reversed(data.get("local_path_history", [])):
+                self._push_history(self.local_path, _h)
+            _lp = data.get("local_path", "")
+            if _lp:
+                self._push_history(self.local_path, _lp)
 
             srv = data.get("local_server", "")
             if srv:
@@ -1437,10 +1478,12 @@ class ModelTab(QScrollArea):
                     self.local_server.setCurrentIndex(idx)
                 self.local_server.blockSignals(False)
 
-            # Restore URL after combo (avoids the auto-preset overwriting it)
+            # Restore server URL history then set current value
+            for _h in reversed(data.get("local_server_url_history", [])):
+                self._push_history(self.local_server_url, _h)
             url = data.get("local_server_url", "")
             if url:
-                self.local_server_url.setText(url)
+                self._push_history(self.local_server_url, url)
 
             fmt = data.get("local_format", "")
             if fmt:
@@ -1460,7 +1503,11 @@ class ModelTab(QScrollArea):
                 if idx >= 0:
                     self.local_loader.setCurrentIndex(idx)
 
-            self.llm_exe_path.setText(data.get("llm_exe_path", ""))
+            for _h in reversed(data.get("llm_exe_path_history", [])):
+                self._push_history(self.llm_exe_path, _h)
+            _ep = data.get("llm_exe_path", "")
+            if _ep:
+                self._push_history(self.llm_exe_path, _ep)
             self.srv_gpu_layers.setValue(int(data.get("srv_gpu_layers", -1)))
             self.srv_ctx.setValue(int(data.get("srv_ctx", 4096)))
             self.srv_port.setValue(int(data.get("srv_port", 8080)))
@@ -1536,14 +1583,14 @@ class ModelTab(QScrollArea):
         if self._llm_process and self._llm_process.state() == QProcess.Running:
             return
 
-        reachable, _ = self._probe_local_server(self.local_server_url.text())
+        reachable, _ = self._probe_local_server(self.local_server_url.currentText())
         if reachable:
             self.llm_server_status.setText("Server: Running externally")
             apply_status_style(self.llm_server_status, "color: #00aa40;")
             self.event_bus.log_entry.emit("[LLM] Found existing local LLM server.")
             return
 
-        if not self.llm_exe_path.text().strip():
+        if not self.llm_exe_path.currentText().strip():
             self.event_bus.log_entry.emit(
                 "[LLM] Auto-start skipped: set an executable path first."
             )
@@ -1580,8 +1627,8 @@ class ModelTab(QScrollArea):
             payload.update(
                 {
                     "server": self.local_server.currentText(),
-                    "server_url": self.local_server_url.text().strip(),
-                    "path": self.local_path.text().strip(),
+                    "server_url": self.local_server_url.currentText().strip(),
+                    "path": self.local_path.currentText().strip(),
                     "core_url": self.client.BASE_URL,
                 }
             )
@@ -1626,11 +1673,11 @@ class ModelTab(QScrollArea):
             "hardware_policy": self._current_hardware_policy(),
         }
         if source == "local":
-            cfg["local_path"] = self.local_path.text().strip()
+            cfg["local_path"] = self.local_path.currentText().strip()
             cfg["local_backend"] = self.local_backend.currentText()
             cfg["local_loader"] = self.local_loader.currentText()
             cfg["local_server"] = self.local_server.currentText()
-            cfg["local_server_url"] = self.local_server_url.text().strip()
+            cfg["local_server_url"] = self.local_server_url.currentText().strip()
         else:
             cfg["api_provider"] = self.api_provider.currentText()
             cfg["api_endpoint"] = self.api_endpoint.text().strip()
