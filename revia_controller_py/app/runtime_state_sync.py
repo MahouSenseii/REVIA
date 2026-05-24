@@ -51,7 +51,7 @@ class RuntimeStateSync(QObject):
         for signal in (
             self.model_tab.source_type.currentIndexChanged,
             self.model_tab.local_server.currentTextChanged,
-            self.model_tab.local_server_url.textChanged,
+            self.model_tab.local_server_url.currentTextChanged,
             self.model_tab.api_provider.currentTextChanged,
             self.model_tab.api_endpoint.textChanged,
             self.model_tab.api_model.currentTextChanged,

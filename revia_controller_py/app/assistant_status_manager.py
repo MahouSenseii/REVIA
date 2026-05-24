@@ -122,8 +122,8 @@ class AssistantStatusManager(QObject):
         for signal in (
             self.model_tab.source_type.currentIndexChanged,
             self.model_tab.local_server.currentTextChanged,
-            self.model_tab.local_server_url.textChanged,
-            self.model_tab.local_path.textChanged,
+            self.model_tab.local_server_url.currentTextChanged,
+            self.model_tab.local_path.currentTextChanged,
             self.model_tab.api_provider.currentTextChanged,
             self.model_tab.api_endpoint.textChanged,
             self.model_tab.api_model.currentTextChanged,
@@ -695,7 +695,7 @@ class AssistantStatusManager(QObject):
         llm = telemetry.get("llm_connection", {}) or {}
         runtime = telemetry.get("runtime_status", {}) or {}
         source_is_online = self.model_tab.source_type.currentIndex() == 1
-        local_model_name = os.path.basename(self.model_tab.local_path.text().strip())
+        local_model_name = os.path.basename(self.model_tab.local_path.currentText().strip())
         online_model_name = self.model_tab.api_model.currentText().strip()
 
         filter_enabled = any(
@@ -856,7 +856,7 @@ class AssistantStatusManager(QObject):
             "local_llm_endpoint": (
                 self.model_tab.api_endpoint.text().strip()
                 if self.model_tab.source_type.currentIndex() == 1
-                else self.model_tab.local_server_url.text().strip()
+                else self.model_tab.local_server_url.currentText().strip()
             ),
             "voice_input_enabled": snapshot["voice_input_enabled"],
             "voice_output_enabled": snapshot["voice_output_enabled"],
