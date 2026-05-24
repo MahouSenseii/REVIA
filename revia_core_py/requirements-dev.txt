@@ -1,0 +1,5 @@
+# WS-0 — developer / CI tooling for the REVIA regression net.
+# Install with:  pip install -r requirements-dev.txt
+pytest>=8.0
+pytest-cov>=5.0
+ruff>=0.6

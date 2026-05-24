@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import random
+import re
 
 from persona_manager import DEFAULT_PROMPT_PROFILE, normalize_profile
 from runtime_models import ResponseMode
@@ -27,8 +29,7 @@ class CharacterProfileManager:
         """Strip known prompt-injection patterns from profile fields."""
         text = str(value or "")[:max_len]
         # Remove attempts to override system instructions
-        import re as _re
-        text = _re.sub(
+        text = re.sub(
             r"(?i)(ignore\s+(all\s+)?previous\s+instructions|"
             r"you\s+are\s+now\s+|"
             r"system\s*:\s*|"
@@ -253,7 +254,6 @@ class PromptAssemblyManager:
                 "I'm having a moment, bear with me.",
             ]
         }
-        import random
         options = responses.get(error_type, responses["default"])
         return random.choice(options)
 

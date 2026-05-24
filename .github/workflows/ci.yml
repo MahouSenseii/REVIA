@@ -1,0 +1,52 @@
+name: REVIA CI
+
+# WS-0 — continuous regression net for the structural remediation.
+# This pipeline is intentionally lenient where the codebase is not yet clean:
+#   * the full requirements install may fail (heavy ML deps) — that is OK,
+#     the pure-Python conversational-core tests still run and gate.
+#   * ruff runs but does NOT block yet — WS-7 makes it blocking once the
+#     code-quality sweep is done.
+# As the remediation progresses, tighten the `continue-on-error` flags below.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: revia_core_py
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev tooling
+        run: pip install -r requirements-dev.txt
+
+      - name: Install runtime dependencies (best-effort)
+        # Heavy ML deps may not install on a clean CI runner. The
+        # conversational-core tests do not need them; the smoke test skips
+        # cleanly if core_server cannot import. So this step is allowed to fail.
+        continue-on-error: true
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff) — non-blocking until WS-7
+        continue-on-error: true
+        run: ruff check .
+
+      - name: Run regression net (pytest, excluding benchmarks)
+        run: pytest -m "not bench"
+
+      - name: Architecture latency benchmark (informational)
+        continue-on-error: true
+        run: pytest -m bench -ra
