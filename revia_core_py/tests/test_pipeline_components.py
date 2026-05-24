@@ -150,8 +150,12 @@ class TestHumanFeelLayer:
 
     def test_golden_hfl_happy_seed42(self, golden):
         result = HumanFeelLayer(profile_engine=None).process(_SAMPLE_REPLY, "happy", rng_seed=42)
-        golden("hfl_happy_seed42", result.to_dict())
+        # Exclude elapsed_ms — it's a performance metric, not a behavior signal,
+        # and it varies between runs which would produce spurious snapshot failures.
+        data = {k: v for k, v in result.to_dict().items() if k != "elapsed_ms"}
+        golden("hfl_happy_seed42", data)
 
     def test_golden_hfl_neutral_seed7(self, golden):
         result = HumanFeelLayer(profile_engine=None).process(_SAMPLE_REPLY, "neutral", rng_seed=7)
-        golden("hfl_neutral_seed7", result.to_dict())
+        data = {k: v for k, v in result.to_dict().items() if k != "elapsed_ms"}
+        golden("hfl_neutral_seed7", data)
