@@ -1,16 +1,11 @@
 {
-  "correction_added": true,
-  "notes": [
-    "self_correction at pos 70: 'look, '"
-  ],
   "original_len": 25,
-  "pause_added": false,
-  "processed_len": 26,
+  "processed_len": 25,
   "prosody": {
     "affect_mode": "natural",
     "energy_db": 1.1,
     "pitch_semitones": 1.1,
-    "rate_multiplier": 1.028
+    "rate_multiplier": 1.07
   },
   "trimmed": false
 }

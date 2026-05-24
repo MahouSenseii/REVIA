@@ -1,9 +1,6 @@
 {
-  "correction_added": false,
-  "notes": [],
   "original_len": 25,
-  "pause_added": false,
-  "processed_len": 26,
+  "processed_len": 25,
   "prosody": {
     "affect_mode": "natural",
     "energy_db": 0.0,

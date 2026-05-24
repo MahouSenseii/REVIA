@@ -263,24 +263,7 @@ from autonomy.self_initiation_scorer import SelfInitiationScorer
 from autonomy.state_tracker import StateTracker
 from autonomy.topic_manager import TopicManager
 from reflex_responder import get_reflex_reply
-from agents import (
-    AgentContext,
-    AgentOrchestrator,
-    CancellationToken,
-    CriticAgent,
-    DebateOrchestrator,
-    EmotionAgent,
-    FinalResponseBuilder,
-    IntentAgent,
-    MemoryAgent,
-    ModelRequirements,
-    ModelRouter,
-    QualityGate,
-    ReasoningAgent,
-    ToolUseAgent,
-    VisionAgent,
-    VoiceStyleAgent,
-)
+# agents/ package retired (WS-2): use /api/chat + parallel_pipeline.
 from autonomy_v3 import (
     AutonomyScheduler,
     EpisodicMemoryStore,
@@ -5784,12 +5767,6 @@ def api_chat():
     })
 
 
-# ---------------------------------------------------------------------------
-# Parallel Agents V1 — additive endpoint (does not replace /api/chat)
-# ---------------------------------------------------------------------------
-
-_agents_orchestrator_lock = threading.Lock()
-_agents_orchestrator: AgentOrchestrator | None = None
 _hardware_profiler: HardwareProfiler | None = None
 _hardware_fingerprint = None  # type: ignore[assignment]
 _hardware_agent: HardwareAgent | None = None
@@ -5960,175 +5937,7 @@ def _ensure_autonomy_scheduler() -> AutonomyScheduler:
         return _autonomy_scheduler
 
 
-def _build_agents_orchestrator() -> AgentOrchestrator:
-    """Wire the parallel-agents orchestrator with REVIA's live singletons.
-
-    Routes are registered with :class:`ModelRequirements` so the
-    :class:`RuntimeScheduler` can throttle or fall back when the GPU
-    is under pressure.
-    """
-    fingerprint, hw_agent, scheduler = _ensure_hardware_runtime()
-
-    router = ModelRouter(scheduler=scheduler)
-
-    # Emotion classifier: cheap, in-process, no GPU needed.
-    router.register(
-        "emotion_classify",
-        backend_name="emotion_net",
-        handler=emotion_net.infer,
-        requirements=ModelRequirements(
-            vram_mb=0, cpu_bound=True, prefers_gpu=False, latency_budget_ms=400,
-        ),
-        priority_class="normal",
-        rank=10,
-        description="REVIA EmotionNet affective fusion",
-    )
-
-    # Issue #10: intent classifier.  Without a registered route, IntentAgent's
-    # router.has("intent_classify") branch was permanently dead and we lost
-    # the natural extension point for a small ML classifier.  The heuristic
-    # engine is registered at rank=100 as a guaranteed fallback; an ML model
-    # (e.g. distilbert / ONNX) can later be registered at rank<=50 and will
-    # win automatically while the heuristic stays as the safety net.
-    def _intent_classify_heuristic(text, **_kw):
-        return IntentAgent._classify_heuristic(str(text or ""))
-
-    router.register(
-        "intent_classify",
-        backend_name="intent_heuristic",
-        handler=_intent_classify_heuristic,
-        requirements=ModelRequirements(
-            vram_mb=0, cpu_bound=True, prefers_gpu=False, latency_budget_ms=50,
-        ),
-        priority_class="normal",
-        rank=100,
-        description="REVIA heuristic intent classifier (rule-based fallback)",
-    )
-
-    # Reasoning: heavy LLM; declared VRAM cost depends on the user's chosen
-    # backend.  Estimate from the boot fingerprint's recommended_defaults so
-    # the scheduler's VRAM budget is coherent with the suggested model size.
-    reason_vram_mb = {
-        "high_24gb": 14000,
-        "mid_12gb": 6500,
-        "low_8gb": 4500,
-        "cpu_only": 0,
-    }.get(getattr(fingerprint, "suggested_profile", "cpu_only"), 4500)
-
-    router.register(
-        "reason_chat",
-        backend_name="llm_backend",
-        handler=lambda text, broadcast_fn=None, **kw: llm_backend.generate_response(
-            text, broadcast_fn or (lambda *a, **k: None), **kw,
-        ),
-        requirements=ModelRequirements(
-            vram_mb=reason_vram_mb,
-            prefers_gpu=reason_vram_mb > 0,
-            cpu_bound=reason_vram_mb == 0,
-            supports_streaming=True,
-            latency_budget_ms=20000,
-        ),
-        priority_class="high",
-        rank=10,
-        description="REVIA LLMBackend.generate_response (primary)",
-    )
-
-    # V2.3: discover available local + cloud providers and register them as
-    # ranked fallbacks (rank >= 30, so the user-chosen LLMBackend at rank 10
-    # is still tried first).  The router will fall back automatically if the
-    # primary route is denied by the scheduler.
-    global _provider_registry
-    try:
-        if _provider_registry is None:
-            _provider_registry = ProviderRegistry(log_fn=_revia_log)
-            _provider_registry.discover()
-        added = _provider_registry.register_chat_routes(
-            router=router,
-            task_type="reason_chat",
-            fingerprint=fingerprint,
-            only_available=True,
-        )
-        _revia_log(
-            f"[Agents] ProviderRegistry registered {added} fallback chat route(s)"
-        )
-    except Exception as exc:
-        _revia_log(f"[Agents] ProviderRegistry skipped: {exc}")
-
-    # V3 + V4 wiring: build episodic memory, goal tracker, skill registry,
-    # and the V3.4 autonomy background loop.  All best-effort.
-    try:
-        episode_store, _goal_tracker_obj, skill_registry = _ensure_v3_v4()
-        _ensure_autonomy_scheduler()
-    except Exception as exc:
-        _revia_log(f"[V3/V4] init failed (non-fatal): {exc}")
-        episode_store = None
-        skill_registry = None
-
-    agents = [
-        # Issue #4 (REVIA_DEEP_DIVE): wire the EpisodicMemoryStore so MemoryAgent
-        # surfaces cross-session lessons into the LLM context (not just the
-        # autonomy loop).  Falls back gracefully if the V3/V4 init failed.
-        MemoryAgent(
-            memory_store=memory_store,
-            model_router=router,
-            episodic_store=episode_store,
-        ),
-        EmotionAgent(emotion_net=emotion_net, model_router=router,
-                     profile_engine=profile_engine),
-        IntentAgent(model_router=router),
-        VoiceStyleAgent(profile_engine=profile_engine, model_router=router),
-        # V4.2 + V4.3: tool-use + vision agents run in parallel with reasoning.
-        ToolUseAgent(registry=skill_registry),
-        VisionAgent(model_router=router),
-        ReasoningAgent(reply_planner=None, model_router=router),
-        # Background HardwareAgent — runs at low priority, refreshes the
-        # snapshot consumed by the scheduler on every turn.
-        hw_agent,
-    ]
-    post_agents = [
-        CriticAgent(model_router=router, profile_engine=profile_engine),
-        # V3.2: reflection agent reads quality + critic + intent and tags
-        # a lesson on the corresponding episode for the AutonomyScheduler.
-        ReflectionAgent(model_router=router, episode_store=episode_store),
-    ]
-    final_builder = FinalResponseBuilder(hfl=None)
-    quality_gate = QualityGate(profile_engine=profile_engine)
-
-    # Regen budget: profile-driven (capped at 2 to bound latency).
-    try:
-        regen_budget = int(getattr(profile_engine, "regen_patience", 1) or 1)
-    except Exception:
-        regen_budget = 1
-    regen_budget = max(0, min(2, regen_budget))
-
-    return AgentOrchestrator(
-        agents=agents,
-        final_builder=final_builder,
-        quality_gate=quality_gate,
-        post_agents=post_agents,
-        max_regen=regen_budget,
-        agent_timeouts_ms={
-            "MemoryAgent": 1500,
-            "EmotionAgent": 500,
-            "IntentAgent": 250,
-            "VoiceStyleAgent": 250,
-            "ToolUseAgent": 600,
-            "VisionAgent": 1200,
-            "ReasoningAgent": 8000,
-            "HardwareAgent": 600,
-            "CriticAgent": 400,
-            "ReflectionAgent": 250,
-        },
-    )
-
-
-def _get_agents_orchestrator() -> AgentOrchestrator:
-    global _agents_orchestrator
-    with _agents_orchestrator_lock:
-        if _agents_orchestrator is None:
-            _agents_orchestrator = _build_agents_orchestrator()
-        return _agents_orchestrator
-
+# Orchestrator builder + accessor removed (WS-2).
 
 def _build_interface_router() -> InterfaceRouter:
     """Construct the V2.4 InterfaceRouter with safe defaults.
@@ -6195,117 +6004,15 @@ def set_interface_callback(name: str, callback) -> bool:
     return True
 
 
-@app.route("/api/agents/chat", methods=["POST"])
-def api_agents_chat():
-    """V1 parallel-agents endpoint.
-
-    Body::
-
-        { "text": "...", "threshold": 0.70, "metadata": {...} }
-
-    Returns the structured orchestrator output (final + quality + per-agent
-    AgentResult records).  Does not modify ``conversation_manager`` state.
-    """
-    data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"error": "empty message"}), 400
-
-    threshold = float(data.get("threshold", 0.70))
-    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-    turn_id = str(data.get("turn_id") or f"agents-{int(time.time() * 1000)}")
-    profile_name = ""
-    try:
-        profile_name = str(profile_engine.profile_name or "")
-    except Exception:
-        profile_name = ""
-
-    ctx = AgentContext(
-        user_text=text,
-        turn_id=turn_id,
-        conversation_id=str(data.get("conversation_id") or "rest"),
-        user_profile=profile_name,
-        response_threshold=threshold,
-        cancel_token=CancellationToken(turn_id=turn_id),
-        metadata=metadata or {},
-    )
-
-    try:
-        output = _get_agents_orchestrator().run_turn(ctx)
-    except Exception as exc:
-        _revia_log(f"[Agents] /api/agents/chat error: {exc}")
-        return jsonify({"error": "orchestrator_error", "detail": str(exc)}), 500
-
-    # V2.4: fan the canonical answer out to every active output channel.
-    interfaces_payload: dict = {}
-    try:
-        # Pull the IntentAgent payload from agent_results (already audited).
-        intent_payload: dict = {}
-        for r in output.agent_results:
-            if r.agent == "IntentAgent" and r.success:
-                intent_payload = r.result
-                break
-        iface_ctx = InterfaceContext(
-            final=output.final,
-            user_text=text,
-            intent=intent_payload,
-            metadata={"turn_id": turn_id, "conversation_id": ctx.conversation_id},
-            cancel_token=ctx.cancel_token,
-        )
-        dispatch = _get_interface_router().dispatch(iface_ctx)
-        interfaces_payload = dispatch.to_dict()
-    except Exception as exc:
-        _revia_log(f"[Agents] interface dispatch failed: {exc}")
-        interfaces_payload = {"error": str(exc)}
-
-    # V3.1 + V3.3: persist the turn as an Episode and run goal detection.
-    episode_dict: dict = {}
-    detected_goals: list = []
-    try:
-        ep_store, goal_tracker, _skills = _ensure_v3_v4()
-        # Pull the post-orchestrator details from agent_results.
-        critic_payload: dict = output.critic or {}
-        ep = ep_store.add(
-            user_text=text,
-            reply_text=str(output.final.text or ""),
-            intent_label=str(intent_payload.get("label") or "chat"),
-            emotion_label=str(output.final.emotion_label or "neutral"),
-            polarity=str(intent_payload.get("polarity") or "neutral"),
-            confidence=float(output.final.confidence or 0.0),
-            quality_score=float(output.quality.score or 0.0),
-            regen_attempts=int(output.regen_attempts or 0),
-            critic_recommendation=str(critic_payload.get("recommendation") or "accept"),
-            session_id=str(ctx.conversation_id or ""),
-            turn_id=turn_id,
-        )
-        episode_dict = ep.to_dict()
-        detected_goals = [
-            g.to_dict() for g in goal_tracker.detect_from_turn(
-                user_text=text,
-                reply_text=str(output.final.text or ""),
-                intent=intent_payload,
-                critic=critic_payload,
-                episode_id=ep.id,
-                session_id=str(ctx.conversation_id or ""),
-            )
-        ]
-    except Exception as exc:
-        _revia_log(f"[V3] episode/goals persist failed: {exc}")
-
-    body = output.to_dict()
-    body["interfaces"] = interfaces_payload
-    body["episode"] = episode_dict
-    body["new_goals"] = detected_goals
-    return jsonify(body)
-
+# /api/agents/chat removed (WS-2).
 
 @app.route("/api/agents/status", methods=["GET"])
 def api_agents_status():
-    """Lightweight introspection for the agent layer."""
-    orch = _get_agents_orchestrator()
+    """Pipeline status — orchestrator retired (WS-2); use /api/chat."""
     return jsonify({
-        "agents": orch.agent_names(),
+        "pipeline": "parallel_pipeline",
         "ready": True,
+        "note": "Orchestrator retired (WS-2). Chat via /api/chat.",
     })
 
 
@@ -6328,7 +6035,7 @@ def api_agents_hardware():
             "policy": policy,
             "roles": roles,
         },
-        "router": _get_agents_orchestrator() and _runtime_scheduler is not None,
+        "router": _runtime_scheduler is not None,  # orchestrator retired (WS-2)
     })
 
 

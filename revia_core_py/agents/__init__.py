@@ -1,79 +1,14 @@
-"""REVIA Parallel Agents — V1 spine.
+"""agents/ — RETIRED (WS-2).
 
-Public flow::
+The entire agents/ package was wired exclusively through AgentOrchestrator
+and /api/agents/chat, both of which have been removed from the active turn
+path.  The production path is /api/chat → parallel_pipeline only.
 
-    text input
-      -> AgentOrchestrator
-      -> [MemoryAgent | EmotionAgent | ReasoningAgent]  (parallel)
-      -> FinalResponseBuilder (one canonical answer)
-      -> QualityGate          (threshold from ProfileEngine)
-      -> console / web output
+Individual files are kept as inert placeholders (deletion blocked by mount
+permissions).  Delete the whole agents/ directory from your IDE.
 
-The agent layer is purely additive: it does not replace any existing
-``revia_core_py`` subsystem.  Each agent is a thin wrapper around an
-already-trusted module (EmotionNet, MemoryStore, ReplyPlanner, AVS, HFL)
-so all profile knobs and unit tests keep working.
+DO NOT import from this package.
 """
+from __future__ import annotations
 
-from .agent_base import (
-    Agent,
-    AgentContext,
-    AgentRequest,
-    AgentResult,
-    CancellationToken,
-    CancelledError,
-)
-from .model_router import ModelRouter, ModelRoute, NoRouteAdmittedError
-
-# Re-export the runtime-side requirements dataclass so agent callers can
-# declare resource needs without importing from two packages.
-try:  # pragma: no cover - import guard
-    from ..runtime.runtime_scheduler import ModelRequirements
-except ImportError:  # pragma: no cover
-    from runtime.runtime_scheduler import ModelRequirements  # type: ignore[no-redef]
-from .memory_agent import MemoryAgent
-from .emotion_agent import EmotionAgent
-from .intent_agent import IntentAgent
-from .reasoning_agent import ReasoningAgent
-from .voice_style_agent import VoiceStyleAgent
-from .critic_agent import CriticAgent
-from .tool_use_agent import ToolUseAgent
-from .vision_agent import VisionAgent
-from .debate_orchestrator import (
-    DebateOrchestrator,
-    DebateOutput,
-    DebateVariantResult,
-)
-from .quality_gate import QualityGate, QualityVerdict
-from .final_response import FinalResponse, FinalResponseBuilder
-from .orchestrator import AgentOrchestrator, OrchestratorOutput
-
-__all__ = [
-    "Agent",
-    "AgentContext",
-    "AgentRequest",
-    "AgentResult",
-    "AgentOrchestrator",
-    "CancellationToken",
-    "CancelledError",
-    "CriticAgent",
-    "DebateOrchestrator",
-    "DebateOutput",
-    "DebateVariantResult",
-    "EmotionAgent",
-    "FinalResponse",
-    "FinalResponseBuilder",
-    "IntentAgent",
-    "MemoryAgent",
-    "ModelRequirements",
-    "ModelRoute",
-    "ModelRouter",
-    "NoRouteAdmittedError",
-    "OrchestratorOutput",
-    "QualityGate",
-    "QualityVerdict",
-    "ReasoningAgent",
-    "ToolUseAgent",
-    "VisionAgent",
-    "VoiceStyleAgent",
-]
+__all__: list[str] = []

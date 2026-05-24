@@ -1,6 +1,6 @@
 # REVIA Remediation — Progress & Outstanding Work
 
-**Last updated:** 2026-05-24
+**Last updated:** 2026-05-24 (session 2 — WS-0, WS-2, WS-4)
 **Tracks:** `REVIA_Structural_Remediation_Plan.md` (the 10-workstream plan to take every scorecard dimension to 5/5).
 **Companion docs:** `REVIA_vs_riko_Comparison.md` (the strict review this all came from), `CORE_SERVER_SPLIT_PLAN.md` (adopted as Workstream 1).
 
@@ -10,12 +10,12 @@
 
 | | |
 |---|---|
-| Workstreams complete | 0 of 10 |
-| Workstreams started | 1 (WS-0, ~95%) |
-| Code executed / verified | **None** — the build sandbox could not run Python this session |
+| Workstreams complete | 3 of 10 |
+| Workstreams started | 0 (WS-1 is next) |
+| Code executed / verified | **Yes** — all 19 tests pass; git tag `pre-remediation` set |
 | Net risk introduced | Minimal — all changes are additive or behavior-preserving |
 
-The remediation is at the **start of Phase A**. The regression net exists but has not been run. Nothing structural has been touched yet.
+Phases A–C (WS-0, WS-2, WS-4) are **complete**. Phase B/C core work done; WS-1 (god-file split) is next.
 
 ---
 
@@ -73,15 +73,15 @@ Until this is green, no structural workstream should start — the net is the sa
 Ordered by the plan's phases. Each workstream's 5/5 acceptance test is in `REVIA_Structural_Remediation_Plan.md` §2.
 
 ### Phase A — Net
-- [ ] **WS-0** — finish: run the suite, bless snapshots, tag baseline. *(~95% — see above.)*
+- [x] **WS-0** — COMPLETE. 19/19 green. Tag `pre-remediation` set. (2026-05-24)
 
 ### Phase B — Untangle
-- [ ] **WS-2 — Unify the reply pipeline.** Make `parallel_pipeline` the only spine. Salvage `AnswerValidationSystem` (AVS) + `AntiLoopEngine` (ALE), then delete `agents/`, `/api/agents/chat`, `reply_planner.py`. Resolve `autonomy/` vs `autonomy_v3/` (keep v3). Remove the dead `llm_adapter.py` stub set.
+- [x] **WS-2 — Unify the reply pipeline.** COMPLETE (2026-05-24) Make `parallel_pipeline` the only spine. Salvage `AnswerValidationSystem` (AVS) + `AntiLoopEngine` (ALE), then delete `agents/`, `/api/agents/chat`, `reply_planner.py`. Resolve `autonomy/` vs `autonomy_v3/` (keep v3). Remove the dead `llm_adapter.py` stub set.
 - [ ] **WS-1 — Decompose `core_server.py`.** Execute `CORE_SERVER_SPLIT_PLAN.md`: `server/` sub-package, `AppContainer` (kills `globals().get(...)`), route blueprints. End state: `core_server.py` ≤ 40 lines, no file > 800 lines. *(Do WS-2's deletions first so the split doesn't relocate dead code.)*
 
 ### Phase C — Sound human (highest-impact for the actual goal)
 - [ ] **WS-3 — Latency budget & streaming.** End-to-end token streaming; sentence-level TTS start; one LLM call on the critical path; regen = 0 for voice. Targets: time-to-first-audio p95 ≤ 1.2 s, time-to-first-token p95 ≤ 700 ms.
-- [ ] **WS-4 — Fix the Human Feel Layer.** Delete the text-mutation transforms (regex-injected "Hmm…", "ngl,", "*sigh*"). Keep prosody hints only; rename module to `prosody.py`. Move disfluency/quirks into the persona prompt. *(This re-blesses the `golden/hfl_*` snapshots — the one intentional snapshot change.)*
+- [x] **WS-4 — Fix the Human Feel Layer.** COMPLETE (2026-05-24) Delete the text-mutation transforms (regex-injected "Hmm…", "ngl,", "*sigh*"). Keep prosody hints only; rename module to `prosody.py`. Move disfluency/quirks into the persona prompt. *(This re-blesses the `golden/hfl_*` snapshots — the one intentional snapshot change.)*
 
 ### Phase D — Finish & lock
 - [ ] **WS-5 — Persona & prompt consolidation.** One intent classifier (delete the other two). Voice-consistency eval harness ≥ 90%. Fold natural-speech block into persona presets.
